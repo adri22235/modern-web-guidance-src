@@ -1,0 +1,165 @@
+diff --git a/analytics.js b/analytics.js
+new file mode 100644
+--- a/analytics.js
++++ b/analytics.js
+@@ -0,0 +1,160 @@
++// Client-side analytics for The Daily Grind.
++//
++// Page views and click interactions are queued and debounced into a single
++// deferred background request using fetchLater() with `activateAfter`. Every
++// event within BATCH_WINDOW of the previous beacon being scheduled replaces
++// that beacon with one carrying the full queue, so rapid interactions coalesce
++// into one request. The browser still delivers the pending beacon if the user
++// leaves the page before the window expires.
++
++// fetchLater() polyfill for browsers without native support (Firefox, Safari).
++// Falls back to fetch keepalive / sendBeacon, flushing when the page is hidden.
++globalThis.fetchLater ??= function fetchLater(url, init = {}) {
++  let timeoutHandle;
++  let activated = false;
++
++  function sendNow() {
++    if (!(init.signal && init.signal.aborted)) {
++      if (
++        'keepalive' in Request.prototype ||
++        init.method !== 'POST' ||
++        init.headers
++      ) {
++        fetch(url, Object.assign({}, init, { keepalive: true }));
++        activated = true;
++      } else {
++        activated = navigator.sendBeacon(url, init.body);
++      }
++    }
++    destroy();
++  }
++
++  function destroy() {
++    document.removeEventListener('visibilitychange', sendNow);
++    clearTimeout(timeoutHandle);
++  }
++
++  if (document.visibilityState === 'hidden') {
++    queueMicrotask(sendNow);
++  } else {
++    document.addEventListener('visibilitychange', sendNow);
++    if (typeof init.activateAfter === 'number' && init.activateAfter >= 0) {
++      timeoutHandle = setTimeout(sendNow, init.activateAfter);
++    }
++  }
++
++  if (init.signal) {
++    init.signal.addEventListener('abort', destroy);
++  }
++
++  return {
++    get activated() {
++      return activated;
++    },
++  };
++};
++
++(() => {
++  const ANALYTICS_ENDPOINT = '/api/analytics';
++  // Events occurring within this window are batched into one request.
++  const BATCH_WINDOW = 5 * 1000;
++  // Keep payloads well under the ~64KB per-origin fetchLater() quota.
++  const MAX_QUEUE_SIZE = 100;
++
++  const sessionId = crypto.randomUUID();
++  const eventQueue = [];
++  let fetchLaterResult = null;
++  let fetchLaterController = null;
++
++  function scheduleBeacon() {
++    // Replace any pending beacon with one carrying the full queue.
++    fetchLaterController?.abort();
++    fetchLaterController = new AbortController();
++
++    try {
++      fetchLaterResult = fetchLater(ANALYTICS_ENDPOINT, {
++        method: 'POST',
++        headers: { 'content-type': 'application/json' },
++        body: JSON.stringify({
++          sessionId,
++          page: location.pathname,
++          events: eventQueue,
++        }),
++        signal: fetchLaterController.signal,
++        activateAfter: BATCH_WINDOW,
++      });
++    } catch (error) {
++      // Most likely a quota error; drop this batch rather than break the page.
++      console.warn('[analytics] Failed to schedule beacon:', error);
++    }
++  }
++
++  function trackEvent(type, data = {}) {
++    // Start a fresh batch once the previous beacon has been sent, or once the
++    // queue is full (leaving the current pending beacon to send as-is).
++    if (fetchLaterResult?.activated || eventQueue.length >= MAX_QUEUE_SIZE) {
++      fetchLaterResult = null;
++      fetchLaterController = null;
++      eventQueue.length = 0;
++    }
++
++    eventQueue.push({
++      type,
++      ts: Date.now(),
++      t: Math.round(performance.now()),
++      ...data,
++    });
++
++    scheduleBeacon();
++  }
++
++  function describeElement(el) {
++    const target = el.closest('a, button, [data-track]') ?? el;
++    const label = (target.dataset.track || target.textContent || '')
++      .trim()
++      .replace(/\s+/g, ' ')
++      .slice(0, 80);
++
++    return {
++      tag: target.tagName.toLowerCase(),
++      id: target.id || undefined,
++      classes: target.classList.length ? [...target.classList].join(' ') : undefined,
++      href: target.getAttribute('href') ?? undefined,
++      text: label || undefined,
++      section: target.closest('nav, header, main, footer')?.tagName.toLowerCase(),
++    };
++  }
++
++  function trackPageView(restored = false) {
++    trackEvent('page_view', {
++      url: location.href,
++      title: document.title,
++      referrer: document.referrer || undefined,
++      viewport: `${innerWidth}x${innerHeight}`,
++      restored: restored || undefined,
++    });
++  }
++
++  // Initial page view (script is deferred, so the DOM is ready).
++  trackPageView();
++
++  // Count pages restored from the back/forward cache as new views.
++  addEventListener('pageshow', (event) => {
++    if (event.persisted) trackPageView(true);
++  });
++
++  // Capture-phase listener so clicks are recorded even if a handler
++  // stops propagation. Work is minimal to avoid hurting INP.
++  document.addEventListener(
++    'click',
++    (event) => {
++      if (!(event.target instanceof Element)) return;
++      trackEvent('click', {
++        ...describeElement(event.target),
++        x: Math.round(event.clientX),
++        y: Math.round(event.clientY),
++      });
++    },
++    { capture: true, passive: true },
++  );
++})();

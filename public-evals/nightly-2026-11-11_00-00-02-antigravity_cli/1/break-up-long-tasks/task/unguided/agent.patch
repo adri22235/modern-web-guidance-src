@@ -1,0 +1,155 @@
+diff --git a/flavor-worker.js b/flavor-worker.js
+new file mode 100644
+--- a/flavor-worker.js
++++ b/flavor-worker.js
+@@ -0,0 +1,150 @@
++// Web Worker for non-blocking coffee flavor profile batch simulation
++const ORIGINS = [
++  { name: 'Ethiopian Yirgacheffe', acidity: 88, body: 55, sweetness: 84, bitterness: 30, aroma: 94, notes: ['Bergamot', 'Jasmine', 'Peach'] },
++  { name: 'Colombian Supremo', acidity: 72, body: 74, sweetness: 78, bitterness: 45, aroma: 80, notes: ['Caramel', 'Red Apple', 'Walnut'] },
++  { name: 'Sumatra Mandheling', acidity: 42, body: 94, sweetness: 62, bitterness: 68, aroma: 76, notes: ['Dark Cocoa', 'Cedar', 'Earthy Spice'] },
++  { name: 'Brazilian Santos', acidity: 50, body: 82, sweetness: 76, bitterness: 54, aroma: 72, notes: ['Hazelnut', 'Milk Chocolate', 'Toffee'] },
++  { name: 'Guatemalan Antigua', acidity: 78, body: 76, sweetness: 74, bitterness: 48, aroma: 85, notes: ['Cinnamon', 'Orange Peel', 'Cocoa'] },
++  { name: 'Kenyan AA', acidity: 92, body: 68, sweetness: 79, bitterness: 38, aroma: 90, notes: ['Blackcurrant', 'Grapefruit', 'Winey'] }
++];
++
++function simulateSingleBlend(index, config) {
++  const seed = (index * 2654435761) >>> 0;
++  const o1 = ORIGINS[seed % ORIGINS.length];
++  const o2 = ORIGINS[((seed >> 4) + 1) % ORIGINS.length];
++  const o3 = ORIGINS[((seed >> 8) + 2) % ORIGINS.length];
++
++  const r1 = 40 + (seed % 35);
++  const r2 = 15 + ((seed >> 6) % (85 - r1));
++  const r3 = 100 - r1 - r2;
++
++  const roastFactor = config.roast === 'light' ? 0.85 : config.roast === 'dark' ? 1.2 : 1.0;
++  const brewMultiplier = config.brew === 'espresso' ? 1.12 : config.brew === 'cold-brew' ? 0.9 : 1.0;
++
++  // Iterative extraction curve calculation
++  let extractionEfficiency = 0;
++  for (let step = 1; step <= 18; step++) {
++    const tempCurve = Math.sin(step * 0.34 + (seed % 13)) * 0.08;
++    extractionEfficiency += (0.055 + tempCurve) * brewMultiplier;
++  }
++  extractionEfficiency = Math.max(0.75, Math.min(1.25, extractionEfficiency));
++
++  const rawAcidity = (o1.acidity * r1 + o2.acidity * r2 + o3.acidity * r3) / 100;
++  const rawBody = (o1.body * r1 + o2.body * r2 + o3.body * r3) / 100;
++  const rawSweetness = (o1.sweetness * r1 + o2.sweetness * r2 + o3.sweetness * r3) / 100;
++  const rawBitterness = (o1.bitterness * r1 + o2.bitterness * r2 + o3.bitterness * r3) / 100;
++  const rawAroma = (o1.aroma * r1 + o2.aroma * r2 + o3.aroma * r3) / 100;
++
++  const acidity = Math.min(100, Math.max(10, Math.round(rawAcidity / roastFactor)));
++  const body = Math.min(100, Math.max(10, Math.round(rawBody * roastFactor * extractionEfficiency)));
++  const sweetness = Math.min(100, Math.max(10, Math.round(rawSweetness * (2.05 - Math.abs(1 - roastFactor)))));
++  const bitterness = Math.min(100, Math.max(10, Math.round(rawBitterness * roastFactor)));
++  const aroma = Math.min(100, Math.max(10, Math.round(rawAroma * extractionEfficiency)));
++
++  const targetAcidity = config.targetAcidity ?? 70;
++  const targetBody = config.targetBody ?? 75;
++  const targetSweetness = config.targetSweetness ?? 80;
++
++  const diffAcidity = Math.abs(acidity - targetAcidity);
++  const diffBody = Math.abs(body - targetBody);
++  const diffSweetness = Math.abs(sweetness - targetSweetness);
++
++  const matchScore = Math.max(
++    10,
++    Math.min(99.8, +(100 - (diffAcidity * 0.32 + diffBody * 0.34 + diffSweetness * 0.34) * 0.85).toFixed(1))
++  );
++
++  return {
++    id: `BLD-${String(index + 1).padStart(5, '0')}`,
++    name: `${o1.name.split(' ')[0]} / ${o2.name.split(' ')[0]} Reserve #${index + 1}`,
++    composition: `${r1}% ${o1.name}, ${r2}% ${o2.name}, ${r3}% ${o3.name}`,
++    notes: [o1.notes[seed % 3], o2.notes[(seed >> 3) % 3], o3.notes[(seed >> 5) % 3]],
++    acidity,
++    body,
++    sweetness,
++    bitterness,
++    aroma,
++    matchScore
++  };
++}
++
++self.onmessage = function (e) {
++  const { type, batchSize, config, runId } = e.data;
++  if (type !== 'START') return;
++
++  const total = Math.max(1, Number(batchSize) || 10000);
++  const chunkSize = Math.max(100, Math.floor(total / 20));
++  let processed = 0;
++
++  let sumAcidity = 0;
++  let sumBody = 0;
++  let sumSweetness = 0;
++  let sumBitterness = 0;
++  let sumAroma = 0;
++  let sumScore = 0;
++  let topBlends = [];
++
++  function runNextChunk() {
++    const limit = Math.min(processed + chunkSize, total);
++    for (let i = processed; i < limit; i++) {
++      const blend = simulateSingleBlend(i, config);
++      sumAcidity += blend.acidity;
++      sumBody += blend.body;
++      sumSweetness += blend.sweetness;
++      sumBitterness += blend.bitterness;
++      sumAroma += blend.aroma;
++      sumScore += blend.matchScore;
++
++      if (topBlends.length < 12) {
++        topBlends.push(blend);
++        topBlends.sort((a, b) => b.matchScore - a.matchScore);
++      } else if (blend.matchScore > topBlends[topBlends.length - 1].matchScore) {
++        topBlends[topBlends.length - 1] = blend;
++        topBlends.sort((a, b) => b.matchScore - a.matchScore);
++      }
++    }
++
++    processed = limit;
++    const progress = Math.round((processed / total) * 100);
++
++    self.postMessage({
++      type: 'PROGRESS',
++      runId,
++      processed,
++      total,
++      progress,
++      averages: {
++        acidity: Math.round(sumAcidity / processed),
++        body: Math.round(sumBody / processed),
++        sweetness: Math.round(sumSweetness / processed),
++        bitterness: Math.round(sumBitterness / processed),
++        aroma: Math.round(sumAroma / processed),
++        matchScore: +(sumScore / processed).toFixed(1)
++      },
++      topBlends: topBlends.slice(0, 8)
++    });
++
++    if (processed < total) {
++      setTimeout(runNextChunk, 12);
++    } else {
++      self.postMessage({
++        type: 'COMPLETE',
++        runId,
++        processed,
++        total,
++        progress: 100,
++        averages: {
++          acidity: Math.round(sumAcidity / total),
++          body: Math.round(sumBody / total),
++          sweetness: Math.round(sumSweetness / total),
++          bitterness: Math.round(sumBitterness / total),
++          aroma: Math.round(sumAroma / total),
++          matchScore: +(sumScore / total).toFixed(1)
++        },
++        topBlends
++      });
++    }
++  }
++
++  runNextChunk();
++};

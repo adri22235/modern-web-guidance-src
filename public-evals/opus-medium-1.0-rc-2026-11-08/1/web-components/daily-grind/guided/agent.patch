@@ -1,0 +1,783 @@
+diff --git a/components/coffee-card.js b/components/coffee-card.js
+new file mode 100644
+index 0000000..20be67b
+--- /dev/null
++++ b/components/coffee-card.js
+@@ -0,0 +1,252 @@
++/**
++ * <coffee-card> — a menu item card with a persistent "favorite" toggle.
++ *
++ * Light DOM content stays authoritative (and readable without JS):
++ *   <coffee-card drink="cold-brew">
++ *     <img slot="media" src="…" alt="…">
++ *     <h3 slot="title">Cold Brew</h3>
++ *     <p>Steeped for 18 hours…</p>
++ *     <a slot="action" href="/menu/cold-brew">View Details</a>
++ *   </coffee-card>
++ *
++ * Attributes:  drink — stable key used to persist the favorite in localStorage.
++ * Properties:  favorited (boolean), drinkName (read-only string).
++ * Events:      favorite-change { drink, name, favorited } — bubbles, composed.
++ * Styling:     :state(favorited); parts card, favorite;
++ *              --coffee-card-bg, --coffee-card-accent, --coffee-card-heading.
++ */
++
++const STORAGE_KEY = 'daily-grind:favorites';
++
++function readFavorites() {
++  try {
++    return new Set(JSON.parse(localStorage.getItem(STORAGE_KEY)) ?? []);
++  } catch {
++    return new Set();
++  }
++}
++
++function writeFavorites(set) {
++  try {
++    localStorage.setItem(STORAGE_KEY, JSON.stringify([...set]));
++  } catch {
++    // Storage unavailable (private mode, quota) — favorite still works for this visit.
++  }
++}
++
++const sheet = new CSSStyleSheet();
++sheet.replaceSync(`
++  :host {
++    --_bg: var(--coffee-card-bg, #fff);
++    --_accent: var(--coffee-card-accent, #ffab40);
++    --_heading: var(--coffee-card-heading, #4e342e);
++    display: block;
++  }
++
++  article {
++    display: flex;
++    flex-direction: column;
++    height: 100%;
++    overflow: hidden;
++    background: var(--_bg);
++    border-radius: 8px;
++    box-shadow: 0 2px 5px rgb(0 0 0 / 0.1);
++    text-align: center;
++    transition: box-shadow 0.2s, translate 0.2s;
++  }
++
++  article:hover { box-shadow: 0 6px 16px rgb(0 0 0 / 0.15); }
++
++  @media (prefers-reduced-motion: no-preference) {
++    article:hover { translate: 0 -2px; }
++  }
++
++  .media { position: relative; aspect-ratio: 3 / 2; background: #d7ccc8; }
++
++  ::slotted(img) {
++    display: block;
++    width: 100%;
++    height: 100%;
++    object-fit: cover;
++  }
++
++  .body {
++    display: flex;
++    flex: 1;
++    flex-direction: column;
++    gap: 10px;
++    padding: 20px;
++  }
++
++  ::slotted([slot="title"]) {
++    margin: 0;
++    color: var(--_heading);
++    font-size: 1.17em;
++  }
++
++  ::slotted(p) { margin: 0; }
++
++  .actions {
++    display: flex;
++    align-items: center;
++    justify-content: center;
++    gap: 10px;
++    margin-top: auto;
++    padding-top: 5px;
++  }
++
++  ::slotted(a) {
++    display: inline-block;
++    padding: 10px 20px;
++    border-radius: 5px;
++    background: var(--_heading);
++    color: #fff;
++    text-decoration: none;
++    transition: background 0.3s;
++  }
++
++  ::slotted(a:hover) { background: #3e2723; }
++
++  ::slotted(a:focus-visible) {
++    outline: 3px solid var(--_accent);
++    outline-offset: 2px;
++  }
++
++  .favorite {
++    display: inline-grid;
++    place-items: center;
++    inline-size: 44px;
++    block-size: 44px;
++    padding: 0;
++    border: 2px solid var(--_heading);
++    border-radius: 50%;
++    background: transparent;
++    color: var(--_heading);
++    font: inherit;
++    cursor: pointer;
++    transition: background 0.2s, color 0.2s;
++  }
++
++  .favorite:hover { background: color-mix(in srgb, var(--_heading) 10%, transparent); }
++
++  .favorite:focus-visible {
++    outline: 3px solid var(--_accent);
++    outline-offset: 2px;
++  }
++
++  .favorite svg { inline-size: 22px; block-size: 22px; }
++  .favorite path { fill: transparent; stroke: currentColor; stroke-width: 2; }
++
++  :host(:state(favorited)) .favorite {
++    background: var(--_heading);
++    color: var(--_accent);
++  }
++
++  :host(:state(favorited)) .favorite path { fill: currentColor; }
++
++  @media (forced-colors: active) {
++    :host(:state(favorited)) .favorite path { fill: ButtonText; }
++  }
++`);
++
++const template = document.createElement('template');
++template.innerHTML = `
++  <article part="card">
++    <div class="media"><slot name="media"></slot></div>
++    <div class="body">
++      <slot name="title"></slot>
++      <slot></slot>
++      <div class="actions">
++        <slot name="action"></slot>
++        <button type="button" class="favorite" part="favorite" aria-pressed="false">
++          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
++            <path d="M12 21s-7.5-4.6-9.6-9.3C1 8.4 3.1 4.5 6.9 4.5c2.1 0 3.6 1.1 5.1 2.9 1.5-1.8 3-2.9 5.1-2.9 3.8 0 5.9 3.9 4.5 7.2C19.5 16.4 12 21 12 21z"/>
++          </svg>
++        </button>
++      </div>
++    </div>
++  </article>
++`;
++
++class CoffeeCard extends HTMLElement {
++  #internals = this.attachInternals();
++  #button;
++  #titleSlot;
++  #favorited = false;
++
++  constructor() {
++    super();
++    const root = this.attachShadow({ mode: 'open' });
++    root.adoptedStyleSheets = [sheet];
++    root.append(template.content.cloneNode(true));
++
++    this.#button = root.querySelector('.favorite');
++    this.#titleSlot = root.querySelector('slot[name="title"]');
++
++    this.#button.addEventListener('click', () => this.toggle());
++    // The title arrives via slot (possibly after upgrade); keep the button label in sync.
++    this.#titleSlot.addEventListener('slotchange', () => this.#updateLabel());
++  }
++
++  connectedCallback() {
++    // Idempotent: safe to re-run when the card is moved in the DOM.
++    this.#setFavorited(readFavorites().has(this.drink), { persist: false, notify: false });
++    this.#updateLabel();
++  }
++
++  get drink() {
++    return this.getAttribute('drink') ?? '';
++  }
++
++  set drink(value) {
++    this.setAttribute('drink', value);
++  }
++
++  get drinkName() {
++    const [title] = this.#titleSlot.assignedElements();
++    return title?.textContent.trim() ?? '';
++  }
++
++  get favorited() {
++    return this.#favorited;
++  }
++
++  set favorited(value) {
++    this.#setFavorited(Boolean(value), { notify: false });
++  }
++
++  toggle() {
++    this.#setFavorited(!this.#favorited);
++  }
++
++  #setFavorited(value, { persist = true, notify = true } = {}) {
++    const changed = value !== this.#favorited;
++    this.#favorited = value;
++    this.#button.setAttribute('aria-pressed', String(value));
++    if (value) this.#internals.states.add('favorited');
++    else this.#internals.states.delete('favorited');
++
++    if (persist && this.drink) {
++      const favorites = readFavorites();
++      if (value) favorites.add(this.drink);
++      else favorites.delete(this.drink);
++      writeFavorites(favorites);
++    }
++
++    if (notify && changed) {
++      this.dispatchEvent(new CustomEvent('favorite-change', {
++        bubbles: true,
++        composed: true,
++        detail: { drink: this.drink, name: this.drinkName, favorited: value },
++      }));
++    }
++  }
++
++  #updateLabel() {
++    // aria-pressed conveys on/off, so the name stays constant ("Favorite Cold Brew").
++    const name = this.drinkName;
++    this.#button.setAttribute('aria-label', name ? `Favorite ${name}` : 'Favorite');
++  }
++}
++
++customElements.define('coffee-card', CoffeeCard);
+diff --git a/components/favorites-summary.js b/components/favorites-summary.js
+new file mode 100644
+index 0000000..a694d7a
+--- /dev/null
++++ b/components/favorites-summary.js
+@@ -0,0 +1,79 @@
++/**
++ * <favorites-summary> — polite live region that reports which <coffee-card>s
++ * in the same section are favorited.
++ *
++ *   <section>
++ *     <favorites-summary></favorites-summary>
++ *     <coffee-card drink="…">…</coffee-card>
++ *   </section>
++ *
++ * Optional Light DOM text is used as the empty-state message.
++ * Scope: the closest <section> ancestor (or the document if none).
++ * Styling: :state(empty); part message; --favorites-summary-fg.
++ */
++
++const sheet = new CSSStyleSheet();
++sheet.replaceSync(`
++  :host {
++    display: block;
++    color: var(--favorites-summary-fg, inherit);
++    font-size: 0.95rem;
++    text-align: center;
++  }
++
++  p { margin: 0.5rem 0 0; min-block-size: 1.6em; }
++  .count { font-weight: bold; }
++`);
++
++const template = document.createElement('template');
++template.innerHTML = `
++  <p part="message" role="status"></p>
++`;
++
++const listFormat = new Intl.ListFormat('en', { style: 'long', type: 'conjunction' });
++
++class FavoritesSummary extends HTMLElement {
++  #internals = this.attachInternals();
++  #message;
++  #scope = document;
++  #onChange = () => this.#render();
++
++  constructor() {
++    super();
++    const root = this.attachShadow({ mode: 'open' });
++    root.adoptedStyleSheets = [sheet];
++    root.append(template.content.cloneNode(true));
++    this.#message = root.querySelector('p');
++  }
++
++  connectedCallback() {
++    this.#scope = this.closest('section') ?? document;
++    this.#scope.addEventListener('favorite-change', this.#onChange);
++    customElements.whenDefined('coffee-card').then(this.#onChange);
++  }
++
++  disconnectedCallback() {
++    this.#scope.removeEventListener('favorite-change', this.#onChange);
++  }
++
++  #render() {
++    const names = [...this.#scope.querySelectorAll('coffee-card')]
++      .filter((card) => card.favorited)
++      .map((card) => card.drinkName);
++
++    if (names.length === 0) {
++      this.#internals.states.add('empty');
++      this.#message.textContent = this.textContent.trim()
++        || 'Tap the heart on a drink to save it as a favorite.';
++      return;
++    }
++
++    this.#internals.states.delete('empty');
++    const count = document.createElement('span');
++    count.className = 'count';
++    count.textContent = `${names.length} ${names.length === 1 ? 'favorite' : 'favorites'} saved:`;
++    this.#message.replaceChildren(count, ` ${listFormat.format(names)}.`);
++  }
++}
++
++customElements.define('favorites-summary', FavoritesSummary);
+diff --git a/components/site-nav.js b/components/site-nav.js
+new file mode 100644
+index 0000000..8bd6804
+--- /dev/null
++++ b/components/site-nav.js
+@@ -0,0 +1,240 @@
++/**
++ * <site-nav> — sticky, responsive primary navigation with a disclosure menu
++ * on narrow screens.
++ *
++ *   <site-nav label="Main">
++ *     <a slot="brand" href="/">The Daily Grind</a>
++ *     <a href="/menu">Menu</a>
++ *     <a href="/logout" data-variant="outline">Logout</a>
++ *   </site-nav>
++ *
++ * Each un-slotted <a> child is manually assigned into its own <li> inside a
++ * shadow <ul>, so links keep list semantics while their styling stays
++ * encapsulated in the component.
++ *
++ * Styling: :state(open); parts bar, toggle, menu;
++ *          --site-nav-bg, --site-nav-fg, --site-nav-accent.
++ */
++
++const sheet = new CSSStyleSheet();
++sheet.replaceSync(`
++  :host {
++    --_bg: var(--site-nav-bg, #4e342e);
++    --_fg: var(--site-nav-fg, #fff);
++    --_accent: var(--site-nav-accent, #ffab40);
++    display: block;
++    position: sticky;
++    top: 0;
++    z-index: 1000;
++    container: site-nav / inline-size;
++  }
++
++  nav {
++    display: flex;
++    flex-wrap: wrap;
++    align-items: center;
++    justify-content: space-between;
++    gap: 0.5rem 1rem;
++    padding: 1rem 5%;
++    background: var(--_bg);
++    color: var(--_fg);
++  }
++
++  ::slotted([slot="brand"]) {
++    color: inherit;
++    font-size: 1.5rem;
++    font-weight: bold;
++    letter-spacing: 1px;
++    text-decoration: none;
++    text-transform: uppercase;
++  }
++
++  ul {
++    display: flex;
++    flex-wrap: wrap;
++    align-items: center;
++    gap: 0.5rem 20px;
++    margin: 0;
++    padding: 0;
++    list-style: none;
++  }
++
++  ::slotted(a) {
++    color: var(--_fg);
++    font-size: 0.9rem;
++    text-decoration: none;
++    transition: color 0.3s;
++  }
++
++  ::slotted(a:hover) { color: var(--_accent); }
++
++  ::slotted(a:focus-visible) {
++    outline: 2px solid var(--_accent);
++    outline-offset: 3px;
++    border-radius: 2px;
++  }
++
++  ::slotted(a[aria-current="page"]) { color: var(--_accent); }
++
++  ::slotted(a[data-variant="outline"]) {
++    padding: 5px 12px;
++    border: 1px solid var(--_accent);
++    border-radius: 4px;
++  }
++
++  .toggle {
++    display: none;
++    align-items: center;
++    gap: 0.5rem;
++    min-block-size: 44px;
++    padding: 0.4rem 0.8rem;
++    border: 1px solid currentColor;
++    border-radius: 4px;
++    background: transparent;
++    color: inherit;
++    font: inherit;
++    cursor: pointer;
++  }
++
++  .toggle:focus-visible {
++    outline: 2px solid var(--_accent);
++    outline-offset: 2px;
++  }
++
++  .toggle svg { inline-size: 1.1em; block-size: 1.1em; }
++  .toggle path { stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
++  .close { display: none; }
++  :host(:state(open)) .open { display: none; }
++  :host(:state(open)) .close { display: inline; }
++
++  @container site-nav (width < 40rem) {
++    .toggle { display: inline-flex; }
++
++    ul {
++      display: none;
++      flex-basis: 100%;
++      flex-direction: column;
++      align-items: stretch;
++      gap: 0;
++      padding-block: 0.5rem;
++    }
++
++    :host(:state(open)) ul { display: flex; }
++
++    li { border-block-start: 1px solid rgb(255 255 255 / 0.15); }
++
++    ::slotted(a) {
++      display: block;
++      padding: 0.75rem 0;
++      font-size: 1rem;
++    }
++
++    ::slotted(a[data-variant="outline"]) {
++      margin-block-start: 0.75rem;
++      text-align: center;
++    }
++  }
++`);
++
++const template = document.createElement('template');
++template.innerHTML = `
++  <nav part="bar">
++    <slot name="brand"></slot>
++    <button type="button" class="toggle" part="toggle" aria-expanded="false" aria-controls="menu">
++      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
++        <path class="open" d="M4 7h16M4 12h16M4 17h16"/>
++        <path class="close" d="M6 6l12 12M18 6L6 18"/>
++      </svg>
++      Menu
++    </button>
++    <ul id="menu" part="menu"></ul>
++  </nav>
++`;
++
++class SiteNav extends HTMLElement {
++  static observedAttributes = ['label'];
++
++  #internals = this.attachInternals();
++  #nav;
++  #toggle;
++  #list;
++  #brandSlot;
++  #observer = new MutationObserver(() => this.#assignLinks());
++
++  constructor() {
++    super();
++    const root = this.attachShadow({ mode: 'open', slotAssignment: 'manual' });
++    root.adoptedStyleSheets = [sheet];
++    root.append(template.content.cloneNode(true));
++
++    this.#nav = root.querySelector('nav');
++    this.#toggle = root.querySelector('.toggle');
++    this.#list = root.querySelector('ul');
++    this.#brandSlot = root.querySelector('slot[name="brand"]');
++
++    this.#toggle.addEventListener('click', () => this.toggle());
++
++    // Close after choosing a link, or when Escape is pressed inside the menu.
++    this.addEventListener('click', (event) => {
++      if (event.target.closest?.('a') && this.open) this.close();
++    });
++    this.addEventListener('keydown', (event) => {
++      if (event.key === 'Escape' && this.open) {
++        this.close();
++        this.#toggle.focus();
++      }
++    });
++    // Collapse when focus leaves the navigation entirely.
++    this.addEventListener('focusout', (event) => {
++      if (this.open && !this.contains(event.relatedTarget)) this.close();
++    });
++  }
++
++  connectedCallback() {
++    this.#nav.setAttribute('aria-label', this.getAttribute('label') ?? 'Main');
++    this.#assignLinks();
++    // Children may still be parsing (or change later); re-assign as they arrive.
++    this.#observer.observe(this, { childList: true, attributeFilter: ['slot'], subtree: true });
++  }
++
++  disconnectedCallback() {
++    this.#observer.disconnect();
++  }
++
++  attributeChangedCallback(name, oldValue, newValue) {
++    if (name === 'label' && oldValue !== newValue) {
++      this.#nav.setAttribute('aria-label', newValue ?? 'Main');
++    }
++  }
++
++  get open() {
++    return this.#internals.states.has('open');
++  }
++
++  toggle(force = !this.open) {
++    if (force) this.#internals.states.add('open');
++    else this.#internals.states.delete('open');
++    this.#toggle.setAttribute('aria-expanded', String(force));
++  }
++
++  close() {
++    this.toggle(false);
++  }
++
++  #assignLinks() {
++    const brand = this.querySelector(':scope > [slot="brand"]');
++    this.#brandSlot.assign(...(brand ? [brand] : []));
++
++    const links = [...this.querySelectorAll(':scope > a:not([slot])')];
++    const items = links.map((link) => {
++      const li = document.createElement('li');
++      const slot = document.createElement('slot');
++      li.append(slot);
++      slot.assign(link);
++      return li;
++    });
++    this.#list.replaceChildren(...items);
++  }
++}
++
++customElements.define('site-nav', SiteNav);
+diff --git a/index.html b/index.html
+index 66c9173..88f846d 100644
+--- a/index.html
++++ b/index.html
+@@ -27,49 +27,44 @@
+       background-color: var(--light);
+     }
+ 
+-    /* Navigation */
+-    nav {
+-      background: var(--primary);
+-      color: white;
+-      padding: 1rem 5%;
++    /* Pre-upgrade fallbacks: Light DOM stays readable and styled if JS is slow or fails. */
++    site-nav:not(:defined) {
+       display: flex;
+-      justify-content: space-between;
++      flex-wrap: wrap;
++      gap: 10px 20px;
+       align-items: center;
+-      position: sticky;
+-      top: 0;
+-      z-index: 1000;
++      padding: 1rem 5%;
++      background: var(--primary);
+     }
+ 
+-    .logo {
+-      font-size: 1.5rem;
+-      font-weight: bold;
+-      letter-spacing: 1px;
++    site-nav:not(:defined) a {
++      color: white;
++      text-decoration: none;
+     }
+ 
+-    nav ul {
+-      display: flex;
+-      list-style: none;
++    coffee-card:not(:defined) {
++      display: block;
++      background: white;
++      padding: 20px;
++      border-radius: 8px;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++      text-align: center;
+     }
+ 
+-    nav ul li {
+-      margin-left: 20px;
++    coffee-card:not(:defined) img {
++      max-width: 100%;
++      height: auto;
+     }
+ 
+-    nav a {
+-      color: white;
+-      text-decoration: none;
+-      font-size: 0.9rem;
+-      transition: color 0.3s;
++    /* Component theming via inherited custom properties */
++    site-nav {
++      --site-nav-bg: var(--primary);
++      --site-nav-accent: var(--accent);
+     }
+ 
+-    nav a:hover {
+-      color: var(--accent);
+-    }
+-
+-    .logout-link {
+-      border: 1px solid var(--accent);
+-      padding: 5px 12px;
+-      border-radius: 4px;
++    coffee-card {
++      --coffee-card-heading: var(--primary);
++      --coffee-card-accent: var(--accent);
+     }
+ 
+     /* Hero Section */
+@@ -107,19 +102,6 @@
+       margin-top: 20px;
+     }
+ 
+-    .card {
+-      background: white;
+-      padding: 20px;
+-      border-radius: 8px;
+-      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+-      text-align: center;
+-    }
+-
+-    .card h3 {
+-      margin-bottom: 10px;
+-      color: var(--primary);
+-    }
+-
+     .btn {
+       display: inline-block;
+       background: var(--primary);
+@@ -135,6 +117,15 @@
+       background: #3e2723;
+     }
+ 
++    .btn:focus-visible {
++      outline: 3px solid var(--accent);
++      outline-offset: 2px;
++    }
++
++    .section-title {
++      text-align: center;
++    }
++
+     footer {
+       background: var(--secondary);
+       text-align: center;
+@@ -153,20 +144,21 @@
+       font-size: 0.85rem;
+     }
+   </style>
++  <script type="module" src="/components/site-nav.js"></script>
++  <script type="module" src="/components/coffee-card.js"></script>
++  <script type="module" src="/components/favorites-summary.js"></script>
+ </head>
+ 
+ <body>
+ 
+-  <nav>
+-    <div class="logo">THE DAILY GRIND</div>
+-    <ul>
+-      <li><a href="/menu">Menu</a></li>
+-      <li><a href="/locations">Locations</a></li>
+-      <li><a href="/rewards">Rewards</a></li>
+-      <li><a href="/account">My Account</a></li>
+-      <li><a href="/logout" class="logout-link">Logout</a></li>
+-    </ul>
+-  </nav>
++  <site-nav label="Main">
++    <a slot="brand" href="/">The Daily Grind</a>
++    <a href="/menu">Menu</a>
++    <a href="/locations">Locations</a>
++    <a href="/rewards">Rewards</a>
++    <a href="/account">My Account</a>
++    <a href="/logout" data-variant="outline">Logout</a>
++  </site-nav>
+ 
+   <header class="hero">
+     <h1>Wake Up Your Senses</h1>
+@@ -175,24 +167,31 @@
+   </header>
+ 
+   <main class="container">
+-    <section>
+-      <h2 style="text-align: center;">Seasonal Favorites</h2>
++    <section aria-labelledby="seasonal-heading">
++      <h2 id="seasonal-heading" class="section-title">Seasonal Favorites</h2>
++      <favorites-summary>Tap the heart on a drink to save it as a favorite.</favorites-summary>
+       <div class="grid">
+-        <div class="card">
+-          <h3>Maple Oat Latte</h3>
++        <coffee-card drink="maple-oat-latte">
++          <img slot="media" src="https://images.unsplash.com/photo-1541167760496-1628856ab772?auto=format&fit=crop&w=600&q=70"
++            alt="Latte with leaf-shaped foam art in a ceramic cup" width="600" height="400" loading="lazy" decoding="async">
++          <h3 slot="title">Maple Oat Latte</h3>
+           <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+-          <a href="/menu/seasonal" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Dark Roast Espresso</h3>
++          <a slot="action" href="/menu/seasonal">View Details</a>
++        </coffee-card>
++        <coffee-card drink="dark-roast-espresso">
++          <img slot="media" src="https://images.unsplash.com/photo-1510591509098-f4fdc6d0ff04?auto=format&fit=crop&w=600&q=70"
++            alt="Shot of espresso with golden crema" width="600" height="400" loading="lazy" decoding="async">
++          <h3 slot="title">Dark Roast Espresso</h3>
+           <p>Bold, smokey, and perfect for a morning boost.</p>
+-          <a href="/menu/espresso" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Cold Brew</h3>
++          <a slot="action" href="/menu/espresso">View Details</a>
++        </coffee-card>
++        <coffee-card drink="cold-brew">
++          <img slot="media" src="https://images.unsplash.com/photo-1461023058943-07fcbe16d735?auto=format&fit=crop&w=600&q=70"
++            alt="Iced cold brew coffee in a tall glass" width="600" height="400" loading="lazy" decoding="async">
++          <h3 slot="title">Cold Brew</h3>
+           <p>Steeped for 18 hours for maximum smoothness.</p>
+-          <a href="/menu/cold-brew" class="btn">View Details</a>
+-        </div>
++          <a slot="action" href="/menu/cold-brew">View Details</a>
++        </coffee-card>
+       </div>
+     </section>
+   </main>

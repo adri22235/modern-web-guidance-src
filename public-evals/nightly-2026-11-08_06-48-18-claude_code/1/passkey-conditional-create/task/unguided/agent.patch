@@ -1,0 +1,248 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -134,8 +134,67 @@
+     .btn:hover {
+       background: #3e2723;
+     }
+ 
++    /* Sign-in */
++    .signin {
++      max-width: 400px;
++      margin: 40px auto 0;
++      background: white;
++      padding: 30px;
++      border-radius: 8px;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++    }
++
++    .signin h2 {
++      text-align: center;
++      color: var(--primary);
++      margin-bottom: 20px;
++    }
++
++    .signin label {
++      display: block;
++      font-size: 0.9rem;
++      margin-bottom: 5px;
++    }
++
++    .signin input {
++      width: 100%;
++      padding: 10px;
++      border: 1px solid var(--secondary);
++      border-radius: 5px;
++      font-size: 1rem;
++      margin-bottom: 15px;
++    }
++
++    .signin button {
++      width: 100%;
++      border: none;
++      cursor: pointer;
++      font-size: 1rem;
++      margin-top: 5px;
++    }
++
++    .signin button:disabled {
++      opacity: 0.7;
++      cursor: wait;
++    }
++
++    .signin-status {
++      min-height: 1.5em;
++      margin-top: 12px;
++      text-align: center;
++      font-size: 0.9rem;
++    }
++
++    .signin-status.error {
++      color: #c62828;
++    }
++
++    .signin-status.success {
++      color: #2e7d32;
++    }
++
+     footer {
+       background: var(--secondary);
+       text-align: center;
+       padding: 40px 20px;
+@@ -174,8 +233,20 @@
+     <a href="/order-online" class="btn">Order Now</a>
+   </header>
+ 
+   <main class="container">
++    <section class="signin" aria-labelledby="signin-title">
++      <h2 id="signin-title">Sign In</h2>
++      <form id="signin-form" novalidate>
++        <label for="username">Email or username</label>
++        <input id="username" name="username" type="text" autocomplete="username webauthn" required>
++        <label for="password">Password</label>
++        <input id="password" name="password" type="password" autocomplete="current-password" required>
++        <button type="submit" class="btn" data-testid="signin-button">Sign In</button>
++        <p id="signin-status" class="signin-status" role="status" aria-live="polite"></p>
++      </form>
++    </section>
++
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+       <div class="grid">
+         <div class="card">
+@@ -206,7 +277,155 @@
+     </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script>
++    (() => {
++      const form = document.getElementById('signin-form');
++      const button = form.querySelector('[data-testid="signin-button"]');
++      const statusEl = document.getElementById('signin-status');
++
++      const setStatus = (msg, type = '') => {
++        statusEl.textContent = msg;
++        statusEl.className = 'signin-status' + (type ? ' ' + type : '');
++      };
++
++      // --- base64url helpers (fallbacks for browsers without JSON helpers) ---
++      const b64urlToBuf = (s) => {
++        const b64 = s.replace(/-/g, '+').replace(/_/g, '/');
++        const pad = b64.length % 4 ? '='.repeat(4 - (b64.length % 4)) : '';
++        const bin = atob(b64 + pad);
++        const bytes = new Uint8Array(bin.length);
++        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
++        return bytes.buffer;
++      };
++
++      const bufToB64url = (buf) => {
++        const bytes = new Uint8Array(buf);
++        let bin = '';
++        for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
++        return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
++      };
++
++      const parseCreationOptions = (json) => {
++        if (typeof PublicKeyCredential.parseCreationOptionsFromJSON === 'function') {
++          return PublicKeyCredential.parseCreationOptionsFromJSON(json);
++        }
++        return {
++          ...json,
++          challenge: b64urlToBuf(json.challenge),
++          user: { ...json.user, id: b64urlToBuf(json.user.id) },
++          excludeCredentials: (json.excludeCredentials || []).map((c) => ({
++            ...c,
++            id: b64urlToBuf(c.id),
++          })),
++        };
++      };
++
++      const credentialToJSON = (cred) => {
++        if (typeof cred.toJSON === 'function') {
++          try { return cred.toJSON(); } catch (_) { /* fall through */ }
++        }
++        const r = cred.response;
++        return {
++          id: cred.id,
++          rawId: bufToB64url(cred.rawId),
++          type: cred.type,
++          authenticatorAttachment: cred.authenticatorAttachment || undefined,
++          clientExtensionResults: cred.getClientExtensionResults(),
++          response: {
++            clientDataJSON: bufToB64url(r.clientDataJSON),
++            attestationObject: bufToB64url(r.attestationObject),
++            transports: typeof r.getTransports === 'function' ? r.getTransports() : [],
++          },
++        };
++      };
++
++      // Feature-detect conditional create (automatic passkey upgrade).
++      const supportsConditionalCreate = async () => {
++        if (
++          !window.PublicKeyCredential ||
++          !navigator.credentials ||
++          typeof PublicKeyCredential.getClientCapabilities !== 'function'
++        ) {
++          return false;
++        }
++        try {
++          const caps = await PublicKeyCredential.getClientCapabilities();
++          return caps.conditionalCreate === true;
++        } catch (_) {
++          return false;
++        }
++      };
++
++      // Silently attempt to create a passkey right after password sign-in.
++      // Never surfaces UI; all failures are swallowed.
++      const promotePasskey = async () => {
++        try {
++          if (!(await supportsConditionalCreate())) return;
++
++          const optRes = await fetch('/api/register/options', {
++            method: 'POST',
++            credentials: 'same-origin',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({}),
++          });
++          if (!optRes.ok) return;
++          const optJSON = await optRes.json();
++          const publicKey = parseCreationOptions(optJSON.publicKey || optJSON);
++
++          const credential = await navigator.credentials.create({
++            publicKey,
++            mediation: 'conditional',
++          });
++          if (!credential) return;
++
++          await fetch('/api/register/verify', {
++            method: 'POST',
++            credentials: 'same-origin',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify(credentialToJSON(credential)),
++          });
++        } catch (err) {
++          // Silent by design: conditional create may be rejected by the
++          // browser/password manager (e.g. NotAllowedError, InvalidStateError).
++          console.debug('Automatic passkey creation skipped:', err);
++        }
++      };
++
++      form.addEventListener('submit', async (e) => {
++        e.preventDefault();
++        const username = form.username.value.trim();
++        const password = form.password.value;
++        if (!username || !password) {
++          setStatus('Please enter your username and password.', 'error');
++          return;
++        }
++
++        button.disabled = true;
++        setStatus('Signing in…');
++        try {
++          const res = await fetch('/api/login', {
++            method: 'POST',
++            credentials: 'same-origin',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ username, password }),
++          });
++          if (!res.ok) throw new Error('Sign-in failed');
++
++          setStatus('Signed in successfully. Welcome back!', 'success');
++          form.password.value = '';
++
++          // Fire-and-forget: upgrade the account to a passkey in the background.
++          promotePasskey();
++        } catch (_) {
++          setStatus('Invalid username or password.', 'error');
++        } finally {
++          button.disabled = false;
++        }
++      });
++    })();
++  </script>
++
+ </body>
+ 
+ </html>

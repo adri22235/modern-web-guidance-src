@@ -1,0 +1,1853 @@
+diff --git a/delivery-crypto.js b/delivery-crypto.js
+new file mode 100644
+index 0000000..1181a7b
+--- /dev/null
++++ b/delivery-crypto.js
+@@ -0,0 +1,417 @@
++/**
++ * Web Cryptography delivery notes encryption engine.
++ *
++ * Implements:
++ * - Post-quantum hybrid Key Encapsulation Mechanism (MLKEM768-X25519)
++ * - Standalone post-quantum KEMs (ML-KEM-768, ML-KEM-1024)
++ * - Classical ephemeral-static key agreement fallback (X25519 + HKDF + AES-GCM)
++ * - Authenticated Encryption with Associated Data (ChaCha20-Poly1305 and AES-GCM)
++ *
++ * Follows modern WebCrypto specifications and Web Guidance for client-side encryption.
++ */
++
++export const SUITES = {
++  HYBRID_MLKEM768: 'MLKEM768-X25519',
++  PQ_MLKEM768: 'ML-KEM-768',
++  PQ_MLKEM1024: 'ML-KEM-1024',
++  CLASSICAL_X25519: 'X25519+HKDF+AES-GCM',
++};
++
++export const KEM_PUBLIC_KEY_SIZES = {
++  1216: 'MLKEM768-X25519',
++  1184: 'ML-KEM-768',
++  1568: 'ML-KEM-1024',
++  32: 'X25519',
++};
++
++export const HKDF_INFO = new TextEncoder().encode('daily-grind-encrypted-delivery-notes-v1');
++
++/**
++ * Checks if SubtleCrypto.supports() static method is available.
++ */
++export function isSubtleCryptoSupportsAvailable() {
++  return typeof globalThis.SubtleCrypto?.supports === 'function';
++}
++
++/**
++ * Detects if a KEM and AEAD suite is supported natively.
++ */
++export function supportsKemSuite(kemName = 'MLKEM768-X25519', aeadName = 'ChaCha20-Poly1305') {
++  if (typeof globalThis.SubtleCrypto?.supports === 'function') {
++    return SubtleCrypto.supports('encapsulateKey', kemName, aeadName);
++  }
++  return false;
++}
++
++/**
++ * Detects if post-quantum hybrid envelope encryption is supported.
++ */
++export function supportsPostQuantumEnvelope() {
++  return supportsKemSuite('MLKEM768-X25519', 'ChaCha20-Poly1305');
++}
++
++/**
++ * Inspects all cryptographic suites and returns their availability status.
++ */
++export function getAvailableSuites() {
++  const hybridSupported = supportsKemSuite('MLKEM768-X25519', 'ChaCha20-Poly1305');
++  const pq768Supported = supportsKemSuite('ML-KEM-768', 'ChaCha20-Poly1305');
++  const pq1024Supported = supportsKemSuite('ML-KEM-1024', 'ChaCha20-Poly1305');
++
++  return [
++    {
++      id: SUITES.HYBRID_MLKEM768,
++      name: 'MLKEM768-X25519 + ChaCha20-Poly1305',
++      label: 'Hybrid Post-Quantum + Classical (FIPS 203 + X25519)',
++      description: 'NIST ML-KEM-768 combined with classical X25519. Maximum safety against both present and quantum threats.',
++      isPostQuantum: true,
++      isHybrid: true,
++      aead: 'ChaCha20-Poly1305',
++      supported: hybridSupported,
++      recommended: hybridSupported,
++    },
++    {
++      id: SUITES.PQ_MLKEM768,
++      name: 'ML-KEM-768 + ChaCha20-Poly1305',
++      label: 'Standalone Post-Quantum (NIST Category 3 / FIPS 203)',
++      description: 'Standardized lattice-based KEM without classical hybrid component (~192-bit quantum security).',
++      isPostQuantum: true,
++      isHybrid: false,
++      aead: 'ChaCha20-Poly1305',
++      supported: pq768Supported,
++      recommended: false,
++    },
++    {
++      id: SUITES.PQ_MLKEM1024,
++      name: 'ML-KEM-1024 + ChaCha20-Poly1305',
++      label: 'Highest Margin Post-Quantum (NIST Category 5 / CNSA 2.0)',
++      description: 'Maximum security margin lattice-based KEM (~256-bit security level).',
++      isPostQuantum: true,
++      isHybrid: false,
++      aead: 'ChaCha20-Poly1305',
++      supported: pq1024Supported,
++      recommended: false,
++    },
++    {
++      id: SUITES.CLASSICAL_X25519,
++      name: 'X25519 + HKDF-SHA256 + AES-GCM-256',
++      label: 'Classical Diffie-Hellman Fallback (Baseline Widely Available)',
++      description: 'Standard classical elliptic-curve key agreement for legacy environments.',
++      isPostQuantum: false,
++      isHybrid: false,
++      aead: 'AES-GCM',
++      supported: true,
++      recommended: !hybridSupported,
++    },
++  ];
++}
++
++/**
++ * Encode Uint8Array to Base64 string.
++ */
++export function bytesToBase64(bytes) {
++  if (typeof bytes.toBase64 === 'function') {
++    return bytes.toBase64();
++  }
++  let binary = '';
++  const len = bytes.byteLength;
++  for (let i = 0; i < len; i += 8192) {
++    binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i + 8192, len)));
++  }
++  return btoa(binary);
++}
++
++/**
++ * Decode Base64 string to Uint8Array.
++ */
++export function base64ToBytes(base64) {
++  if (typeof Uint8Array.fromBase64 === 'function') {
++    return Uint8Array.fromBase64(base64);
++  }
++  const binary = atob(base64.trim());
++  const bytes = new Uint8Array(binary.length);
++  for (let i = 0; i < binary.length; i++) {
++    bytes[i] = binary.charCodeAt(i);
++  }
++  return bytes;
++}
++
++/**
++ * Convert bytes to lowercase hexadecimal string.
++ */
++export function bytesToHex(bytes) {
++  return Array.from(bytes)
++    .map((b) => b.toString(16).padStart(2, '0'))
++    .join('');
++}
++
++/**
++ * Computes a short SHA-256 key fingerprint (e.g. 16 hex characters).
++ */
++export async function computeFingerprint(bytes) {
++  const hash = await crypto.subtle.digest('SHA-256', bytes);
++  return bytesToHex(new Uint8Array(hash)).slice(0, 16);
++}
++
++/**
++ * Generates a recipient key pair for the given suite.
++ * - Non-extractable private key for security.
++ * - Exports raw-public or raw public key bytes.
++ */
++export async function generateRecipientKeyPair(suiteId = SUITES.HYBRID_MLKEM768) {
++  if (suiteId === SUITES.CLASSICAL_X25519) {
++    const keyPair = await crypto.subtle.generateKey('X25519', false, ['deriveBits']);
++    const publicKeyBytes = new Uint8Array(
++      await crypto.subtle.exportKey('raw', keyPair.publicKey)
++    );
++    const fingerprint = await computeFingerprint(publicKeyBytes);
++    return {
++      suiteId,
++      keyPair,
++      publicKeyBytes,
++      fingerprint,
++    };
++  }
++
++  // Post-quantum KEM suite (MLKEM768-X25519, ML-KEM-768, or ML-KEM-1024)
++  const keyPair = await crypto.subtle.generateKey(suiteId, false, [
++    'encapsulateKey',
++    'decapsulateKey',
++  ]);
++  const publicKeyBytes = new Uint8Array(
++    await crypto.subtle.exportKey('raw-public', keyPair.publicKey)
++  );
++  const fingerprint = await computeFingerprint(publicKeyBytes);
++  return {
++    suiteId,
++    keyPair,
++    publicKeyBytes,
++    fingerprint,
++  };
++}
++
++/**
++ * Imports a recipient's public key from raw bytes.
++ */
++export async function importPublicKey(publicKeyBytes, suiteId) {
++  const bytes =
++    publicKeyBytes instanceof Uint8Array
++      ? publicKeyBytes
++      : new Uint8Array(publicKeyBytes);
++
++  if (suiteId === SUITES.CLASSICAL_X25519 || bytes.byteLength === 32) {
++    return crypto.subtle.importKey('raw', bytes, 'X25519', true, []);
++  }
++
++  const kemName = suiteId || KEM_PUBLIC_KEY_SIZES[bytes.byteLength] || 'MLKEM768-X25519';
++  return crypto.subtle.importKey('raw-public', bytes, kemName, true, ['encapsulateKey']);
++}
++
++/**
++ * Helper to derive AES-GCM key from X25519 shared secret using HKDF.
++ */
++async function deriveFallbackAesKey(privateKey, peerPublicKey, infoBytes = HKDF_INFO) {
++  const sharedSecret = await crypto.subtle.deriveBits(
++    { name: 'X25519', public: peerPublicKey },
++    privateKey,
++    256
++  );
++  const hkdfKey = await crypto.subtle.importKey('raw', sharedSecret, 'HKDF', false, ['deriveKey']);
++  return crypto.subtle.deriveKey(
++    {
++      name: 'HKDF',
++      hash: 'SHA-256',
++      salt: new Uint8Array(32),
++      info: infoBytes,
++    },
++    hkdfKey,
++    { name: 'AES-GCM', length: 256 },
++    false,
++    ['encrypt', 'decrypt']
++  );
++}
++
++/**
++ * Encapsulates a one-time shared AEAD key against a recipient's public key.
++ *
++ * Returns:
++ * - sharedKey: CryptoKey for AEAD encryption
++ * - capsuleBytes: Uint8Array containing the ciphertext capsule to send to the recipient
++ */
++export async function encapsulateEnvelopeKey(
++  recipientPublicKeyOrBytes,
++  suiteId = SUITES.HYBRID_MLKEM768,
++  infoBytes = HKDF_INFO
++) {
++  const pubKey =
++    recipientPublicKeyOrBytes instanceof CryptoKey
++      ? recipientPublicKeyOrBytes
++      : await importPublicKey(recipientPublicKeyOrBytes, suiteId);
++
++  if (pubKey.algorithm.name === 'X25519') {
++    // Classical fallback: generate ephemeral X25519 key pair and send ephemeral public key as capsule
++    const ephemeral = await crypto.subtle.generateKey('X25519', false, ['deriveBits']);
++    const capsuleBytes = new Uint8Array(
++      await crypto.subtle.exportKey('raw', ephemeral.publicKey)
++    );
++    const sharedKey = await deriveFallbackAesKey(ephemeral.privateKey, pubKey, infoBytes);
++    return { sharedKey, capsuleBytes, suiteId: SUITES.CLASSICAL_X25519 };
++  }
++
++  // Modern Post-Quantum KEM
++  const kemAlgorithm = pubKey.algorithm.name;
++  const { sharedKey, ciphertext } = await crypto.subtle.encapsulateKey(
++    kemAlgorithm,
++    pubKey,
++    'ChaCha20-Poly1305',
++    false,
++    ['encrypt', 'decrypt']
++  );
++
++  return {
++    sharedKey,
++    capsuleBytes: new Uint8Array(ciphertext),
++    suiteId: kemAlgorithm,
++  };
++}
++
++/**
++ * Decapsulates a shared key using the recipient's private key and ciphertext capsule.
++ */
++export async function decapsulateEnvelopeKey(
++  recipientPrivateKey,
++  capsuleBytes,
++  suiteId = SUITES.HYBRID_MLKEM768,
++  infoBytes = HKDF_INFO
++) {
++  if (recipientPrivateKey.algorithm.name === 'X25519') {
++    const ephemeralPubKey = await crypto.subtle.importKey(
++      'raw',
++      capsuleBytes,
++      'X25519',
++      true,
++      []
++    );
++    return deriveFallbackAesKey(recipientPrivateKey, ephemeralPubKey, infoBytes);
++  }
++
++  return crypto.subtle.decapsulateKey(
++    recipientPrivateKey.algorithm.name,
++    recipientPrivateKey,
++    capsuleBytes,
++    'ChaCha20-Poly1305',
++    false,
++    ['encrypt', 'decrypt']
++  );
++}
++
++/**
++ * Encrypts UTF-8 plaintext with an AEAD CryptoKey (ChaCha20-Poly1305 or AES-GCM).
++ * Always generates a fresh, random 12-byte IV.
++ */
++export async function encryptMessage(key, plaintext, additionalData = new Uint8Array(0)) {
++  const iv = crypto.getRandomValues(new Uint8Array(12));
++  const encoded = new TextEncoder().encode(plaintext);
++
++  const ciphertextBuffer = await crypto.subtle.encrypt(
++    {
++      name: key.algorithm.name,
++      iv,
++      additionalData,
++    },
++    key,
++    encoded
++  );
++
++  return {
++    iv,
++    ciphertext: new Uint8Array(ciphertextBuffer),
++  };
++}
++
++/**
++ * Decrypts and authenticates an AEAD payload.
++ * Throws OperationError if tampered or AAD mismatch.
++ */
++export async function decryptMessage(key, iv, ciphertext, additionalData = new Uint8Array(0)) {
++  const plaintextBuffer = await crypto.subtle.decrypt(
++    {
++      name: key.algorithm.name,
++      iv,
++      additionalData,
++    },
++    key,
++    ciphertext
++  );
++
++  return new TextDecoder().decode(plaintextBuffer);
++}
++
++/**
++ * Creates an end-to-end encrypted delivery note package.
++ */
++export async function createEncryptedDeliveryPackage({
++  recipientPublicKeyBytes,
++  suiteId = SUITES.HYBRID_MLKEM768,
++  plaintext,
++  orderId = '',
++  address = '',
++}) {
++  // Bind orderId and address into additionalData for tamper-proofing
++  const aadString = JSON.stringify({ orderId, address });
++  const additionalData = new TextEncoder().encode(aadString);
++
++  // Encapsulate shared key
++  const { sharedKey, capsuleBytes } = await encapsulateEnvelopeKey(
++    recipientPublicKeyBytes,
++    suiteId
++  );
++
++  // Encrypt with AEAD
++  const { iv, ciphertext } = await encryptMessage(sharedKey, plaintext, additionalData);
++
++  return {
++    version: '1.0',
++    suiteId,
++    aead: sharedKey.algorithm.name,
++    orderId,
++    address,
++    capsuleBase64: bytesToBase64(capsuleBytes),
++    ivBase64: bytesToBase64(iv),
++    ciphertextBase64: bytesToBase64(ciphertext),
++    aadString,
++    createdAt: new Date().toISOString(),
++  };
++}
++
++/**
++ * Opens and decrypts an encrypted delivery note package with the recipient's private key.
++ */
++export async function openEncryptedDeliveryPackage({
++  packageData,
++  recipientPrivateKey,
++}) {
++  const capsuleBytes = base64ToBytes(packageData.capsuleBase64);
++  const iv = base64ToBytes(packageData.ivBase64);
++  const ciphertext = base64ToBytes(packageData.ciphertextBase64);
++  const additionalData = new TextEncoder().encode(packageData.aadString);
++
++  // Decapsulate shared AEAD key
++  const sharedKey = await decapsulateEnvelopeKey(
++    recipientPrivateKey,
++    capsuleBytes,
++    packageData.suiteId
++  );
++
++  // Decrypt and authenticate ciphertext
++  const decryptedNote = await decryptMessage(sharedKey, iv, ciphertext, additionalData);
++
++  return {
++    orderId: packageData.orderId,
++    address: packageData.address,
++    decryptedNote,
++    suiteId: packageData.suiteId,
++    aead: packageData.aead,
++    createdAt: packageData.createdAt,
++  };
++}
+diff --git a/delivery-notes.js b/delivery-notes.js
+new file mode 100644
+index 0000000..de09c9d
+--- /dev/null
++++ b/delivery-notes.js
+@@ -0,0 +1,524 @@
++/**
++ * UI Controller for Daily Grind Encrypted Delivery Notes.
++ *
++ * Implements accessible form handling, post-quantum hybrid KEM key establishment,
++ * authenticated client-side AEAD encryption, recipient decapsulation, and tampering checks.
++ */
++
++import {
++  SUITES,
++  getAvailableSuites,
++  generateRecipientKeyPair,
++  createEncryptedDeliveryPackage,
++  openEncryptedDeliveryPackage,
++  bytesToBase64,
++  computeFingerprint,
++} from './delivery-crypto.js';
++
++// State for active recipient key pair and encrypted packages
++let currentRecipient = null;
++let savedPackages = [];
++
++// Fallback sample data if storage is empty
++const SAMPLE_PACKAGES = [
++  {
++    orderId: 'DG-2026-7814',
++    address: '42 Maple Street, Apt 3B',
++    note: 'Gate code is #9021. Please place coffee in the weather-proof parcel bin by the porch swing.',
++  },
++];
++
++/**
++ * Initializes the delivery notes feature on the homepage.
++ */
++export async function initDeliveryNotes() {
++  const container = document.getElementById('encrypted-delivery-section');
++  if (!container) return;
++
++  // Initialize suites and recipient key pair
++  const suites = getAvailableSuites();
++  renderSuiteOptions(suites);
++  updateStatusBanner(suites);
++
++  // Initialize default dispatch recipient key pair (Hybrid MLKEM768-X25519 if supported, else X25519)
++  const defaultSuite = suites.find((s) => s.recommended) || suites[0];
++  await setupRecipientKeys(defaultSuite.id);
++
++  // Wire up UI events
++  setupEventListeners();
++
++  // Populate sample note into store
++  await seedInitialPackage(defaultSuite.id);
++  renderSavedNotesList();
++}
++
++/**
++ * Updates the platform crypto support banner.
++ */
++function updateStatusBanner(suites) {
++  const badgeEl = document.getElementById('crypto-support-badge');
++  const detailsEl = document.getElementById('crypto-support-details');
++  if (!badgeEl) return;
++
++  const hybrid = suites.find((s) => s.id === SUITES.HYBRID_MLKEM768);
++  if (hybrid && hybrid.supported) {
++    badgeEl.textContent = '🛡️ Post-Quantum Hybrid Active (MLKEM768-X25519 + ChaCha20-Poly1305)';
++    badgeEl.className = 'security-badge badge-quantum';
++    detailsEl.textContent =
++      'WebCrypto native quantum-resistant Key Encapsulation (FIPS 203) combined with classical X25519 and ChaCha20-Poly1305 authenticated encryption is active in this browser.';
++  } else {
++    badgeEl.textContent = '🔒 Classical Security Active (X25519 + HKDF + AES-GCM-256)';
++    badgeEl.className = 'security-badge badge-classical';
++    detailsEl.textContent =
++      'Running in classical authenticated key agreement mode (X25519 with 256-bit AES-GCM AEAD).';
++  }
++}
++
++/**
++ * Generates and sets up the dispatch center recipient key pair.
++ */
++async function setupRecipientKeys(suiteId) {
++  const statusEl = document.getElementById('recipient-key-status');
++  const fingerprintEl = document.getElementById('recipient-fingerprint');
++  const sizeEl = document.getElementById('recipient-key-size');
++
++  try {
++    currentRecipient = await generateRecipientKeyPair(suiteId);
++
++    if (statusEl) {
++      statusEl.textContent = `Dispatch Key Active (${currentRecipient.suiteId})`;
++    }
++    if (fingerprintEl) {
++      fingerprintEl.textContent = currentRecipient.fingerprint;
++    }
++    if (sizeEl) {
++      sizeEl.textContent = `${currentRecipient.publicKeyBytes.byteLength} bytes`;
++    }
++
++    const pubKeyBase64El = document.getElementById('recipient-pubkey-base64');
++    if (pubKeyBase64El) {
++      pubKeyBase64El.value = bytesToBase64(currentRecipient.publicKeyBytes);
++    }
++  } catch (err) {
++    console.error('Failed to setup recipient keys:', err);
++    if (statusEl) {
++      statusEl.textContent = `Key Error: ${err.message}`;
++    }
++  }
++}
++
++/**
++ * Renders the radio button selection list for available cryptographic suites.
++ */
++function renderSuiteOptions(suites) {
++  const container = document.getElementById('suite-options-container');
++  if (!container) return;
++
++  container.innerHTML = '';
++
++  suites.forEach((suite, index) => {
++    const wrapper = document.createElement('div');
++    wrapper.className = `suite-option-card ${suite.supported ? '' : 'suite-disabled'}`;
++
++    const radioId = `suite-radio-${index}`;
++    const input = document.createElement('input');
++    input.type = 'radio';
++    input.id = radioId;
++    input.name = 'cryptoSuite';
++    input.value = suite.id;
++    input.disabled = !suite.supported;
++    if (suite.recommended) {
++      input.checked = true;
++    }
++
++    const label = document.createElement('label');
++    label.htmlFor = radioId;
++    label.innerHTML = `
++      <div class="suite-title">
++        <strong>${suite.label}</strong>
++        ${suite.recommended ? '<span class="tag tag-recommended">Recommended</span>' : ''}
++        ${suite.isPostQuantum ? '<span class="tag tag-pq">Post-Quantum</span>' : ''}
++        ${suite.isHybrid ? '<span class="tag tag-hybrid">Hybrid</span>' : ''}
++      </div>
++      <div class="suite-desc">${suite.description}</div>
++      <div class="suite-meta"><small>KEM / Agreement: <code>${suite.id}</code> | AEAD: <code>${suite.aead}</code></small></div>
++    `;
++
++    wrapper.appendChild(input);
++    wrapper.appendChild(label);
++    container.appendChild(wrapper);
++
++    input.addEventListener('change', async () => {
++      if (input.checked) {
++        await setupRecipientKeys(suite.id);
++      }
++    });
++  });
++}
++
++/**
++ * Attaches event listeners for tab switching, encryption, decryption, and tamper testing.
++ */
++function setupEventListeners() {
++  // Tab switching
++  const tabButtons = document.querySelectorAll('.tab-btn');
++  tabButtons.forEach((btn) => {
++    btn.addEventListener('click', () => {
++      tabButtons.forEach((b) => {
++        b.classList.remove('active');
++        b.setAttribute('aria-selected', 'false');
++      });
++      document.querySelectorAll('.tab-panel').forEach((p) => {
++        p.classList.remove('active');
++        p.hidden = true;
++      });
++
++      btn.classList.add('active');
++      btn.setAttribute('aria-selected', 'true');
++      const targetId = btn.getAttribute('data-target');
++      const targetPanel = document.getElementById(targetId);
++      if (targetPanel) {
++        targetPanel.classList.add('active');
++        targetPanel.hidden = false;
++      }
++    });
++  });
++
++  // Delivery Notes Form Submit (Encryption)
++  const form = document.getElementById('encrypt-note-form');
++  if (form) {
++    form.addEventListener('submit', handleEncryptSubmit);
++  }
++
++  // Clear Form Button
++  const clearBtn = document.getElementById('btn-clear-note-form');
++  if (clearBtn) {
++    clearBtn.addEventListener('click', () => {
++      form.reset();
++      const outputCard = document.getElementById('encrypted-output-card');
++      if (outputCard) outputCard.hidden = true;
++      announceLive('Form cleared.');
++    });
++  }
++
++  // Copy Encrypted JSON
++  const copyBtn = document.getElementById('btn-copy-package-json');
++  if (copyBtn) {
++    copyBtn.addEventListener('click', async () => {
++      const jsonEl = document.getElementById('output-package-json');
++      if (!jsonEl || !jsonEl.value) return;
++      try {
++        await navigator.clipboard.writeText(jsonEl.value);
++        copyBtn.textContent = 'Copied!';
++        setTimeout(() => (copyBtn.textContent = 'Copy Encrypted Package JSON'), 2000);
++      } catch {
++        jsonEl.select();
++        document.execCommand('copy');
++        copyBtn.textContent = 'Copied!';
++        setTimeout(() => (copyBtn.textContent = 'Copy Encrypted Package JSON'), 2000);
++      }
++    });
++  }
++
++  // Rotate Key Pair Button
++  const rotateBtn = document.getElementById('btn-rotate-recipient-keys');
++  if (rotateBtn) {
++    rotateBtn.addEventListener('click', async () => {
++      const selectedSuite = document.querySelector('input[name="cryptoSuite"]:checked')?.value || SUITES.HYBRID_MLKEM768;
++      rotateBtn.disabled = true;
++      rotateBtn.textContent = 'Generating...';
++      await setupRecipientKeys(selectedSuite);
++      rotateBtn.disabled = false;
++      rotateBtn.textContent = '🔄 Rotate Dispatch Key Pair';
++      announceLive('Dispatch recipient key pair rotated successfully.');
++    });
++  }
++
++  // Decrypt Note Button
++  const decryptBtn = document.getElementById('btn-decrypt-action');
++  if (decryptBtn) {
++    decryptBtn.addEventListener('click', handleDecryptAction);
++  }
++
++  // Tamper Ciphertext Button
++  const tamperCiphertextBtn = document.getElementById('btn-tamper-ciphertext');
++  if (tamperCiphertextBtn) {
++    tamperCiphertextBtn.addEventListener('click', handleTamperCiphertext);
++  }
++
++  // Tamper AAD Button
++  const tamperAadBtn = document.getElementById('btn-tamper-aad');
++  if (tamperAadBtn) {
++    tamperAadBtn.addEventListener('click', handleTamperAad);
++  }
++}
++
++/**
++ * Handles submission of customer delivery note and client-side encryption.
++ */
++async function handleEncryptSubmit(e) {
++  e.preventDefault();
++
++  const orderIdInput = document.getElementById('note-order-id');
++  const addressInput = document.getElementById('note-address');
++  const noteTextInput = document.getElementById('note-plaintext');
++  const submitBtn = document.getElementById('btn-submit-encrypt');
++
++  const orderId = orderIdInput.value.trim();
++  const address = addressInput.value.trim();
++  const plaintext = noteTextInput.value.trim();
++
++  if (!plaintext) {
++    alert('Please enter delivery instructions.');
++    noteTextInput.focus();
++    return;
++  }
++
++  const selectedSuite =
++    document.querySelector('input[name="cryptoSuite"]:checked')?.value ||
++    currentRecipient?.suiteId ||
++    SUITES.HYBRID_MLKEM768;
++
++  try {
++    submitBtn.disabled = true;
++    submitBtn.textContent = '🔒 Establishing Secret & Encrypting...';
++
++    // 1. Establish shared secret and encrypt customer note client-side
++    const encryptedPkg = await createEncryptedDeliveryPackage({
++      recipientPublicKeyBytes: currentRecipient.publicKeyBytes,
++      suiteId: selectedSuite,
++      plaintext,
++      orderId: orderId || `DG-${Date.now().toString().slice(-4)}`,
++      address: address || 'Daily Grind Delivery',
++    });
++
++    // 2. Save into session packages
++    savedPackages.unshift(encryptedPkg);
++    renderSavedNotesList();
++
++    // 3. Display live output inspector
++    renderEncryptedOutput(encryptedPkg);
++
++    // 4. Update courier panel inputs with the newly encrypted package
++    const courierPkgInput = document.getElementById('courier-package-input');
++    if (courierPkgInput) {
++      courierPkgInput.value = JSON.stringify(encryptedPkg, null, 2);
++    }
++
++    announceLive(`Delivery note encrypted with ${selectedSuite} and authenticated successfully!`);
++  } catch (err) {
++    console.error('Encryption failed:', err);
++    alert(`Encryption failed: ${err.message}`);
++  } finally {
++    submitBtn.disabled = false;
++    submitBtn.textContent = '🔐 Encrypt & Submit Delivery Note';
++  }
++}
++
++/**
++ * Renders the cryptographic details of the encrypted payload.
++ */
++function renderEncryptedOutput(pkg) {
++  const outputCard = document.getElementById('encrypted-output-card');
++  if (!outputCard) return;
++
++  document.getElementById('out-suite').textContent = `${pkg.suiteId} + ${pkg.aead}`;
++  document.getElementById('out-capsule').textContent = pkg.capsuleBase64;
++  document.getElementById('out-iv').textContent = pkg.ivBase64;
++  document.getElementById('out-ciphertext').textContent = pkg.ciphertextBase64;
++  document.getElementById('out-aad').textContent = pkg.aadString;
++  document.getElementById('output-package-json').value = JSON.stringify(pkg, null, 2);
++
++  outputCard.hidden = false;
++  outputCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
++}
++
++/**
++ * Handles courier decapsulation and decryption.
++ */
++async function handleDecryptAction() {
++  const courierPkgInput = document.getElementById('courier-package-input');
++  const decryptBtn = document.getElementById('btn-decrypt-action');
++  const resultCard = document.getElementById('decrypt-result-card');
++  const resultText = document.getElementById('decrypt-result-text');
++  const resultMeta = document.getElementById('decrypt-result-meta');
++  const resultBadge = document.getElementById('decrypt-status-badge');
++
++  if (!courierPkgInput || !courierPkgInput.value.trim()) {
++    alert('Please provide an encrypted package JSON.');
++    return;
++  }
++
++  try {
++    decryptBtn.disabled = true;
++    decryptBtn.textContent = '🔓 Decapsulating Shared Secret...';
++
++    const pkg = JSON.parse(courierPkgInput.value.trim());
++
++    // Decapsulate and decrypt with dispatch private key
++    const decrypted = await openEncryptedDeliveryPackage({
++      packageData: pkg,
++      recipientPrivateKey: currentRecipient.keyPair.privateKey,
++    });
++
++    resultCard.hidden = false;
++    resultCard.className = 'result-card success';
++    resultBadge.textContent = '✅ Authenticated & Decrypted Successfully';
++    resultBadge.className = 'badge badge-success';
++    resultText.textContent = decrypted.decryptedNote;
++    resultMeta.innerHTML = `
++      <strong>Order ID:</strong> ${decrypted.orderId} |
++      <strong>Delivery Address:</strong> ${decrypted.address} |
++      <strong>Suite:</strong> ${decrypted.suiteId} (${decrypted.aead})
++    `;
++
++    announceLive('Encrypted delivery note decapsulated and decrypted successfully.');
++  } catch (err) {
++    console.error('Decryption failed:', err);
++    resultCard.hidden = false;
++    resultCard.className = 'result-card error';
++    resultBadge.textContent = '❌ Authentication / Decryption Failed!';
++    resultBadge.className = 'badge badge-error';
++    resultText.textContent = `Security Rejection: ${err.name} - ${err.message}. The payload or authenticated data has been tampered with or corrupted.`;
++    resultMeta.innerHTML = '<strong>Tamper Alert:</strong> Authenticated encryption tag rejected this payload.';
++    announceLive('Decryption failed: Authenticated tag rejection.');
++  } finally {
++    decryptBtn.disabled = false;
++    decryptBtn.textContent = '🔓 Decapsulate Key & Decrypt Note';
++  }
++}
++
++/**
++ * Tamper simulation: modifies 1 byte of the ciphertext.
++ */
++function handleTamperCiphertext() {
++  const courierPkgInput = document.getElementById('courier-package-input');
++  if (!courierPkgInput || !courierPkgInput.value.trim()) {
++    alert('No package in courier input to tamper with.');
++    return;
++  }
++
++  try {
++    const pkg = JSON.parse(courierPkgInput.value.trim());
++    // Flip characters in ciphertext
++    const ct = pkg.ciphertextBase64;
++    const alteredChar = ct[0] === 'A' ? 'B' : 'A';
++    pkg.ciphertextBase64 = alteredChar + ct.slice(1);
++
++    courierPkgInput.value = JSON.stringify(pkg, null, 2);
++    announceLive('Ciphertext tampered! Click Decrypt to test authentication verification.');
++    alert('⚠️ Tamper Simulated: 1 byte of the ciphertext was modified. Click "Decapsulate Key & Decrypt Note" to verify that AEAD rejects it.');
++  } catch (err) {
++    alert('Invalid JSON in courier input: ' + err.message);
++  }
++}
++
++/**
++ * Tamper simulation: modifies the Associated Authenticated Data (AAD).
++ */
++function handleTamperAad() {
++  const courierPkgInput = document.getElementById('courier-package-input');
++  if (!courierPkgInput || !courierPkgInput.value.trim()) {
++    alert('No package in courier input to tamper with.');
++    return;
++  }
++
++  try {
++    const pkg = JSON.parse(courierPkgInput.value.trim());
++    pkg.aadString = JSON.stringify({ orderId: 'DG-TAMPERED-ATTACKER', address: 'Attacker Redirection' });
++    pkg.orderId = 'DG-TAMPERED-ATTACKER';
++
++    courierPkgInput.value = JSON.stringify(pkg, null, 2);
++    announceLive('Order ID / AAD tampered! Click Decrypt to test authentication verification.');
++    alert('⚠️ Tamper Simulated: Associated Authenticated Data (AAD) was modified to an attacker order ID. Click "Decapsulate Key & Decrypt Note" to verify that AEAD rejects it.');
++  } catch (err) {
++    alert('Invalid JSON in courier input: ' + err.message);
++  }
++}
++
++/**
++ * Renders the list of saved encrypted packages.
++ */
++function renderSavedNotesList() {
++  const container = document.getElementById('saved-notes-list');
++  if (!container) return;
++
++  if (savedPackages.length === 0) {
++    container.innerHTML = '<p class="empty-state">No encrypted delivery notes stored yet.</p>';
++    return;
++  }
++
++  container.innerHTML = '';
++  savedPackages.forEach((pkg, index) => {
++    const item = document.createElement('div');
++    item.className = 'saved-note-item';
++    item.innerHTML = `
++      <div class="note-header">
++        <span class="note-order"><strong>${pkg.orderId}</strong> (${pkg.address})</span>
++        <span class="note-suite-badge">${pkg.suiteId}</span>
++      </div>
++      <div class="note-preview">
++        <small>Encrypted Ciphertext: <code>${pkg.ciphertextBase64.slice(0, 36)}...</code> (${pkg.ciphertextBase64.length} chars)</small>
++      </div>
++      <div class="note-actions">
++        <button type="button" class="btn btn-sm btn-outline load-pkg-btn" data-index="${index}">
++          Load into Courier Decryptor
++        </button>
++      </div>
++    `;
++    container.appendChild(item);
++  });
++
++  container.querySelectorAll('.load-pkg-btn').forEach((btn) => {
++    btn.addEventListener('click', () => {
++      const idx = parseInt(btn.getAttribute('data-index'), 10);
++      const pkg = savedPackages[idx];
++      if (pkg) {
++        const courierPkgInput = document.getElementById('courier-package-input');
++        if (courierPkgInput) {
++          courierPkgInput.value = JSON.stringify(pkg, null, 2);
++        }
++        // Switch to courier tab
++        const courierTabBtn = document.querySelector('[data-target="panel-courier"]');
++        if (courierTabBtn) courierTabBtn.click();
++        courierPkgInput?.scrollIntoView({ behavior: 'smooth' });
++      }
++    });
++  });
++}
++
++/**
++ * Seeds an initial sample encrypted delivery note for immediate demo capability.
++ */
++async function seedInitialPackage(suiteId) {
++  try {
++    const sample = SAMPLE_PACKAGES[0];
++    const pkg = await createEncryptedDeliveryPackage({
++      recipientPublicKeyBytes: currentRecipient.publicKeyBytes,
++      suiteId,
++      plaintext: sample.note,
++      orderId: sample.orderId,
++      address: sample.address,
++    });
++    savedPackages.push(pkg);
++  } catch (err) {
++    console.warn('Could not seed initial package:', err);
++  }
++}
++
++/**
++ * Helper to announce messages to screen readers via aria-live.
++ */
++function announceLive(message) {
++  const liveEl = document.getElementById('crypto-live-announcer');
++  if (liveEl) {
++    liveEl.textContent = message;
++  }
++}
++
++// Auto-initialize when DOM is ready
++if (document.readyState === 'loading') {
++  document.addEventListener('DOMContentLoaded', initDeliveryNotes);
++} else {
++  initDeliveryNotes();
++}
+diff --git a/index.html b/index.html
+index 66c9173..cc4bdba 100644
+--- a/index.html
++++ b/index.html
+@@ -135,6 +135,516 @@
+       background: #3e2723;
+     }
+ 
++    .btn-hero-secure {
++      background: transparent;
++      border: 2px solid var(--accent);
++      color: white;
++    }
++
++    .btn-hero-secure:hover {
++      background: var(--accent);
++      color: var(--primary);
++    }
++
++    .btn-encrypt {
++      background: #2e7d32;
++      font-size: 1rem;
++      font-weight: 600;
++      border: none;
++      cursor: pointer;
++    }
++
++    .btn-encrypt:hover {
++      background: #1b5e20;
++    }
++
++    .btn-decrypt {
++      background: var(--primary);
++      font-size: 1rem;
++      font-weight: 600;
++      border: none;
++      cursor: pointer;
++    }
++
++    .btn-decrypt:hover {
++      background: #271410;
++    }
++
++    .btn-secondary {
++      background: #757575;
++      border: none;
++      cursor: pointer;
++    }
++
++    .btn-secondary:hover {
++      background: #424242;
++    }
++
++    .btn-outline {
++      background: transparent;
++      border: 1px solid var(--primary);
++      color: var(--primary);
++      cursor: pointer;
++    }
++
++    .btn-outline:hover {
++      background: var(--secondary);
++    }
++
++    .btn-sm {
++      padding: 6px 12px;
++      font-size: 0.85rem;
++      margin-top: 0;
++    }
++
++    .btn-danger {
++      background: #c62828;
++      border: none;
++      cursor: pointer;
++    }
++
++    .btn-danger:hover {
++      background: #8e0000;
++    }
++
++    /* Encrypted Delivery Notes Section */
++    .delivery-notes-section {
++      background: white;
++      border-radius: 12px;
++      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
++      padding: 35px 30px;
++      margin-top: 50px;
++      border: 1px solid #e0e0e0;
++    }
++
++    .section-header {
++      text-align: center;
++      margin-bottom: 25px;
++    }
++
++    .section-header h2 {
++      color: var(--primary);
++      font-size: 2rem;
++      display: flex;
++      align-items: center;
++      justify-content: center;
++      gap: 10px;
++      flex-wrap: wrap;
++    }
++
++    .section-header p {
++      color: #616161;
++      max-width: 800px;
++      margin: 10px auto 0;
++      font-size: 1rem;
++    }
++
++    /* Security Status Banner */
++    .security-banner {
++      background: #f1f8e9;
++      border-left: 5px solid #43a047;
++      padding: 16px 20px;
++      border-radius: 6px;
++      margin-bottom: 30px;
++      display: flex;
++      flex-direction: column;
++      gap: 6px;
++    }
++
++    .security-badge {
++      display: inline-flex;
++      align-items: center;
++      gap: 8px;
++      font-weight: 700;
++      font-size: 0.95rem;
++      color: #1b5e20;
++    }
++
++    .security-banner p {
++      font-size: 0.88rem;
++      color: #33691e;
++      margin: 0;
++    }
++
++    /* Tabs */
++    .tabs-nav {
++      display: flex;
++      border-bottom: 2px solid var(--secondary);
++      margin-bottom: 25px;
++      gap: 8px;
++    }
++
++    .tab-btn {
++      background: none;
++      border: none;
++      padding: 12px 20px;
++      font-size: 1rem;
++      font-weight: 600;
++      color: #757575;
++      cursor: pointer;
++      border-bottom: 3px solid transparent;
++      transition: all 0.2s ease;
++    }
++
++    .tab-btn:hover {
++      color: var(--primary);
++    }
++
++    .tab-btn.active {
++      color: var(--primary);
++      border-bottom-color: var(--primary);
++    }
++
++    .tab-panel {
++      display: block;
++    }
++
++    .tab-panel[hidden] {
++      display: none;
++    }
++
++    /* Forms */
++    .form-group {
++      display: flex;
++      flex-direction: column;
++      align-items: flex-start;
++      gap: 0.35rem;
++      margin-block-end: 1.25rem;
++    }
++
++    .form-row {
++      display: grid;
++      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
++      gap: 15px;
++    }
++
++    label {
++      font-weight: 600;
++      color: var(--primary);
++      font-size: 0.92rem;
++    }
++
++    .required-star {
++      color: #c62828;
++    }
++
++    .hint {
++      font-size: 0.82rem;
++      color: #757575;
++    }
++
++    input[type="text"],
++    textarea,
++    select {
++      width: 100%;
++      padding: 10px 14px;
++      border: 1px solid #bdbdbd;
++      border-radius: 6px;
++      font-family: inherit;
++      font-size: 0.95rem;
++      color: var(--text);
++      background: #fafafa;
++      transition: border-color 0.2s, box-shadow 0.2s;
++    }
++
++    input[type="text"]:focus-visible,
++    textarea:focus-visible,
++    select:focus-visible {
++      outline: 3px solid var(--accent);
++      outline-offset: 1px;
++      border-color: var(--primary);
++      background: white;
++    }
++
++    textarea {
++      min-height: 110px;
++      resize: vertical;
++    }
++
++    /* Suite selector fieldset */
++    fieldset.suite-fieldset {
++      border: 1px solid #e0e0e0;
++      border-radius: 8px;
++      padding: 15px;
++      margin-block-end: 1.5rem;
++      background: #fdfbfb;
++    }
++
++    fieldset.suite-fieldset legend {
++      font-weight: 700;
++      color: var(--primary);
++      padding: 0 8px;
++      font-size: 0.95rem;
++    }
++
++    .suite-options-grid {
++      display: grid;
++      gap: 12px;
++      margin-top: 10px;
++    }
++
++    .suite-option-card {
++      display: flex;
++      align-items: flex-start;
++      gap: 12px;
++      padding: 12px 14px;
++      border: 1px solid #dcdcdc;
++      border-radius: 6px;
++      background: white;
++      transition: border-color 0.2s, box-shadow 0.2s;
++    }
++
++    .suite-option-card:hover {
++      border-color: var(--primary);
++    }
++
++    .suite-option-card input[type="radio"] {
++      margin-top: 4px;
++      accent-color: var(--primary);
++      cursor: pointer;
++    }
++
++    .suite-option-card label {
++      cursor: pointer;
++      display: flex;
++      flex-direction: column;
++      gap: 4px;
++      width: 100%;
++    }
++
++    .suite-title {
++      display: flex;
++      align-items: center;
++      gap: 8px;
++      flex-wrap: wrap;
++    }
++
++    .suite-desc {
++      font-size: 0.85rem;
++      font-weight: normal;
++      color: #555;
++    }
++
++    .suite-meta {
++      font-size: 0.78rem;
++      color: #757575;
++    }
++
++    .tag {
++      font-size: 0.72rem;
++      padding: 2px 7px;
++      border-radius: 12px;
++      font-weight: 700;
++      text-transform: uppercase;
++      letter-spacing: 0.5px;
++    }
++
++    .tag-recommended {
++      background: #e8f5e9;
++      color: #2e7d32;
++    }
++
++    .tag-pq {
++      background: #e3f2fd;
++      color: #1565c0;
++    }
++
++    .tag-hybrid {
++      background: #ede7f6;
++      color: #512da8;
++    }
++
++    /* Output Card / Inspector */
++    .inspector-card {
++      background: #fbf9f8;
++      border: 1px solid #d7ccc8;
++      border-radius: 8px;
++      padding: 20px;
++      margin-top: 25px;
++    }
++
++    .inspector-header {
++      display: flex;
++      justify-content: space-between;
++      align-items: center;
++      margin-bottom: 15px;
++      flex-wrap: wrap;
++      gap: 10px;
++    }
++
++    .inspector-header h4 {
++      color: var(--primary);
++      margin: 0;
++      font-size: 1.1rem;
++    }
++
++    .crypto-field {
++      margin-bottom: 12px;
++    }
++
++    .crypto-field label {
++      display: block;
++      font-size: 0.8rem;
++      color: #616161;
++      text-transform: uppercase;
++      letter-spacing: 0.5px;
++      margin-bottom: 3px;
++    }
++
++    .code-box {
++      background: #272822;
++      color: #f8f8f2;
++      padding: 10px 12px;
++      border-radius: 5px;
++      font-family: Consolas, Monaco, 'Courier New', monospace;
++      font-size: 0.82rem;
++      word-break: break-all;
++      max-height: 80px;
++      overflow-y: auto;
++    }
++
++    /* Dispatch Key Status Info Box */
++    .dispatch-info-box {
++      background: #efebe9;
++      border-radius: 8px;
++      padding: 16px 20px;
++      margin-bottom: 20px;
++      display: flex;
++      justify-content: space-between;
++      align-items: center;
++      flex-wrap: wrap;
++      gap: 15px;
++    }
++
++    .dispatch-info-box h4 {
++      color: var(--primary);
++      margin-bottom: 4px;
++    }
++
++    .dispatch-info-box p {
++      font-size: 0.85rem;
++      color: #5d4037;
++      margin: 0;
++    }
++
++    /* Decryption Result Card */
++    .result-card {
++      border-radius: 8px;
++      padding: 20px;
++      margin-top: 20px;
++    }
++
++    .result-card.success {
++      background: #e8f5e9;
++      border: 1px solid #a5d6a7;
++      color: #1b5e20;
++    }
++
++    .result-card.error {
++      background: #ffebee;
++      border: 1px solid #ef9a9a;
++      color: #b71c1c;
++    }
++
++    .result-note-text {
++      background: white;
++      border: 1px dashed #bdbdbd;
++      border-radius: 6px;
++      padding: 12px 16px;
++      font-size: 1rem;
++      color: var(--text);
++      margin: 12px 0;
++      white-space: pre-wrap;
++    }
++
++    .badge {
++      display: inline-block;
++      padding: 4px 10px;
++      border-radius: 4px;
++      font-size: 0.85rem;
++      font-weight: 700;
++    }
++
++    .badge-success {
++      background: #2e7d32;
++      color: white;
++    }
++
++    .badge-error {
++      background: #c62828;
++      color: white;
++    }
++
++    /* Tamper panel */
++    .tamper-panel {
++      background: #fff8e1;
++      border: 1px solid #ffe082;
++      border-radius: 8px;
++      padding: 16px;
++      margin-top: 20px;
++    }
++
++    .tamper-panel h4 {
++      color: #f57f17;
++      margin-bottom: 8px;
++      display: flex;
++      align-items: center;
++      gap: 6px;
++    }
++
++    .tamper-panel p {
++      font-size: 0.85rem;
++      color: #795548;
++      margin-bottom: 12px;
++    }
++
++    .tamper-buttons {
++      display: flex;
++      gap: 10px;
++      flex-wrap: wrap;
++    }
++
++    /* Saved Notes List */
++    .saved-notes-container {
++      margin-top: 30px;
++      border-top: 1px solid #e0e0e0;
++      padding-top: 25px;
++    }
++
++    .saved-note-item {
++      background: #fafafa;
++      border: 1px solid #e0e0e0;
++      border-radius: 6px;
++      padding: 12px 16px;
++      margin-bottom: 10px;
++      display: flex;
++      justify-content: space-between;
++      align-items: center;
++      flex-wrap: wrap;
++      gap: 10px;
++    }
++
++    .note-suite-badge {
++      background: var(--secondary);
++      color: var(--primary);
++      padding: 2px 8px;
++      border-radius: 4px;
++      font-size: 0.78rem;
++      font-weight: 600;
++    }
++
++    .sr-only {
++      position: absolute;
++      width: 1px;
++      height: 1px;
++      padding: 0;
++      margin: -1px;
++      overflow: hidden;
++      clip: rect(0, 0, 0, 0);
++      white-space: nowrap;
++      border-width: 0;
++    }
++
+     footer {
+       background: var(--secondary);
+       text-align: center;
+@@ -163,6 +673,7 @@
+       <li><a href="/menu">Menu</a></li>
+       <li><a href="/locations">Locations</a></li>
+       <li><a href="/rewards">Rewards</a></li>
++      <li><a href="#encrypted-delivery-section">Encrypted Notes</a></li>
+       <li><a href="/account">My Account</a></li>
+       <li><a href="/logout" class="logout-link">Logout</a></li>
+     </ul>
+@@ -171,7 +682,10 @@
+   <header class="hero">
+     <h1>Wake Up Your Senses</h1>
+     <p>Ethically sourced, locally roasted, delivered to your cup.</p>
+-    <a href="/order-online" class="btn">Order Now</a>
++    <div style="display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;">
++      <a href="/order-online" class="btn">Order Now</a>
++      <a href="#encrypted-delivery-section" class="btn btn-hero-secure">🔒 Secure Delivery Notes</a>
++    </div>
+   </header>
+ 
+   <main class="container">
+@@ -195,6 +709,196 @@
+         </div>
+       </div>
+     </section>
++
++    <!-- Encrypted Delivery Notes Section -->
++    <section id="encrypted-delivery-section" class="delivery-notes-section" aria-labelledby="delivery-notes-heading">
++      <div class="section-header">
++        <h2 id="delivery-notes-heading">
++          <span>🔒 Quantum-Safe Encrypted Delivery Notes</span>
++        </h2>
++        <p>
++          Protect your gate codes, door keys, and private delivery instructions with post-quantum hybrid Key Encapsulation (MLKEM768-X25519) and client-side authenticated AEAD encryption (ChaCha20-Poly1305 / AES-GCM). Notes are encrypted directly in your browser before submission and can only be decapsulated by authorized Daily Grind dispatch personnel.
++        </p>
++      </div>
++
++      <!-- Real-Time Cryptographic Capability Banner -->
++      <div class="security-banner" role="region" aria-label="Cryptographic Security Status">
++        <div id="crypto-support-badge" class="security-badge badge-quantum">
++          🛡️ Probing Client-Side WebCrypto Capabilities...
++        </div>
++        <p id="crypto-support-details">
++          Detecting hardware and browser support for NIST post-quantum KEMs (FIPS 203) and authenticated encryption.
++        </p>
++      </div>
++
++      <!-- Navigation Tabs -->
++      <div class="tabs-nav" role="tablist" aria-label="Encrypted Delivery Notes Views">
++        <button type="button" class="tab-btn active" role="tab" id="tab-btn-customer" aria-selected="true" aria-controls="panel-customer" data-target="panel-customer">
++          ✍️ Customer: Encrypt Note
++        </button>
++        <button type="button" class="tab-btn" role="tab" id="tab-btn-courier" aria-selected="false" aria-controls="panel-courier" data-target="panel-courier">
++          📦 Courier / Dispatch: Decrypt &amp; Verify
++        </button>
++      </div>
++
++      <!-- Panel 1: Customer View (Encryption) -->
++      <div id="panel-customer" class="tab-panel active" role="tabpanel" aria-labelledby="tab-btn-customer">
++        <form id="encrypt-note-form" novalidate aria-labelledby="form-customer-heading">
++          <h3 id="form-customer-heading" class="sr-only">Encrypted Delivery Note Entry</h3>
++
++          <div class="form-row">
++            <div class="form-group">
++              <label for="note-order-id">
++                Order Reference / ID <span class="required-star" aria-hidden="true">*</span>
++              </label>
++              <input type="text" id="note-order-id" name="orderId" required aria-describedby="order-id-hint" value="DG-2026-8842" autocomplete="off">
++              <span id="order-id-hint" class="hint">Cryptographically bound to the encryption as Additional Authenticated Data (AAD).</span>
++            </div>
++
++            <div class="form-group">
++              <label for="note-address">
++                Delivery Address / Unit <span class="required-star" aria-hidden="true">*</span>
++              </label>
++              <input type="text" id="note-address" name="address" required aria-describedby="address-hint" value="742 Evergreen Terrace, Apt 4B" autocomplete="street-address">
++              <span id="address-hint" class="hint">Delivery location associated with this order.</span>
++            </div>
++          </div>
++
++          <div class="form-group">
++            <label for="note-plaintext">
++              Sensitive Delivery Instructions <span class="required-star" aria-hidden="true">*</span>
++            </label>
++            <textarea id="note-plaintext" name="plaintext" required aria-describedby="note-hint" rows="4">Gate code is #4829. Leave coffee box inside parcel locker behind the jasmine trellis. Call 555-0199 if front gate does not buzz open.</textarea>
++            <span id="note-hint" class="hint">Encrypted locally in browser using a fresh 12-byte IV and encapsulated shared key. Plaintext is never stored or transmitted in the clear.</span>
++          </div>
++
++          <!-- KEM / Cryptography Suite Selection -->
++          <fieldset class="suite-fieldset">
++            <legend>Select Public-Key Encapsulation / Key Agreement Suite</legend>
++            <div id="suite-options-container" class="suite-options-grid">
++              <!-- Dynamically populated with MLKEM768-X25519, ML-KEM-768, ML-KEM-1024, X25519 fallback -->
++            </div>
++          </fieldset>
++
++          <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
++            <button type="submit" class="btn btn-encrypt" id="btn-submit-encrypt">
++              🔐 Encrypt &amp; Submit Delivery Note
++            </button>
++            <button type="button" class="btn btn-secondary" id="btn-clear-note-form">
++              Clear Form
++            </button>
++          </div>
++        </form>
++
++        <!-- Live Encrypted Package Output Inspector -->
++        <div id="encrypted-output-card" class="inspector-card" hidden aria-live="polite">
++          <div class="inspector-header">
++            <h4>📦 Client-Side Encrypted Envelope Payload</h4>
++            <button type="button" class="btn btn-sm btn-outline" id="btn-copy-package-json">
++              Copy Encrypted Package JSON
++            </button>
++          </div>
++
++          <div class="crypto-field">
++            <label>Authenticated Cryptographic Suite</label>
++            <div id="out-suite" style="font-weight: 600; color: var(--primary);"></div>
++          </div>
++
++          <div class="crypto-field">
++            <label>Encapsulated Key Capsule (Base64)</label>
++            <div id="out-capsule" class="code-box"></div>
++          </div>
++
++          <div class="form-row">
++            <div class="crypto-field">
++              <label>12-Byte Initialization Vector / Nonce (Base64)</label>
++              <div id="out-iv" class="code-box"></div>
++            </div>
++            <div class="crypto-field">
++              <label>Associated Authenticated Data (AAD)</label>
++              <div id="out-aad" class="code-box"></div>
++            </div>
++          </div>
++
++          <div class="crypto-field">
++            <label>Authenticated Ciphertext &amp; Poly1305 / GCM Tag (Base64)</label>
++            <div id="out-ciphertext" class="code-box"></div>
++          </div>
++
++          <input type="hidden" id="output-package-json" value="">
++        </div>
++      </div>
++
++      <!-- Panel 2: Courier / Dispatch Decryptor View -->
++      <div id="panel-courier" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-courier" hidden>
++        <!-- Dispatch Recipient Key Status Box -->
++        <div class="dispatch-info-box">
++          <div>
++            <h4 id="recipient-key-status">Dispatch Key Pair Initializing...</h4>
++            <p>
++              Public Key Fingerprint: <code id="recipient-fingerprint">Generating...</code> |
++              Key Size: <span id="recipient-key-size">...</span>
++            </p>
++          </div>
++          <div>
++            <button type="button" class="btn btn-sm btn-outline" id="btn-rotate-recipient-keys">
++              🔄 Rotate Dispatch Key Pair
++            </button>
++          </div>
++        </div>
++
++        <div class="form-group">
++          <label for="courier-package-input">
++            Encrypted Delivery Package JSON
++          </label>
++          <textarea id="courier-package-input" rows="6" aria-describedby="courier-input-hint" placeholder="Paste or load encrypted package JSON here..."></textarea>
++          <span id="courier-input-hint" class="hint">Contains ciphertext capsule, 12-byte IV, AAD, and authenticated ciphertext.</span>
++        </div>
++
++        <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
++          <button type="button" class="btn btn-decrypt" id="btn-decrypt-action">
++            🔓 Decapsulate Key &amp; Decrypt Note
++          </button>
++        </div>
++
++        <!-- Decryption Result Card -->
++        <div id="decrypt-result-card" class="result-card" hidden aria-live="polite">
++          <div id="decrypt-status-badge" class="badge"></div>
++          <div id="decrypt-result-text" class="result-note-text"></div>
++          <div id="decrypt-result-meta" style="font-size: 0.85rem;"></div>
++        </div>
++
++        <!-- Tamper Verification & Security Testing Panel -->
++        <div class="tamper-panel">
++          <h4>⚠️ Authenticated Encryption Tamper Verification</h4>
++          <p>
++            AEAD guarantees that if an attacker alters even a single bit of the ciphertext or swaps the order ID/delivery address in transit, decryption will immediately fail with an authentication error (Poly1305/GCM tag rejection).
++          </p>
++          <div class="tamper-buttons">
++            <button type="button" class="btn btn-sm btn-danger" id="btn-tamper-ciphertext">
++              Simulate Altered Ciphertext (Bit Flip)
++            </button>
++            <button type="button" class="btn btn-sm btn-danger" id="btn-tamper-aad">
++              Simulate Altered Order ID (AAD Tampering)
++            </button>
++          </div>
++        </div>
++      </div>
++
++      <!-- Encrypted Notes Vault (Stored Encrypted Orders) -->
++      <div class="saved-notes-container">
++        <h3 style="color: var(--primary); margin-bottom: 12px; font-size: 1.15rem;">
++          🗄️ Encrypted Delivery Notes Vault (Session Storage)
++        </h3>
++        <p style="font-size: 0.88rem; color: #616161; margin-bottom: 15px;">
++          All stored customer instructions are held strictly in encrypted form (ciphertext + KEM capsule). Plaintext is only recovered when decapsulated by the dispatch key holder.
++        </p>
++        <div id="saved-notes-list"></div>
++      </div>
++
++      <!-- Screen reader live announcer -->
++      <div id="crypto-live-announcer" class="sr-only" aria-live="polite"></div>
++    </section>
+   </main>
+ 
+   <footer>
+@@ -207,6 +911,7 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script type="module" src="./delivery-notes.js"></script>
+ </body>
+ 
+ </html>
+diff --git a/package.json b/package.json
+index 2bd4d77..f5a118c 100644
+--- a/package.json
++++ b/package.json
+@@ -1,8 +1,10 @@
+ {
+   "name": "daily-grind",
+   "version": "1.0.0",
++  "type": "module",
+   "scripts": {
+-    "start": "pnpm dlx statikk --port ${PORT:-11222}"
++    "start": "pnpm dlx statikk --port ${PORT:-11222}",
++    "test": "node test/crypto.test.mjs"
+   },
+   "pnpm": {
+     "onlyBuiltDependencies": []
+diff --git a/test/crypto.test.mjs b/test/crypto.test.mjs
+new file mode 100644
+index 0000000..39b25a2
+--- /dev/null
++++ b/test/crypto.test.mjs
+@@ -0,0 +1,132 @@
++import {
++  SUITES,
++  getAvailableSuites,
++  generateRecipientKeyPair,
++  importPublicKey,
++  encapsulateEnvelopeKey,
++  decapsulateEnvelopeKey,
++  encryptMessage,
++  decryptMessage,
++  createEncryptedDeliveryPackage,
++  openEncryptedDeliveryPackage,
++  bytesToBase64,
++  base64ToBytes,
++  computeFingerprint,
++} from '../delivery-crypto.js';
++
++async function runTests() {
++  console.log('Testing delivery-crypto.js...');
++
++  // 1. Suite discovery
++  const suites = getAvailableSuites();
++  console.log('Available suites count:', suites.length);
++  const hybridSuite = suites.find((s) => s.id === SUITES.HYBRID_MLKEM768);
++  if (!hybridSuite) throw new Error('Hybrid suite missing');
++
++  // Test Base64 roundtrip
++  const sampleBytes = new Uint8Array([0, 15, 255, 128, 42, 99]);
++  const b64 = bytesToBase64(sampleBytes);
++  const roundtripBytes = base64ToBytes(b64);
++  if (roundtripBytes.length !== sampleBytes.length || roundtripBytes[2] !== 255) {
++    throw new Error('Base64 roundtrip failed');
++  }
++
++  // Test all supported suites
++  for (const suite of suites) {
++    if (!suite.supported) {
++      console.log(`Skipping unsupported suite: ${suite.id}`);
++      continue;
++    }
++
++    console.log(`\nTesting Suite: ${suite.id} (${suite.aead})`);
++
++    // A. Key Generation
++    const recipient = await generateRecipientKeyPair(suite.id);
++    if (!recipient.keyPair || !recipient.publicKeyBytes) {
++      throw new Error(`Failed to generate recipient keys for ${suite.id}`);
++    }
++    console.log(`- Generated key pair, public key size: ${recipient.publicKeyBytes.byteLength} bytes`);
++    console.log(`- Fingerprint: ${recipient.fingerprint}`);
++
++    // B. Encapsulation & Decapsulation
++    const { sharedKey: senderSharedKey, capsuleBytes } = await encapsulateEnvelopeKey(
++      recipient.publicKeyBytes,
++      suite.id
++    );
++    console.log(`- Encapsulated key, capsule size: ${capsuleBytes.byteLength} bytes`);
++
++    const recipientSharedKey = await decapsulateEnvelopeKey(
++      recipient.keyPair.privateKey,
++      capsuleBytes,
++      suite.id
++    );
++    console.log(`- Decapsulated key on recipient`);
++
++    // C. Encryption & Decryption
++    const note = 'Sensitive note: Gate code is 8821. Key under the flowerpot.';
++    const aad = new TextEncoder().encode('AAD-ORDER-101');
++    const { iv, ciphertext } = await encryptMessage(senderSharedKey, note, aad);
++    console.log(`- Encrypted note, ciphertext size: ${ciphertext.byteLength} bytes, IV: ${iv.byteLength} bytes`);
++
++    const decryptedNote = await decryptMessage(recipientSharedKey, iv, ciphertext, aad);
++    if (decryptedNote !== note) {
++      throw new Error(`Decrypted note does not match original! Expected "${note}", got "${decryptedNote}"`);
++    }
++    console.log(`- Successfully decrypted and authenticated note`);
++
++    // D. Tamper testing - Ciphertext
++    const tamperedCiphertext = new Uint8Array(ciphertext);
++    tamperedCiphertext[tamperedCiphertext.length - 1] ^= 0x01;
++    let tamperDetected = false;
++    try {
++      await decryptMessage(recipientSharedKey, iv, tamperedCiphertext, aad);
++    } catch (e) {
++      tamperDetected = true;
++    }
++    if (!tamperDetected) {
++      throw new Error('Authenticated encryption failed to detect tampered ciphertext!');
++    }
++    console.log(`- Correctly rejected tampered ciphertext`);
++
++    // E. Tamper testing - AAD
++    const tamperedAad = new TextEncoder().encode('AAD-ORDER-TAMPERED');
++    let aadTamperDetected = false;
++    try {
++      await decryptMessage(recipientSharedKey, iv, ciphertext, tamperedAad);
++    } catch (e) {
++      aadTamperDetected = true;
++    }
++    if (!aadTamperDetected) {
++      throw new Error('Authenticated encryption failed to detect tampered AAD!');
++    }
++    console.log(`- Correctly rejected tampered AAD`);
++
++    // F. High-level package workflow
++    const pkg = await createEncryptedDeliveryPackage({
++      recipientPublicKeyBytes: recipient.publicKeyBytes,
++      suiteId: suite.id,
++      plaintext: 'Package Test: Leave behind counter #3',
++      orderId: 'DG-TEST-99',
++      address: '123 Coffee Lane',
++    });
++
++    const opened = await openEncryptedDeliveryPackage({
++      packageData: pkg,
++      recipientPrivateKey: recipient.keyPair.privateKey,
++    });
++
++    if (opened.decryptedNote !== 'Package Test: Leave behind counter #3') {
++      throw new Error('Package decryption failed');
++    }
++    console.log(`- High-level package workflow verified for ${suite.id}`);
++  }
++
++  console.log('\n=============================');
++  console.log('ALL CRYPTO TESTS PASSED 100%!');
++  console.log('=============================');
++}
++
++runTests().catch((err) => {
++  console.error('Test failed:', err);
++  process.exit(1);
++});

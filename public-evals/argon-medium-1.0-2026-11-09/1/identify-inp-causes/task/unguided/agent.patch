@@ -1,0 +1,387 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -206,7 +206,383 @@
+     </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script type="importmap">
++    {
++      "imports": {
++        "web-vitals": "/node_modules/web-vitals/dist/web-vitals.js",
++        "web-vitals/attribution": "/node_modules/web-vitals/dist/web-vitals.attribution.js"
++      }
++    }
++  </script>
++  <script src="/node_modules/web-vitals/dist/web-vitals.attribution.iife.js"></script>
++  <script type="module">
++    import { onINP, INPThresholds } from 'web-vitals/attribution';
++
++    const ANALYTICS_ENDPOINT = window.INP_ANALYTICS_ENDPOINT || '/analytics/inp';
++    const SLOW_INTERACTION_THRESHOLD_MS = INPThresholds?.[0] ?? 200;
++
++    // Global field telemetry store for inspection and reporting
++    window.__INP_METRICS__ = [];
++    window.inpMetrics = window.__INP_METRICS__;
++    window.lastINPReport = null;
++
++    /**
++     * Classifies which INP subpart/phase a script execution occurred in.
++     */
++    function classifySubpart(scriptStartTime, interactionTime, inputDelay, processingDuration) {
++      const processingStart = interactionTime + inputDelay;
++      const processingEnd = processingStart + processingDuration;
++      if (scriptStartTime < processingStart) {
++        return 'input-delay';
++      }
++      if (scriptStartTime >= processingEnd) {
++        return 'presentation-delay';
++      }
++      return 'processing-duration';
++    }
++
++    /**
++     * Identifies the primary bottleneck phase among Input Delay, Processing Duration,
++     * and Presentation Delay, as well as detailed rendering sub-phases from LoAF.
++     */
++    function determineDominantPhase(phases) {
++      const candidates = [
++        { phase: 'input-delay', duration: phases.inputDelay || 0 },
++        { phase: 'processing-duration', duration: phases.processingDuration || 0 },
++        { phase: 'presentation-delay', duration: phases.presentationDelay || 0 },
++      ];
++      candidates.sort((a, b) => b.duration - a.duration);
++      return candidates[0];
++    }
++
++    /**
++     * Extracts detailed rendering phase timings and script attribution from
++     * intersecting Long Animation Frame (LoAF) entries.
++     */
++    function extractLoAFBreakdown(loafEntries = [], interactionTime = 0, inputDelay = 0, processingDuration = 0, nextPaintTime = 0) {
++      const frames = [];
++      const scripts = [];
++
++      for (const loaf of loafEntries) {
++        const frameEnd = loaf.startTime + loaf.duration;
++        const renderStart = loaf.renderStart || 0;
++        const styleAndLayoutStart = loaf.styleAndLayoutStart || 0;
++
++        // LoAF rendering phase breakdown:
++        // 1. Work duration (tasks/scripts before rendering)
++        const workDuration = renderStart > 0 ? Math.max(0, renderStart - loaf.startTime) : loaf.duration;
++        // 2. Pre-layout / render callbacks (requestAnimationFrame, ResizeObserver, IntersectionObserver, etc.)
++        const renderCallbacksDuration =
++          renderStart > 0 && styleAndLayoutStart > 0
++            ? Math.max(0, styleAndLayoutStart - renderStart)
++            : 0;
++        // 3. Style and layout calculation at end of frame
++        const styleAndLayoutDuration =
++          styleAndLayoutStart > 0 ? Math.max(0, frameEnd - styleAndLayoutStart) : 0;
++
++        const frameScripts = (loaf.scripts || []).map((script) => {
++          const scriptEnd = script.startTime + script.duration;
++          const intersectingDuration = Math.max(
++            0,
++            scriptEnd - Math.max(interactionTime, script.startTime)
++          );
++          const compileDuration =
++            script.executionStart > script.startTime
++              ? script.executionStart - script.startTime
++              : 0;
++          const executionDuration = Math.max(
++            0,
++            scriptEnd - (script.executionStart || script.startTime) - (script.forcedStyleAndLayoutDuration || 0)
++          );
++          const subpart = classifySubpart(
++            script.startTime,
++            interactionTime,
++            inputDelay,
++            processingDuration
++          );
++
++          const scriptSummary = {
++            invoker: script.invoker || 'unknown',
++            invokerType: script.invokerType || 'unknown',
++            sourceURL: script.sourceURL || window.location.href,
++            sourceFunctionName: script.sourceFunctionName || '(anonymous)',
++            sourceCharPosition: script.sourceCharPosition ?? -1,
++            startTime: script.startTime,
++            executionStart: script.executionStart,
++            duration: script.duration,
++            intersectingDuration,
++            compileDuration,
++            executionDuration,
++            forcedStyleAndLayoutDuration: script.forcedStyleAndLayoutDuration || 0,
++            pauseDuration: script.pauseDuration || 0,
++            windowAttribution: script.windowAttribution || 'self',
++            subpart,
++          };
++          scripts.push(scriptSummary);
++          return scriptSummary;
++        });
++
++        frames.push({
++          startTime: loaf.startTime,
++          duration: loaf.duration,
++          blockingDuration: loaf.blockingDuration || 0,
++          firstUIEventTimestamp: loaf.firstUIEventTimestamp || 0,
++          renderStart,
++          styleAndLayoutStart,
++          phases: {
++            workDuration,
++            renderCallbacksDuration,
++            styleAndLayoutDuration,
++          },
++          scripts: frameScripts,
++        });
++      }
++
++      // Sort scripts by intersecting duration descending to highlight top offenders
++      scripts.sort((a, b) => b.intersectingDuration - a.intersectingDuration || b.duration - a.duration);
++
++      return { frames, scripts };
++    }
++
++    /**
++     * Dispatches telemetry payload to field analytics endpoint using sendBeacon/fetch.
++     */
++    function sendToAnalytics(report) {
++      const payload = JSON.stringify(report);
++      try {
++        if (navigator.sendBeacon) {
++          const blob = new Blob([payload], { type: 'application/json' });
++          navigator.sendBeacon(ANALYTICS_ENDPOINT, blob);
++        } else if (typeof fetch === 'function') {
++          fetch(ANALYTICS_ENDPOINT, {
++            method: 'POST',
++            body: payload,
++            headers: { 'Content-Type': 'application/json' },
++            keepalive: true,
++          }).catch(() => {});
++        }
++      } catch {
++        // Ignore network errors in static/offline environments
++      }
++    }
++
++    /**
++     * Builds and records a structured INP attribution report from a web-vitals INPMetricWithAttribution.
++     */
++    function handleINPReport(metric) {
++      const attr = metric.attribution || {};
++      const interactionTime = attr.interactionTime ?? metric.entries?.[0]?.startTime ?? 0;
++      const inputDelay = attr.inputDelay ?? 0;
++      const processingDuration = attr.processingDuration ?? 0;
++      const presentationDelay = attr.presentationDelay ?? 0;
++      const nextPaintTime = attr.nextPaintTime ?? interactionTime + metric.value;
++
++      const { frames, scripts } = extractLoAFBreakdown(
++        attr.longAnimationFrameEntries || [],
++        interactionTime,
++        inputDelay,
++        processingDuration,
++        nextPaintTime
++      );
++
++      const longestScript = attr.longestScript
++        ? {
++            subpart: attr.longestScript.subpart,
++            intersectingDuration: attr.longestScript.intersectingDuration,
++            invoker: attr.longestScript.entry?.invoker || 'unknown',
++            invokerType: attr.longestScript.entry?.invokerType || 'unknown',
++            sourceURL: attr.longestScript.entry?.sourceURL || window.location.href,
++            sourceFunctionName: attr.longestScript.entry?.sourceFunctionName || '(anonymous)',
++            sourceCharPosition: attr.longestScript.entry?.sourceCharPosition ?? -1,
++            startTime: attr.longestScript.entry?.startTime ?? 0,
++            executionStart: attr.longestScript.entry?.executionStart ?? 0,
++            duration: attr.longestScript.entry?.duration ?? 0,
++            forcedStyleAndLayoutDuration:
++              attr.longestScript.entry?.forcedStyleAndLayoutDuration ?? 0,
++            pauseDuration: attr.longestScript.entry?.pauseDuration ?? 0,
++            windowAttribution: attr.longestScript.entry?.windowAttribution || 'self',
++            entry: attr.longestScript.entry,
++          }
++        : scripts[0] || null;
++
++      const renderingPhases = {
++        inputDelay,
++        processingDuration,
++        presentationDelay,
++        totalScriptDuration: attr.totalScriptDuration ?? 0,
++        totalStyleAndLayoutDuration: attr.totalStyleAndLayoutDuration ?? 0,
++        totalPaintDuration: attr.totalPaintDuration ?? 0,
++        totalUnattributedDuration: attr.totalUnattributedDuration ?? 0,
++      };
++
++      const dominantPhase = determineDominantPhase(renderingPhases);
++
++      const processedEvents = (attr.processedEventEntries || metric.entries || []).map((entry) => ({
++        name: entry.name,
++        interactionId: entry.interactionId,
++        startTime: entry.startTime,
++        processingStart: entry.processingStart,
++        processingEnd: entry.processingEnd,
++        duration: entry.duration,
++        inputDelay: Math.max(0, entry.processingStart - entry.startTime),
++        processingDuration: Math.max(0, entry.processingEnd - entry.processingStart),
++        presentationDelay: Math.max(0, entry.startTime + entry.duration - entry.processingEnd),
++      }));
++
++      const report = {
++        name: metric.name,
++        id: metric.id,
++        value: metric.value,
++        delta: metric.delta,
++        rating: metric.rating,
++        isSlow: metric.value > SLOW_INTERACTION_THRESHOLD_MS,
++        navigationType: metric.navigationType,
++        timestamp: Date.now(),
++        pageUrl: window.location.href,
++        attribution: {
++          interactionTarget: attr.interactionTarget || 'unknown',
++          interactionType: attr.interactionType || 'unknown',
++          interactionTime,
++          nextPaintTime,
++          loadState: attr.loadState || document.readyState,
++          inputDelay,
++          processingDuration,
++          presentationDelay,
++          totalScriptDuration: attr.totalScriptDuration,
++          totalStyleAndLayoutDuration: attr.totalStyleAndLayoutDuration,
++          totalPaintDuration: attr.totalPaintDuration,
++          totalUnattributedDuration: attr.totalUnattributedDuration,
++          dominantPhase: dominantPhase.phase,
++          dominantPhaseDuration: dominantPhase.duration,
++          renderingPhases,
++          longestScript,
++          scripts,
++          longAnimationFrameEntries: frames,
++          processedEventEntries: processedEvents,
++        },
++      };
++
++      window.lastINPReport = report;
++      window.__INP_METRICS__.push(report);
++
++      // Log attribution details for slow interactions and field diagnostics
++      console.log('[INP Attribution]', {
++        value: `${Math.round(report.value)}ms`,
++        rating: report.rating,
++        target: report.attribution.interactionTarget,
++        type: report.attribution.interactionType,
++        loadState: report.attribution.loadState,
++        dominantPhase: report.attribution.dominantPhase,
++        phases: renderingPhases,
++        longestScript: longestScript
++          ? {
++              sourceURL: longestScript.sourceURL,
++              sourceFunctionName: longestScript.sourceFunctionName,
++              sourceCharPosition: longestScript.sourceCharPosition,
++              invoker: longestScript.invoker,
++              invokerType: longestScript.invokerType,
++              subpart: longestScript.subpart,
++              intersectingDuration: longestScript.intersectingDuration,
++              forcedStyleAndLayoutDuration: longestScript.forcedStyleAndLayoutDuration,
++            }
++          : null,
++        scripts,
++        frames,
++      });
++
++      window.dispatchEvent(new CustomEvent('inp-metric', { detail: report }));
++      sendToAnalytics(report);
++    }
++
++    // Initialize web-vitals INP attribution observer
++    onINP(handleINPReport, {
++      reportAllChanges: true,
++      durationThreshold: 0,
++      includeProcessedEventEntries: true,
++    });
++
++    // Native PerformanceObserver instrumentation for Event Timing & Long Animation Frames (LoAF)
++    // Correlates individual slow interaction events directly with intersecting LoAF entries
++    if (typeof PerformanceObserver !== 'undefined') {
++      const supportedTypes = PerformanceObserver.supportedEntryTypes || [];
++      const recentLoAFEntries = [];
++      window.__LOAF_ENTRIES__ = recentLoAFEntries;
++      window.__SLOW_INTERACTIONS__ = [];
++
++      if (supportedTypes.includes('long-animation-frame')) {
++        const loafObserver = new PerformanceObserver((list) => {
++          for (const entry of list.getEntries()) {
++            recentLoAFEntries.push(entry);
++            if (recentLoAFEntries.length > 50) {
++              recentLoAFEntries.shift();
++            }
++          }
++        });
++        loafObserver.observe({ type: 'long-animation-frame', buffered: true });
++      }
++
++      if (supportedTypes.includes('event')) {
++        const eventObserver = new PerformanceObserver((list) => {
++          for (const entry of list.getEntries()) {
++            if (!entry.interactionId) continue;
++
++            const startTime = entry.startTime;
++            const processingStart = Math.max(entry.processingStart, startTime);
++            const nextPaintTime = Math.max(startTime + entry.duration, processingStart);
++            const processingEnd = Math.min(entry.processingEnd, nextPaintTime);
++
++            const inputDelay = processingStart - startTime;
++            const processingDuration = processingEnd - processingStart;
++            const presentationDelay = nextPaintTime - processingEnd;
++
++            const intersectingLoAFs = recentLoAFEntries.filter(
++              (loaf) => loaf.startTime + loaf.duration >= startTime && loaf.startTime <= processingEnd
++            );
++
++            const { frames, scripts } = extractLoAFBreakdown(
++              intersectingLoAFs,
++              startTime,
++              inputDelay,
++              processingDuration,
++              nextPaintTime
++            );
++
++            const interactionDetail = {
++              interactionId: entry.interactionId,
++              name: entry.name,
++              duration: entry.duration,
++              startTime,
++              processingStart,
++              processingEnd,
++              nextPaintTime,
++              target: entry.target ? entry.target.tagName + (entry.target.id ? `#${entry.target.id}` : '') : 'unknown',
++              phases: {
++                inputDelay,
++                processingDuration,
++                presentationDelay,
++              },
++              dominantPhase: determineDominantPhase({
++                inputDelay,
++                processingDuration,
++                presentationDelay,
++              }).phase,
++              scripts,
++              longAnimationFrames: frames,
++            };
++
++            window.__SLOW_INTERACTIONS__.push(interactionDetail);
++          }
++        });
++        eventObserver.observe({
++          type: 'event',
++          buffered: true,
++          durationThreshold: 40,
++        });
++      }
++    }
++  </script>
++
+ </body>
+ 
+ </html>

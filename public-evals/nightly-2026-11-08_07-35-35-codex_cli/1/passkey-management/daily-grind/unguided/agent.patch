@@ -1,0 +1,681 @@
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..016e176
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,55 @@
++# The Daily Grind account UI
++
++A static, responsive account security page. Open it through the existing static hosting setup. No dependencies or build step are required.
++
++The default account is an explicitly labeled preview. Its three sample passkeys can be renamed or removed; changes persist in local storage. Sample credentials never trigger authenticator signals. No real authentication or server-side account storage existed in the original project.
++
++## Connect an authenticated account API
++
++Set this configuration before `app.js` loads:
++
++```html
++<script>
++  window.dailyGrindAccount = {
++    apiBase: '/api/account/passkeys',
++    csrfToken: 'SERVER_GENERATED_CSRF_TOKEN'
++  };
++</script>
++```
++
++The client sends same-origin session credentials and the configured `X-CSRF-Token`. The backend must authenticate the customer, enforce CSRF checks and ownership on every operation, validate names, and guard against account lockout when deleting the last usable sign-in method. Do not populate this configuration from user-controlled content.
++
++Expected endpoints:
++
++- `GET /api/account/passkeys`: returns the snapshot below, scoped to the signed-in customer.
++- `PATCH /api/account/passkeys/:id`: accepts `{ "name": "My laptop" }`; returns `204` after saving the account label.
++- `DELETE /api/account/passkeys/:id`: returns `204` only after revoking the credential on the server.
++
++```json
++{
++  "rpId": "your-production-domain.example",
++  "userId": "BASE64URL_WEBAUTHN_USER_HANDLE",
++  "passkeys": [
++    {
++      "id": "SERVER_RECORD_ID",
++      "credentialId": "BASE64URL_CREDENTIAL_ID",
++      "name": "MacBook Pro",
++      "kind": "laptop",
++      "provider": "iCloud Keychain",
++      "created": "Oct 12, 2026",
++      "lastUsed": "Today",
++      "current": true
++    }
++  ]
++}
++```
++
++`kind` supports `laptop`, `phone`, and `key`. The user ID is the original WebAuthn user handle, not an email or database account ID. Return `current` only when known; a passkey provider may sync credentials across multiple devices.
++
++After successful deletion, the client fetches a fresh server snapshot and calls `PublicKeyCredential.signalAllAcceptedCredentials` when supported. It falls back to `signalUnknownCredential`. These require a secure context and a valid relying-party domain. A successful signal reports notification, not guaranteed authenticator deletion. Missing support or a rejected signal produces guidance to remove the stale entry from the password manager. Failed deletion never signals the browser. A rename only changes the account label; WebAuthn does not expose an API to rename individual credentials in a password manager.
++
++The server and session integration, real registration, and actual sign-in are outside this static repository. Existing menu, order, and other account links retain their intended routes and require the corresponding site pages.
++
++## Checks
++
++Run `npm test` for persistence, validation, request handling, and authenticator signal tests. No server is started.
+diff --git a/app.js b/app.js
+new file mode 100644
+index 0000000..ab3c49a
+--- /dev/null
++++ b/app.js
+@@ -0,0 +1,158 @@
++import { createPreviewRepository, createAccountRepository, validateName, syncAuthenticator } from './passkeys.mjs';
++
++const $ = selector => document.querySelector(selector);
++let storage;
++try { storage = window.localStorage; } catch { storage = { getItem() { return null; }, setItem() { throw new Error('Browser storage is unavailable. Enable storage to save changes.'); } }; }
++const repository = window.dailyGrindAccount?.apiBase
++  ? createAccountRepository(window.dailyGrindAccount)
++  : createPreviewRepository(storage);
++let snapshot = { passkeys: [] };
++let action;
++let selected;
++let busy = false;
++let toastTimer;
++const dialog = $('#action-dialog');
++const form = $('#action-form');
++const list = $('#passkey-list');
++const nameInput = $('#passkey-name');
++
++function icon(type) {
++  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
++  svg.setAttribute('aria-hidden', 'true');
++  const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
++  use.setAttribute('href', `#${type}`);
++  svg.append(use);
++  return svg;
++}
++function element(tag, className, text) {
++  const node = document.createElement(tag);
++  if (className) node.className = className;
++  if (text) node.textContent = text;
++  return node;
++}
++function render() {
++  $('#key-count').textContent = snapshot.passkeys.length;
++  list.replaceChildren();
++  if (!snapshot.passkeys.length) {
++    const empty = element('div', 'empty-state');
++    empty.append(icon('passkey'), element('h4', '', 'No passkeys registered'), element('p', '', 'Your registered passkeys will appear here. Use another sign-in method to access your account.'));
++    list.append(empty);
++  }
++  for (const key of snapshot.passkeys) {
++    const row = element('article', 'passkey-row');
++    const device = element('div', 'device-icon');
++    device.append(icon(['phone', 'laptop', 'key'].includes(key.kind) ? key.kind : 'key'));
++    const info = element('div', 'device-info');
++    const title = element('div', 'device-title');
++    title.append(element('h4', '', key.name));
++    if (key.current) title.append(element('span', 'current-badge', 'This device'));
++    const meta = element('p', 'device-meta', key.provider || 'Passkey');
++    meta.append(element('span', 'dot', '·'), document.createTextNode(`Added ${key.created || 'recently'}`));
++    const used = element('p', 'device-meta', `Last used: ${key.lastUsed || 'Not yet used'}`);
++    info.append(title, meta, used);
++    const actions = element('div', 'row-actions');
++    for (const [type, label, symbol] of [['rename', 'Rename', 'edit'], ['delete', 'Delete', 'trash']]) {
++      const button = element('button', `icon-button ${type}`);
++      button.type = 'button';
++      button.setAttribute('aria-label', `${label} ${key.name}`);
++      button.title = `${label} passkey`;
++      button.append(icon(symbol));
++      button.addEventListener('click', () => openDialog(type, key));
++      actions.append(button);
++    }
++    row.append(device, info, actions);
++    list.append(row);
++  }
++}
++function notify(message) {
++  clearTimeout(toastTimer);
++  $('#toast').textContent = message;
++  $('#toast').hidden = false;
++  toastTimer = setTimeout(() => { $('#toast').hidden = true; }, 8500);
++}
++function openDialog(type, key) {
++  action = type;
++  selected = key;
++  $('#dialog-error').textContent = '';
++  $('#rename-field').hidden = type !== 'rename';
++  $('#cancel-button').hidden = type === 'about';
++  $('#confirm-button').classList.toggle('danger-button', type === 'delete');
++  $('#confirm-button').textContent = type === 'rename' ? 'Save name' : type === 'delete' ? 'Delete passkey' : 'Got it';
++  if (type === 'rename') {
++    $('#dialog-title').textContent = 'Make it your own.';
++    $('#dialog-description').textContent = 'Give this passkey a name that’s easy to recognize. This label is only used in your Daily Grind account.';
++    nameInput.value = key.name;
++  } else if (type === 'delete') {
++    $('#dialog-title').textContent = 'Remove this passkey?';
++    const lastKey = snapshot.passkeys.length === 1;
++    $('#dialog-description').textContent = `“${key.name}” will no longer be available for signing in.${key.current ? ' This is the passkey for your current device.' : ''}${lastKey ? ' This is your last passkey. Make sure you can sign in with another method before continuing.' : ' You can still use your other passkeys.'}${repository.preview ? ' This preview only removes the sample from this browser.' : ' We’ll notify supported authenticators after removal. You may also need to remove it from your password manager.'}`;
++  } else {
++    $('#dialog-title').textContent = 'A familiar way to sign in.';
++    $('#dialog-description').textContent = 'Passkeys let you use your device’s screen lock, fingerprint, or face instead of a password. Your biometric information stays on your device. Rename a passkey to keep your account organized, or remove one you no longer use. Account labels don’t rename entries in your password manager. Supported browsers can receive updates when a passkey is removed.';
++  }
++  dialog.showModal();
++  if (type === 'rename') { nameInput.focus(); nameInput.select(); }
++  else $('#cancel-button').hidden ? $('#confirm-button').focus() : $('#cancel-button').focus();
++}
++function closeDialog() { if (!busy) dialog.close(); }
++$('.dialog-close').addEventListener('click', closeDialog);
++$('#cancel-button').addEventListener('click', closeDialog);
++$('#about-button').addEventListener('click', () => openDialog('about'));
++dialog.addEventListener('cancel', event => { if (busy) event.preventDefault(); });
++dialog.addEventListener('click', event => { if (event.target === dialog && (event.clientX < dialog.getBoundingClientRect().left || event.clientX > dialog.getBoundingClientRect().right || event.clientY < dialog.getBoundingClientRect().top || event.clientY > dialog.getBoundingClientRect().bottom)) closeDialog(); });
++nameInput.addEventListener('input', () => { $('#dialog-error').textContent = ''; });
++form.addEventListener('submit', async event => {
++  event.preventDefault();
++  if (busy) return;
++  if (action === 'about') { dialog.close(); return; }
++  let newName;
++  try { if (action === 'rename') newName = validateName(nameInput.value); }
++  catch (error) { $('#dialog-error').textContent = error.message; nameInput.focus(); return; }
++  busy = true;
++  $('#confirm-button').disabled = true;
++  $('#confirm-button').textContent = 'Saving…';
++  try {
++    if (action === 'rename') await repository.rename(selected.id, newName);
++    else await repository.remove(selected.id);
++  } catch (error) {
++    $('#dialog-error').textContent = error.message;
++    busy = false;
++    $('#confirm-button').disabled = false;
++    $('#confirm-button').textContent = action === 'rename' ? 'Save name' : 'Delete passkey';
++    return;
++  }
++  let message = action === 'rename' ? 'Passkey name updated.' : 'Passkey removed.';
++  try {
++    snapshot = await repository.list();
++    render();
++    if (action === 'delete' && !repository.preview) {
++      const sync = await syncAuthenticator(snapshot, selected.credentialId);
++      message += sync === 'signaled' ? ' Your browser has been notified.' : ' Remove it from your device’s password manager too; browser sync is unavailable.';
++    }
++  } catch {
++    // The mutation succeeded. Reflect that without inviting a duplicate delete.
++    snapshot.passkeys = action === 'delete' ? snapshot.passkeys.filter(key => key.id !== selected.id) : snapshot.passkeys.map(key => key.id === selected.id ? { ...key, name: newName } : key);
++    render();
++    message += ' Refresh to get the latest account details. Remove deleted passkeys from your password manager if needed.';
++  }
++  busy = false;
++  $('#confirm-button').disabled = false;
++  dialog.close();
++  // The invoking row button may have been replaced; provide a reliable focus target.
++  $('#passkeys-title').tabIndex = -1;
++  $('#passkeys-title').focus({ preventScroll: true });
++  notify(message);
++});
++async function load() {
++  if (!repository.preview) $('.preview-note').hidden = true;
++  try { snapshot = await repository.list(); render(); }
++  catch (error) {
++    $('#key-count').textContent = '—';
++    const errorState = element('div', 'empty-state');
++    const retry = element('button', 'secondary-button', 'Try again');
++    retry.addEventListener('click', load);
++    errorState.append(element('p', '', error.message), retry);
++    list.replaceChildren(errorState);
++  }
++}
++load();
+diff --git a/index.html b/index.html
+index 66c9173..edb6d7d 100644
+--- a/index.html
++++ b/index.html
+@@ -1,212 +1,74 @@
+ <!DOCTYPE html>
+ <html lang="en">
+-
+ <head>
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+-  <title>The Daily Grind | Artisanal Coffee</title>
+-  <style>
+-    :root {
+-      --primary: #4e342e;
+-      --secondary: #d7ccc8;
+-      --accent: #ffab40;
+-      --text: #3e2723;
+-      --light: #fafafa;
+-    }
+-
+-    * {
+-      box-sizing: border-box;
+-      margin: 0;
+-      padding: 0;
+-    }
+-
+-    body {
+-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+-      line-height: 1.6;
+-      color: var(--text);
+-      background-color: var(--light);
+-    }
+-
+-    /* Navigation */
+-    nav {
+-      background: var(--primary);
+-      color: white;
+-      padding: 1rem 5%;
+-      display: flex;
+-      justify-content: space-between;
+-      align-items: center;
+-      position: sticky;
+-      top: 0;
+-      z-index: 1000;
+-    }
+-
+-    .logo {
+-      font-size: 1.5rem;
+-      font-weight: bold;
+-      letter-spacing: 1px;
+-    }
+-
+-    nav ul {
+-      display: flex;
+-      list-style: none;
+-    }
+-
+-    nav ul li {
+-      margin-left: 20px;
+-    }
+-
+-    nav a {
+-      color: white;
+-      text-decoration: none;
+-      font-size: 0.9rem;
+-      transition: color 0.3s;
+-    }
+-
+-    nav a:hover {
+-      color: var(--accent);
+-    }
+-
+-    .logout-link {
+-      border: 1px solid var(--accent);
+-      padding: 5px 12px;
+-      border-radius: 4px;
+-    }
+-
+-    /* Hero Section */
+-    .hero {
+-      height: 60vh;
+-      background: linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)),
+-        url('https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?auto=format&fit=crop&w=1350&q=80');
+-      background-size: cover;
+-      background-position: center;
+-      display: flex;
+-      flex-direction: column;
+-      justify-content: center;
+-      align-items: center;
+-      color: white;
+-      text-align: center;
+-      padding: 0 20px;
+-    }
+-
+-    .hero h1 {
+-      font-size: 3rem;
+-      margin-bottom: 1rem;
+-    }
+-
+-    /* Content Sections */
+-    .container {
+-      max-width: 1100px;
+-      margin: 40px auto;
+-      padding: 0 20px;
+-    }
+-
+-    .grid {
+-      display: grid;
+-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+-      gap: 20px;
+-      margin-top: 20px;
+-    }
+-
+-    .card {
+-      background: white;
+-      padding: 20px;
+-      border-radius: 8px;
+-      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+-      text-align: center;
+-    }
+-
+-    .card h3 {
+-      margin-bottom: 10px;
+-      color: var(--primary);
+-    }
+-
+-    .btn {
+-      display: inline-block;
+-      background: var(--primary);
+-      color: white;
+-      padding: 10px 20px;
+-      text-decoration: none;
+-      border-radius: 5px;
+-      margin-top: 15px;
+-      transition: background 0.3s;
+-    }
+-
+-    .btn:hover {
+-      background: #3e2723;
+-    }
+-
+-    footer {
+-      background: var(--secondary);
+-      text-align: center;
+-      padding: 40px 20px;
+-      margin-top: 40px;
+-    }
+-
+-    .footer-links {
+-      margin-bottom: 20px;
+-    }
+-
+-    .footer-links a {
+-      margin: 0 10px;
+-      color: var(--text);
+-      text-decoration: none;
+-      font-size: 0.85rem;
+-    }
+-  </style>
++  <meta name="theme-color" content="#292f23">
++  <title>Passkeys · My Account | The Daily Grind</title>
++  <link rel="preconnect" href="https://fonts.googleapis.com">
++  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
++  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;450;500;550;600;650;700&family=Libre+Caslon+Display&display=swap" rel="stylesheet">
++  <link rel="stylesheet" href="/styles.css">
+ </head>
+-
+ <body>
+-
+-  <nav>
+-    <div class="logo">THE DAILY GRIND</div>
+-    <ul>
+-      <li><a href="/menu">Menu</a></li>
+-      <li><a href="/locations">Locations</a></li>
+-      <li><a href="/rewards">Rewards</a></li>
+-      <li><a href="/account">My Account</a></li>
+-      <li><a href="/logout" class="logout-link">Logout</a></li>
+-    </ul>
+-  </nav>
+-
+-  <header class="hero">
+-    <h1>Wake Up Your Senses</h1>
+-    <p>Ethically sourced, locally roasted, delivered to your cup.</p>
+-    <a href="/order-online" class="btn">Order Now</a>
++  <div class="announcement">Good coffee. Good mornings. <span>Always at The Daily Grind.</span><svg aria-hidden="true"><use href="#sparkle"/></svg></div>
++  <header class="site-header">
++    <a class="wordmark" href="/" aria-label="The Daily Grind home"><svg aria-hidden="true"><use href="#cup"/></svg><span>THE DAILY GRIND<small>YOUR DAILY RITUAL, REIMAGINED.</small></span></a>
++    <nav aria-label="Main navigation"><a href="/menu">Our menu</a><a href="/locations">Find your grind</a><a href="/rewards">Rewards</a></nav>
++    <div class="header-actions"><a class="account-link" href="/account" aria-current="page"><svg aria-hidden="true"><use href="#user"/></svg><span>My account</span></a><a class="order-button" href="/order-online">Order online <svg aria-hidden="true"><use href="#arrow"/></svg></a></div>
+   </header>
+-
+-  <main class="container">
+-    <section>
+-      <h2 style="text-align: center;">Seasonal Favorites</h2>
+-      <div class="grid">
+-        <div class="card">
+-          <h3>Maple Oat Latte</h3>
+-          <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+-          <a href="/menu/seasonal" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Dark Roast Espresso</h3>
+-          <p>Bold, smokey, and perfect for a morning boost.</p>
+-          <a href="/menu/espresso" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Cold Brew</h3>
+-          <p>Steeped for 18 hours for maximum smoothness.</p>
+-          <a href="/menu/cold-brew" class="btn">View Details</a>
+-        </div>
++  <main class="page-shell">
++    <div class="breadcrumb"><a href="/">Home</a><span>/</span><a href="/account">My account</a><span>/</span><span>Security</span></div>
++    <div class="page-title"><div><p class="eyebrow">A LITTLE SPACE, JUST FOR YOU</p><h1>My account<span>.</span></h1></div><p>Your next great morning starts here.</p></div>
++    <div class="account-layout">
++      <aside class="sidebar" aria-label="Account navigation">
++        <div class="profile"><div class="avatar">JD</div><div><strong>Jamie Davis</strong><span>Coffee person since 2024</span></div></div>
++        <nav class="account-nav" aria-label="My account"><a href="/account/overview"><svg><use href="#grid"/></svg>Overview</a><a href="/account/orders"><svg><use href="#bag"/></svg>Order history</a><a href="/account/rewards"><svg><use href="#gift"/></svg>My rewards<span class="points">240 pts</span></a><a href="/account/details"><svg><use href="#user"/></svg>Personal details</a><a class="selected" href="/account" aria-current="page"><svg><use href="#shield"/></svg>Sign-in & security<svg class="nav-arrow"><use href="#chevron"/></svg></a></nav>
++        <a class="sign-out" href="/logout"><svg aria-hidden="true"><use href="#logout"/></svg>Sign out</a>
++        <div class="sidebar-note"><svg aria-hidden="true"><use href="#cup"/></svg><p>A good day starts<br>with a little ritual.</p><span>MAKE YOURSELF AT HOME.</span></div>
++      </aside>
++      <div class="account-content">
++        <div class="section-heading"><div class="heading-icon"><svg aria-hidden="true"><use href="#shield"/></svg></div><div><h2>Sign-in & security</h2><p>A little peace of mind, with every sign-in.</p></div></div>
++        <section class="passkey-panel" aria-labelledby="passkeys-title">
++          <div class="panel-heading"><div><div class="title-line"><h3 id="passkeys-title">Your passkeys</h3><span class="count" id="key-count">3</span></div><p>A simpler, safer way to get back to your daily ritual.</p></div><span class="secure-badge"><svg aria-hidden="true"><use href="#shield-check"/></svg>Passwordless & protected</span></div>
++          <div class="passkey-intro"><div class="intro-icon"><svg aria-hidden="true"><use href="#passkey"/></svg></div><div><h4>You’re the key.</h4><p>Use your fingerprint, face, or device screen lock to sign in.<br class="desktop-break"> No passwords to remember. More time for coffee.</p></div><button class="text-button" id="about-button">How it works <svg aria-hidden="true"><use href="#arrow"/></svg></button></div>
++          <div class="list-label">REGISTERED PASSKEYS <span>Only keep devices you know and trust.</span></div>
++          <div id="passkey-list"></div>
++          <div class="sync-note"><svg aria-hidden="true"><use href="#sync"/></svg><p><strong>Made to stay in sync.</strong> When you remove a passkey, we’ll let supported browsers know so your sign-in options stay up to date.</p></div>
++        </section>
++        <div class="bottom-grid"><section class="tip-card"><div class="tip-icon"><svg aria-hidden="true"><use href="#bulb"/></svg></div><div><h4>A name you’ll recognize</h4><p>Try “My MacBook” or “Work phone” to easily tell your passkeys apart. You can change a name anytime.</p></div></section><section class="help-card"><svg aria-hidden="true"><use href="#help"/></svg><div><h4>Need a hand?</h4><p>We’re here for more than great coffee.</p><a href="mailto:hello@dailygrind.example">Get in touch <svg aria-hidden="true"><use href="#arrow"/></svg></a></div></section></div>
++        <p class="privacy-line"><svg aria-hidden="true"><use href="#lock"/></svg>Your biometric information stays on your device. Always.</p>
++        <p class="preview-note">Account preview · Sample passkeys · Changes are saved in this browser.</p>
+       </div>
+-    </section>
+-  </main>
+-
+-  <footer>
+-    <div class="footer-links">
+-      <a href="/about">Our Story</a> |
+-      <a href="/careers">Join the Team</a> |
+-      <a href="/contact">Contact Us</a> |
+-      <a href="/privacy-policy">Privacy</a>
+     </div>
+-    <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+-  </footer>
+-
++  </main>
++  <footer><a class="footer-brand" href="/">THE DAILY GRIND<span>A little better, every day.</span></a><p>© 2026 The Daily Grind Coffee Co.</p><div><a href="/privacy-policy">Privacy policy</a><a href="/terms">Terms of use</a><a href="/contact">Contact</a></div></footer>
++  <dialog id="action-dialog" aria-labelledby="dialog-title"><form id="action-form"><button class="dialog-close icon-button" type="button" aria-label="Close dialog"><svg><use href="#close"/></svg></button><div class="dialog-emblem"><svg aria-hidden="true"><use href="#passkey"/></svg></div><h2 id="dialog-title"></h2><p id="dialog-description"></p><div id="rename-field"><label for="passkey-name">Passkey name</label><input id="passkey-name" name="name" maxlength="50" autocomplete="off"><p class="field-hint">Choose a name you’ll recognize. Up to 50 characters.</p></div><p id="dialog-error" role="alert"></p><div class="dialog-actions"><button class="secondary-button" type="button" id="cancel-button">Cancel</button><button class="primary-button" type="submit" id="confirm-button">Save name</button></div></form></dialog>
++  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
++  <svg class="svg-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><defs>
++    <symbol id="cup" viewBox="0 0 24 24"><path d="M4 8h13v7a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5V8Zm13 1h2a3 3 0 1 1 0 6h-2M2 22h19M8 2v3m4-3v3m4-3v3"/></symbol>
++    <symbol id="user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21v-2a8 8 0 0 1 16 0v2"/></symbol>
++    <symbol id="arrow" viewBox="0 0 24 24"><path d="M4 12h15m-6-6 6 6-6 6"/></symbol>
++    <symbol id="chevron" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></symbol>
++    <symbol id="shield" viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Z"/><path d="M12 8v5m0 3h.01"/></symbol>
++    <symbol id="shield-check" viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Z"/><path d="m8 12 3 3 5-6"/></symbol>
++    <symbol id="grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></symbol>
++    <symbol id="bag" viewBox="0 0 24 24"><path d="M5 7h14l2 14H3L5 7Zm3 0V6a4 4 0 0 1 8 0v1"/></symbol>
++    <symbol id="gift" viewBox="0 0 24 24"><path d="M4 11h16v10H4V11Zm-1-5h18v5H3V6Zm9 0v15"/><path d="M12 6H8a2.5 2.5 0 1 1 2.4-3.2L12 6Zm0 0h4a2.5 2.5 0 1 0-2.4-3.2L12 6Z"/></symbol>
++    <symbol id="logout" viewBox="0 0 24 24"><path d="M10 4H4v16h6m-2-8h13m-5-5 5 5-5 5"/></symbol>
++    <symbol id="passkey" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><path d="M3 20v-2a6 6 0 0 1 10-4m5 0v8m0-3h3"/><circle cx="18" cy="11" r="3"/></symbol>
++    <symbol id="laptop" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="12" rx="1.5"/><path d="m4 16-2 4h20l-2-4M9 20h6"/></symbol>
++    <symbol id="phone" viewBox="0 0 24 24"><rect x="6" y="2" width="12" height="20" rx="2.5"/><path d="M10 5h4m-3 14h2"/></symbol>
++    <symbol id="key" viewBox="0 0 24 24"><circle cx="8" cy="8" r="5"/><path d="m12 12 9 9m-3-3 3-3m-6 0 3-3M7 7h.01"/></symbol>
++    <symbol id="edit" viewBox="0 0 24 24"><path d="m15 4 5 5M4 20l1-6L17 2l5 5-12 12-6 1Z"/></symbol>
++    <symbol id="trash" viewBox="0 0 24 24"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7"/></symbol>
++    <symbol id="sync" viewBox="0 0 24 24"><path d="M20 9a8 8 0 0 0-14-3L3 9m0-6v6h6M4 15a8 8 0 0 0 14 3l3-3m0 6v-6h-6"/></symbol>
++    <symbol id="bulb" viewBox="0 0 24 24"><path d="M8 16c0-3-3-3-3-7a7 7 0 0 1 14 0c0 4-3 4-3 7H8Zm1 3h6m-5 3h4M12 9v7"/></symbol>
++    <symbol id="help" viewBox="0 0 24 24"><path d="M21 11a9 9 0 0 1-9 9H7l-5 2 2-6a9 9 0 1 1 17-5Z"/><path d="M9 8a3 3 0 0 1 6 0c0 2-3 2-3 4m0 3h.01"/></symbol>
++    <symbol id="lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 4v3"/></symbol>
++    <symbol id="close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
++    <symbol id="sparkle" viewBox="0 0 24 24"><path d="m12 2 3 7 7 3-7 3-3 7-3-7-7-3 7-3 3-7Z"/></symbol>
++  </defs></svg>
++  <script type="module" src="/app.js"></script>
+ </body>
+-
+ </html>
+diff --git a/package.json b/package.json
+index 2bd4d77..93fcb10 100644
+--- a/package.json
++++ b/package.json
+@@ -2,7 +2,8 @@
+   "name": "daily-grind",
+   "version": "1.0.0",
+   "scripts": {
+-    "start": "pnpm dlx statikk --port ${PORT:-11222}"
++    "start": "pnpm dlx statikk --port ${PORT:-11222}",
++    "test": "node --test tests/*.test.mjs"
+   },
+   "pnpm": {
+     "onlyBuiltDependencies": []
+diff --git a/passkeys.mjs b/passkeys.mjs
+new file mode 100644
+index 0000000..b568ead
+--- /dev/null
++++ b/passkeys.mjs
+@@ -0,0 +1,79 @@
++export const SAMPLE_PASSKEYS = [
++  { id: 'sample-mac', name: 'MacBook Pro', kind: 'laptop', provider: 'iCloud Keychain', created: 'Oct 12, 2026', lastUsed: 'Today', current: true },
++  { id: 'sample-phone', name: 'iPhone 15', kind: 'phone', provider: 'iCloud Keychain', created: 'Sep 28, 2026', lastUsed: '3 days ago' },
++  { id: 'sample-key', name: 'YubiKey 5C', kind: 'key', provider: 'Security key', created: 'Aug 15, 2026', lastUsed: '2 weeks ago' },
++];
++export function validateName(value) {
++  const name = value.trim();
++  if (!name) throw new Error('Please enter a name for this passkey.');
++  if (name.length > 50) throw new Error('Keep the name to 50 characters or fewer.');
++  return name;
++}
++export function createPreviewRepository(storage) {
++  const storageKey = 'daily-grind-passkeys-v1';
++  let keys = structuredClone(SAMPLE_PASSKEYS);
++  try {
++    const saved = JSON.parse(storage.getItem(storageKey));
++    if (Array.isArray(saved) && saved.every(key => SAMPLE_PASSKEYS.some(sample => sample.id === key.id) && typeof key.name === 'string' && key.name.trim() && key.name.length <= 50) && new Set(saved.map(key => key.id)).size === saved.length) {
++      keys = saved.map(key => ({ ...SAMPLE_PASSKEYS.find(sample => sample.id === key.id), name: key.name }));
++    }
++  } catch { /* A blocked storage area still allows an in-memory preview. */ }
++  function save(next) {
++    // Do not report a successful change when persistent storage fails.
++    storage.setItem(storageKey, JSON.stringify(next));
++    keys = next;
++  }
++  return {
++    preview: true,
++    async list() { return { passkeys: structuredClone(keys) }; },
++    async rename(id, value) {
++      const name = validateName(value);
++      if (!keys.some(key => key.id === id)) throw new Error('This passkey is no longer available.');
++      save(keys.map(key => key.id === id ? { ...key, name } : key));
++    },
++    async remove(id) {
++      if (!keys.some(key => key.id === id)) throw new Error('This passkey has already been removed.');
++      save(keys.filter(key => key.id !== id));
++    },
++  };
++}
++
++// The server must scope every operation to the authenticated customer and enforce CSRF protection.
++export function createAccountRepository({ apiBase, csrfToken }, request = fetch) {
++  const base = new URL(apiBase, location.origin);
++  if (base.origin !== location.origin) throw new Error('The account API must use the same origin.');
++  async function send(path = '', method = 'GET', body) {
++    const response = await request(`${base.href.replace(/\/$/, '')}${path}`, {
++      method, credentials: 'same-origin', cache: 'no-store',
++      headers: { Accept: 'application/json', ...(body ? { 'Content-Type': 'application/json' } : {}), ...(csrfToken ? { 'X-CSRF-Token': csrfToken } : {}) },
++      ...(body ? { body: JSON.stringify(body) } : {}),
++    });
++    if (!response.ok) throw new Error(response.status === 401 ? 'Your session has expired. Please sign in again.' : 'We couldn’t save this change. Please try again.');
++    return response.status === 204 ? undefined : response.json();
++  }
++  return {
++    preview: false,
++    list: () => send(),
++    rename: (id, name) => send(`/${encodeURIComponent(id)}`, 'PATCH', { name: validateName(name) }),
++    remove: id => send(`/${encodeURIComponent(id)}`, 'DELETE'),
++  };
++}
++
++// Call only with a fresh server snapshot after a successful server-side deletion.
++export async function syncAuthenticator(snapshot, credentialId, credentialAPI = globalThis.PublicKeyCredential) {
++  if (!credentialAPI) return 'unsupported';
++  try {
++    if (typeof credentialAPI.signalAllAcceptedCredentials === 'function' && snapshot.userId && snapshot.rpId) {
++      await credentialAPI.signalAllAcceptedCredentials({
++        rpId: snapshot.rpId, userId: snapshot.userId,
++        allAcceptedCredentialIds: snapshot.passkeys.map(key => key.credentialId),
++      });
++      return 'signaled';
++    }
++    if (typeof credentialAPI.signalUnknownCredential === 'function' && credentialId && snapshot.rpId) {
++      await credentialAPI.signalUnknownCredential({ rpId: snapshot.rpId, credentialId });
++      return 'signaled';
++    }
++  } catch { return 'failed'; }
++  return 'unsupported';
++}
+diff --git a/styles.css b/styles.css
+new file mode 100644
+index 0000000..0fec465
+--- /dev/null
++++ b/styles.css
+@@ -0,0 +1 @@
++:root{--paper:#f8f7f3;--ink:#30352b;--muted:#7a7d73;--olive:#59633d;--border:#e6e5dc;--serif:'Libre Caslon Display',Georgia,serif;--sans:'DM Sans',sans-serif}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);font-size:14px;-webkit-font-smoothing:antialiased}a{color:inherit;text-decoration:none}button,input{font:inherit}button,a,input{-webkit-tap-highlight-color:transparent}button{cursor:pointer}svg{width:21px;height:21px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}.announcement{height:34px;background:#2c3427;color:#f4f0e5;display:flex;align-items:center;justify-content:center;gap:4px;font-size:10px;letter-spacing:.65px}.announcement svg{width:12px;height:12px;margin-left:9px}.site-header{height:99px;padding:0 5.5%;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);background:#fcfbf8;gap:28px}.wordmark{display:flex;gap:13px;align-items:center;font-size:20px;letter-spacing:1.5px;font-weight:700;white-space:nowrap}.wordmark>svg{width:35px;height:37px;stroke-width:1.35}.wordmark small{display:block;font-size:7px;letter-spacing:2.1px;font-weight:500;margin-top:6px}.site-header nav{display:flex;gap:31px;font-size:12px}.site-header nav a:hover,footer a:hover{color:var(--olive);text-decoration:underline;text-underline-offset:5px}.header-actions{display:flex;gap:26px;align-items:center;font-size:12px}.account-link{display:flex;align-items:center;gap:8px}.account-link svg{width:17px;height:17px}.order-button{display:flex;gap:22px;align-items:center;background:var(--olive);color:white;padding:13px 18px;border-radius:5px}.order-button:hover{background:#424c2c}.order-button svg{width:16px;height:16px}.page-shell{max-width:1260px;margin:0 auto;padding:31px 49px 0}.breadcrumb{display:flex;gap:12px;font-size:10px;color:#999b91;align-items:center}.breadcrumb span:last-child{color:#5f6358}.breadcrumb a:hover{text-decoration:underline}.page-title{display:flex;align-items:flex-end;justify-content:space-between;margin:36px 0 37px}.eyebrow{font-size:9px;font-weight:600;letter-spacing:2px;margin:0 0 11px;color:#81866f}h1{font-family:var(--serif);font-weight:400;font-size:57px;line-height:1.1;letter-spacing:-1.6px;margin:0}h1 span{color:#90966b}.page-title>p{color:var(--muted);font-size:12px;margin:0 0 7px}.account-layout{display:grid;grid-template-columns:249px minmax(0,1fr);gap:43px}.sidebar{border-right:1px solid var(--border);padding-right:26px}.profile{display:flex;align-items:center;gap:11px;padding:0 0 25px 5px;border-bottom:1px solid var(--border)}.avatar{width:40px;height:40px;display:grid;place-items:center;background:#e9e8dc;border-radius:50%;font-family:var(--serif);font-size:18px;color:#61674d}.profile strong{font-size:12px;font-weight:600}.profile span{display:block;font-size:9px;color:var(--muted);margin-top:5px}.account-nav{padding-top:18px;display:flex;flex-direction:column;gap:5px}.account-nav a{display:flex;align-items:center;gap:12px;padding:13px 11px;font-size:11px;border-radius:5px;color:#686c61;white-space:nowrap}.account-nav svg{height:17px;width:17px}.account-nav a:hover{background:#eeeee6}.account-nav a.selected{background:#e9ecdf;color:#4d5838;font-weight:600}.account-nav .nav-arrow{margin-left:auto;width:12px;height:12px}.points{font-size:8px;margin-left:auto;background:#eeece2;border-radius:4px;padding:3px 5px;color:#77775d}.sign-out{margin:23px 0 0;padding:20px 11px;display:flex;align-items:center;gap:12px;font-size:11px;border-top:1px solid var(--border);color:#7d7f74}.sign-out svg{width:17px;height:17px}.sidebar-note{margin:37px 0 0 5px;background:#efeee6;border:1px solid #e8e6db;border-radius:7px;padding:26px 20px;text-align:center;position:relative;overflow:hidden}.sidebar-note:before,.sidebar-note:after{content:'';position:absolute;border:1px solid #dddfcc;border-radius:50%;width:180px;height:180px;right:-127px;top:-74px}.sidebar-note:after{right:-115px;top:-85px}.sidebar-note>svg{width:28px;height:28px;color:#78805f}.sidebar-note p{font-family:var(--serif);font-size:25px;line-height:1.15;margin:14px 0 18px}.sidebar-note span{font-size:7px;letter-spacing:1.6px;color:#858871}.section-heading{display:flex;align-items:center;gap:13px;margin:0 0 27px}.heading-icon{width:43px;height:43px;border:1px solid #e0e3d5;background:#efefe6;display:grid;place-items:center;border-radius:50%;color:#66724c}.heading-icon svg{width:22px;height:22px}h2{font-family:var(--serif);font-size:31px;font-weight:400;letter-spacing:-.4px;margin:0 0 5px}.section-heading p{margin:0;font-size:11px;color:var(--muted)}.passkey-panel{background:#fffefa;border:1px solid #dfdfd4;border-radius:10px;overflow:hidden;box-shadow:0 3px 5px #33382003}.panel-heading{padding:26px 26px 23px;display:flex;align-items:center;justify-content:space-between;gap:12px}.title-line{display:flex;gap:10px;align-items:center}h3{font-family:var(--serif);font-weight:400;font-size:27px;margin:0;letter-spacing:-.3px}.count{font-size:10px;background:#eeeee5;border:1px solid #e5e6d9;border-radius:5px;padding:2px 7px;color:#6c7357}.panel-heading p{font-size:10px;color:var(--muted);margin:9px 0 0}.secure-badge{display:flex;align-items:center;gap:5px;color:#778160;font-size:8px;white-space:nowrap}.secure-badge svg{width:13px;height:13px}.passkey-intro{margin:0 26px;padding:20px 18px;background:#f0f2e8;border:1px solid #e4e8d8;border-radius:6px;display:flex;align-items:center;gap:15px}.intro-icon{width:40px;height:40px;color:#6f7a53;display:grid;place-items:center}.intro-icon svg{width:31px;height:31px;stroke-width:1.25}h4{font-size:12px;font-weight:600;margin:0 0 7px}.passkey-intro p{font-size:10px;color:#7d826f;margin:0;line-height:1.8}.text-button{border:0;background:transparent;display:flex;gap:7px;align-items:center;color:#5b6742;font-size:9px;padding:5px 0;margin-left:auto;white-space:nowrap}.text-button svg{width:13px;height:13px}.text-button:hover{text-decoration:underline}.list-label{display:flex;align-items:center;justify-content:space-between;font-size:8px;font-weight:600;letter-spacing:1.2px;margin:28px 26px 0;padding-bottom:12px;border-bottom:1px solid var(--border);color:#898d7e}.list-label span{font-size:9px;letter-spacing:0;font-weight:400;color:#989b90}.passkey-row{margin:0 26px;display:flex;align-items:center;gap:14px;padding:23px 0;border-bottom:1px solid #eeeee6}.passkey-row:last-child{border-bottom:0}.device-icon{height:43px;width:43px;display:grid;place-items:center;border:1px solid #e7e6de;border-radius:8px;background:#f8f7f1;color:#717961}.device-icon svg{width:23px;height:23px;stroke-width:1.4}.device-info{min-width:0}.device-title{display:flex;align-items:center;gap:9px}.device-title h4{font-size:12px;margin:0;font-weight:550;overflow-wrap:anywhere}.current-badge{display:inline-flex;align-items:center;gap:4px;background:#edf1e5;color:#718054;border-radius:4px;padding:3px 6px;font-size:7px;white-space:nowrap}.current-badge:before{content:'';height:4px;width:4px;border-radius:50%;background:#829361}.device-meta{font-size:9px;color:#8b8e80;margin:7px 0 0;line-height:1.5}.device-meta .dot{padding:0 6px;color:#b1b1a3}.row-actions{display:flex;gap:11px;margin-left:auto;padding-left:8px}.icon-button{border:0;background:transparent;display:grid;place-items:center;padding:7px;color:#9b9d90;border-radius:4px}.icon-button svg{width:16px;height:16px;stroke-width:1.4}.icon-button:hover{background:#efefe5;color:#59633d}.icon-button.delete:hover{background:#f9ede8;color:#a15c4c}.sync-note{display:flex;gap:11px;margin-top:3px;padding:18px 26px;background:#f8f8f2;border-top:1px solid var(--border);color:#8b8e7d}.sync-note svg{width:15px;height:15px;margin-top:2px}.sync-note p{font-size:9px;line-height:1.8;margin:0}.sync-note strong{font-weight:550;color:#6c745d}.bottom-grid{display:grid;grid-template-columns:1.15fr 1fr;gap:16px;margin-top:20px}.tip-card,.help-card{display:flex;gap:12px;border:1px solid var(--border);padding:21px 18px;border-radius:7px;align-items:flex-start}.tip-card{background:#f0efe8}.tip-icon>svg,.help-card>svg{width:20px;height:20px;color:#858c70}.bottom-grid h4{font-size:10px;font-weight:550;margin:0 0 7px}.bottom-grid p{font-size:9px;color:#8a8d7f;line-height:1.8;margin:0}.help-card{background:#faf9f5}.help-card a{display:flex;gap:7px;align-items:center;font-size:9px;color:#637044;margin-top:10px}.help-card a:hover{text-decoration:underline}.help-card a svg{width:13px;height:13px}.privacy-line{display:flex;justify-content:center;align-items:center;gap:6px;font-size:9px;color:#969a8b;margin:22px 0 0}.privacy-line svg{width:11px;height:11px}.preview-note{text-align:center;font-size:8px;color:#a1a396;margin:12px 0 0}footer{max-width:1162px;margin:56px auto 0;padding:27px 0 30px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:20px}.footer-brand{font-size:11px;font-weight:650;letter-spacing:1.2px}.footer-brand span{display:block;font-family:var(--serif);font-size:15px;font-weight:400;letter-spacing:0;color:#8a8d7d;margin-top:6px}footer p,footer>div{font-size:9px;color:#979a8c}footer>div{display:flex;gap:23px}.svg-defs{position:absolute;width:0;height:0;overflow:hidden}button:focus-visible,a:focus-visible{outline:2px solid #7c8a55;outline-offset:4px}dialog{width:min(440px,calc(100% - 32px));border:1px solid var(--border);border-radius:12px;background:#fffefa;color:var(--ink);padding:32px;box-shadow:0 20px 80px #18201122}dialog::backdrop{background:#252a2466;backdrop-filter:blur(3px)}.dialog-close{position:absolute;right:13px;top:13px}.dialog-emblem{width:44px;height:44px;background:#edf0e3;border-radius:50%;display:grid;place-items:center;color:#657349;margin-bottom:20px}dialog h2{font-size:32px}#dialog-description{font-size:12px;color:var(--muted);line-height:1.9;margin:12px 0 22px}#rename-field label{display:block;font-size:11px;font-weight:600;margin-bottom:8px}input{width:100%;padding:12px;border:1px solid #cfd4c1;border-radius:5px;background:white;color:var(--ink);outline-color:var(--olive)}.field-hint{font-size:9px;color:var(--muted);margin:8px 0 0}.dialog-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:26px}.primary-button,.secondary-button{padding:11px 18px;border:1px solid var(--olive);border-radius:5px;font-size:11px}.primary-button{background:var(--olive);color:white}.secondary-button{border-color:var(--border);background:transparent;color:var(--muted)}.danger-button{background:#a35f4b;border-color:#a35f4b}#dialog-error{color:#a14f3b;font-size:11px}button:disabled{opacity:.6;cursor:wait}.toast{position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:#303b28;color:#fffefa;padding:15px 22px;border-radius:7px;box-shadow:0 5px 25px #25311b22;font-size:12px;z-index:10;max-width:calc(100% - 32px);width:max-content}.empty-state{padding:35px 20px;text-align:center;color:var(--muted);font-size:12px}.empty-state svg{width:30px;height:30px;margin-bottom:12px}.empty-state p{font-size:10px;line-height:1.8}[hidden]{display:none!important}@media(min-width:1400px){.page-shell{padding-top:39px}.page-title{margin-top:43px;margin-bottom:44px}.passkey-row{padding-top:26px;padding-bottom:26px}footer{margin-top:65px}}@media(max-width:1100px){.site-header{padding:0 4%;gap:20px}.site-header nav{gap:18px}.wordmark{font-size:16px}.header-actions{gap:16px}.page-shell{padding:28px 30px 0}.account-layout{grid-template-columns:210px minmax(0,1fr);gap:28px}.sidebar{padding-right:18px}.secure-badge{display:none}.passkey-intro{gap:8px;padding:16px 12px}.passkey-intro p{font-size:9px}.text-button{font-size:8px}.passkey-row{gap:11px}.row-actions{gap:3px}.device-meta{font-size:8px}footer{margin-left:30px;margin-right:30px}.sidebar-note{padding:25px 10px}.sidebar-note p{font-size:23px}}@media(max-width:800px){.site-header nav{display:none}.site-header{height:83px}.page-title>p{display:none}.account-layout{grid-template-columns:1fr;gap:25px}.sidebar{border:0;padding:0}.profile,.sign-out,.sidebar-note{display:none}.account-nav{flex-direction:row;overflow:auto;padding:0 0 10px;gap:6px;border-bottom:1px solid var(--border)}.account-nav a{padding:12px;flex-shrink:0}.account-nav .points,.nav-arrow{display:none!important}.page-title{margin:28px 0}.section-heading{margin-bottom:22px}footer{margin-top:40px}.passkey-intro p{font-size:10px}.text-button{font-size:10px}}@media(max-width:520px){.announcement{font-size:8px;letter-spacing:.3px}.site-header{padding:0 19px;gap:12px}.wordmark{font-size:13px;gap:8px;letter-spacing:.7px}.wordmark>svg{width:26px;height:30px}.wordmark small{font-size:5px;letter-spacing:1.1px}.account-link span{display:none}.header-actions{gap:13px}.order-button{padding:10px;font-size:10px;gap:6px}.order-button svg{width:12px}.page-shell{padding:24px 18px 0}h1{font-size:49px}.eyebrow{font-size:8px}.account-nav a{font-size:10px;gap:7px;padding:11px 9px}.account-nav a svg{width:14px}.account-nav{margin-right:-18px}.section-heading h2{font-size:28px}.section-heading p{font-size:10px}.panel-heading{padding:22px 18px}.passkey-intro{margin:0 17px;flex-wrap:wrap;padding:16px 12px;gap:7px}.intro-icon{width:32px}.passkey-intro h4{font-size:12px}.passkey-intro p{font-size:9px}.text-button{margin-left:40px;font-size:9px}.desktop-break{display:none}.passkey-intro>div:nth-child(2){flex:1}.list-label{margin:23px 18px 0;font-size:7px;letter-spacing:.8px}.list-label span{font-size:7px}.passkey-row{margin:0 18px;gap:10px;padding:22px 0}.device-icon{width:35px;height:39px}.device-title{gap:6px;flex-wrap:wrap}.device-title h4{font-size:11px}.device-meta{font-size:8px;max-width:165px;line-height:1.8}.device-meta .dot{padding:0 3px}.row-actions{gap:1px;padding:0}.icon-button{padding:6px}.icon-button svg{width:14px;height:14px}.sync-note{padding:15px 18px}.sync-note p{font-size:8px}.bottom-grid{grid-template-columns:1fr;gap:12px}.tip-card,.help-card{padding:18px}.bottom-grid h4{font-size:11px}.bottom-grid p{font-size:10px}.privacy-line{font-size:8px;gap:4px}.preview-note{font-size:7px}footer{margin:35px 18px 0;flex-wrap:wrap;padding:24px 0;gap:22px}footer p{font-size:8px}footer>div{width:100%;gap:25px}.footer-brand{font-size:10px}}
+diff --git a/tests/passkeys.test.mjs b/tests/passkeys.test.mjs
+new file mode 100644
+index 0000000..20143d0
+--- /dev/null
++++ b/tests/passkeys.test.mjs
+@@ -0,0 +1,65 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { createPreviewRepository, validateName, syncAuthenticator } from '../passkeys.mjs';
++function memoryStorage() { const data = new Map(); return { getItem: key => data.get(key) ?? null, setItem: (key, value) => data.set(key, value) }; }
++test('rename and deletion persist across account reloads', async () => {
++  const storage = memoryStorage();
++  const account = createPreviewRepository(storage);
++  await account.rename('sample-mac', '  My laptop  ');
++  await account.remove('sample-phone');
++  const { passkeys } = await createPreviewRepository(storage).list();
++  assert.equal(passkeys.length, 2);
++  assert.equal(passkeys[0].name, 'My laptop');
++  assert.ok(!passkeys.some(key => key.id === 'sample-phone'));
++});
++test('invalid names, missing keys, and storage failure preserve records', async () => {
++  assert.throws(() => validateName('   '));
++  assert.throws(() => validateName('a'.repeat(51)));
++  const account = createPreviewRepository({ getItem: () => '{invalid', setItem: () => { throw Error('Storage blocked'); } });
++  await assert.rejects(account.rename('sample-mac', 'Laptop'), /Storage blocked/);
++  await assert.rejects(account.remove('sample-mac'), /Storage blocked/);
++  await assert.rejects(account.remove('missing'));
++  assert.equal((await account.list()).passkeys.length, 3);
++  assert.equal((await account.list()).passkeys[0].name, 'MacBook Pro');
++});
++test('an empty saved list remains empty on reload', async () => {
++  const storage = memoryStorage();
++  const account = createPreviewRepository(storage);
++  for (const key of (await account.list()).passkeys) await account.remove(key.id);
++  assert.deepEqual((await createPreviewRepository(storage).list()).passkeys, []);
++});
++test('authenticator sync prefers a complete accepted server snapshot', async () => {
++  let received;
++  const snapshot = { rpId: 'example.com', userId: 'dXNlcg', passkeys: [{ credentialId: 'a2V5' }] };
++  const result = await syncAuthenticator(snapshot, 'b2xk', { signalAllAcceptedCredentials: async options => { received = options; }, signalUnknownCredential: () => assert.fail('prefer full snapshot') });
++  assert.equal(result, 'signaled');
++  assert.deepEqual(received, { rpId: 'example.com', userId: 'dXNlcg', allAcceptedCredentialIds: ['a2V5'] });
++});
++test('sync has an individual-credential fallback and handles unavailable or rejected signals', async () => {
++  let received;
++  const snapshot = { rpId: 'example.com', passkeys: [] };
++  assert.equal(await syncAuthenticator(snapshot, 'b2xk', { signalUnknownCredential: async options => { received = options; } }), 'signaled');
++  assert.deepEqual(received, { rpId: 'example.com', credentialId: 'b2xk' });
++  assert.equal(await syncAuthenticator(snapshot, 'b2xk', {}), 'unsupported');
++  assert.equal(await syncAuthenticator(snapshot, 'b2xk', { signalUnknownCredential: async () => { throw Error('Denied'); } }), 'failed');
++});
++test('account API encodes IDs, sends session and CSRF protection, and surfaces failures', async () => {
++  const { createAccountRepository } = await import('../passkeys.mjs');
++  globalThis.location = { origin: 'https://dailygrind.example' };
++  const calls = [];
++  const account = createAccountRepository({ apiBase: '/api/account/passkeys', csrfToken: 'token' }, async (url, options) => {
++    calls.push({ url, options });
++    return { ok: true, status: 204 };
++  });
++  await account.rename('key/1', '  Work phone  ');
++  assert.equal(calls[0].url, 'https://dailygrind.example/api/account/passkeys/key%2F1');
++  assert.equal(calls[0].options.credentials, 'same-origin');
++  assert.equal(calls[0].options.headers['X-CSRF-Token'], 'token');
++  assert.equal(calls[0].options.method, 'PATCH');
++  assert.deepEqual(JSON.parse(calls[0].options.body), { name: 'Work phone' });
++  await account.remove('key/1');
++  assert.equal(calls[1].options.method, 'DELETE');
++  const expired = createAccountRepository({ apiBase: '/api/account/passkeys' }, async () => ({ ok: false, status: 401 }));
++  await assert.rejects(expired.remove('key'), /session has expired/);
++  assert.throws(() => createAccountRepository({ apiBase: 'https://other.example/keys' }), /same origin/);
++});

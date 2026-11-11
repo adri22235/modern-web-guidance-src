@@ -1,0 +1,747 @@
+diff --git a/README.md b/README.md
+index 4479b53..bd7a6b3 100644
+--- a/README.md
++++ b/README.md
+@@ -15,3 +15,32 @@ The application will now be running on `http://localhost:11224`.
+ - **[React](https://react.dev/)**: Used for UI components.
+ - **[Tailwind CSS](https://tailwindcss.com/)**: For styling the application.
+ - **[Astro DB](https://docs.astro.build/en/guides/database/)**: Powers the comments feature, using a libSQL-compatible database.
++
++## Browser tools (WebMCP)
++
++The shared layout registers client-side tools with `document.modelContext`, with
++support for the earlier `navigator.modelContext` API. Browsers without WebMCP
++continue to use the normal buttons and forms. Tools stay registered across Astro
++client navigation and read current page/session state when invoked.
++
++- `search_articles({ query })`: search titles and summaries and open the search flyout.
++- `get_reading_list({})`: return saved articles and open the reading-list flyout.
++- `toggle_reading_list({ slug })`: add an unsaved article or remove a saved article;
++  updates the open list and bookmark buttons using the existing session API.
++- `get_current_article({})`: return the current article title, body text and URL.
++- `get_article_popularity({ id })`, `get_coffee_brew({})`, `get_plant_stats({})`,
++  `get_tide_levels({})`: call the article widget APIs. The intentional demo endpoint
++  failures are preserved and returned as `{ isError: true, error }`.
++
++Opening either flyout also exposes a declarative form tool,
++`search_articles_form({ query })` or `reading_list_form({ slug })`. These forms
++include named, described fields and return structured results through
++`SubmitEvent.respondWith` for agent submissions. The reading-list form toggles
++membership, just like the bookmark button. Ordinary submissions work without
++WebMCP. The implementation follows Chrome's
++[imperative API](https://developer.chrome.com/docs/ai/webmcp/imperative-api) and
++[declarative API](https://developer.chrome.com/docs/ai/webmcp/declarative-api).
++
++Run `pnpm test` for client-only tests using mocked browser APIs and fetch;
++`pnpm run build` checks the production bundles. Neither command starts a server.
++Tests require Node 22.13 or newer for built-in TypeScript stripping.
+diff --git a/package.json b/package.json
+index bfffcf0..2dde27f 100644
+--- a/package.json
++++ b/package.json
+@@ -7,7 +7,8 @@
+     "start": "HOST=0.0.0.0 PORT=${PORT:-11224} node ./dist/server/entry.mjs",
+     "build": "astro build",
+     "preview": "astro preview",
+-    "astro": "astro"
++    "astro": "astro",
++    "test": "node --test tests/*.test.mjs"
+   },
+   "dependencies": {
+     "@astrojs/node": "^11.1.9",
+diff --git a/src/components/BookmarkButton.tsx b/src/components/BookmarkButton.tsx
+index f089dc0..7967bcf 100644
+--- a/src/components/BookmarkButton.tsx
++++ b/src/components/BookmarkButton.tsx
+@@ -1,4 +1,5 @@
+ 
++import { toggleReadingList } from '../lib/browser-tools';
+ import React, { useState, useEffect } from 'react';
+ import { BookmarkIcon } from '@heroicons/react/24/outline'
+ 
+@@ -10,21 +11,26 @@ interface Props {
+ export default function BookmarkButton({ slug, initialIsBookmarked }: Props) {
+   const [isBookmarked, setIsBookmarked] = useState(initialIsBookmarked);
+ 
++  const [error, setError] = useState('');
++  useEffect(() => {
++    const updated = (event: Event) => setIsBookmarked((event as CustomEvent<string[]>).detail.includes(slug));
++    window.addEventListener('reading-list-updated', updated);
++    return () => window.removeEventListener('reading-list-updated', updated);
++  }, [slug]);
++
+   const handleClick = async () => {
+-    const response = await fetch(`${import.meta.env.BASE_URL}api/reading-list.json`, {
+-      method: 'POST',
+-      headers: {
+-        'Content-Type': 'application/json',
+-      },
+-      body: JSON.stringify({ slug }),
+-    });
+-    const data = await response.json();
+-    setIsBookmarked(data.readingList.includes(slug));
++    try {
++      setError('');
++      const data = await toggleReadingList(slug);
++      setIsBookmarked(data.readingList.includes(slug));
++    } catch {
++      setError('Unable to update reading list.');
++    }
+   };
+ 
+   return (
+-    <button onClick={handleClick} className="p-1">
++    <><button onClick={handleClick} aria-label={isBookmarked ? "Remove from reading list" : "Save to reading list"} aria-pressed={isBookmarked} className="p-1">
+       <BookmarkIcon className={`h-5 w-5 ${isBookmarked ? 'text-amber-400 fill-current' : 'text-gray-400'}`}></BookmarkIcon>
+-    </button>
++    </button>{error && <span role="alert">{error}</span>}</>
+   );
+ }
+diff --git a/src/components/ReadingListButton.tsx b/src/components/ReadingListButton.tsx
+index 29642be..265eea9 100644
+--- a/src/components/ReadingListButton.tsx
++++ b/src/components/ReadingListButton.tsx
+@@ -10,6 +10,7 @@ interface Article {
+ }
+ 
+ export default function ReadingListButton() {
++  const [error, setError] = useState('');
+   const [isOpen, setIsOpen] = useState(false);
+   const [articles, setArticles] = useState<Article[]>([]);
+ 
+@@ -19,12 +20,15 @@ export default function ReadingListButton() {
+       const data = await response.json();
+       setArticles(data);
+     };
+-    fetchArticles();
++    fetchArticles().catch(() => setError('Unable to load reading-list articles.'));
++    const open = () => setIsOpen(true);
++    window.addEventListener('open-reading-list', open);
++    return () => window.removeEventListener('open-reading-list', open);
+   }, []);
+ 
+   return (
+     <>
+-      <button onClick={() => setIsOpen(true)} className="p-1">
++      <button aria-label="Open reading list" onClick={() => setIsOpen(true)} className="p-1">
+         <svg
+           xmlns="http://www.w3.org/2000/svg"
+           className="h-6 w-6 text-gray-600"
+@@ -40,6 +44,7 @@ export default function ReadingListButton() {
+           />
+         </svg>
+       </button>
++      {error && <p role="alert">{error}</p>}
+       {isOpen && <ReadingListFlyout articles={articles} onClose={() => setIsOpen(false)} />}
+     </>
+   );
+diff --git a/src/components/ReadingListFlyout.tsx b/src/components/ReadingListFlyout.tsx
+index 10bfbad..e156aab 100644
+--- a/src/components/ReadingListFlyout.tsx
++++ b/src/components/ReadingListFlyout.tsx
+@@ -1,4 +1,5 @@
+ 
++import { getReadingList, toggleReadingList, respondToAgent } from '../lib/browser-tools';
+ import React, { useState, useEffect } from 'react';
+ 
+ interface Article {
+@@ -15,37 +16,51 @@ interface Props {
+ 
+ export default function ReadingListFlyout({ articles, onClose }: Props) {
+   const [readingList, setReadingList] = useState<string[]>([]);
++  const [error, setError] = useState('');
+ 
+   const fetchReadingList = async () => {
+-    const response = await fetch(`${import.meta.env.BASE_URL}api/reading-list.json`);
+-    const data = await response.json();
++    const data = await getReadingList();
+     setReadingList(data.readingList);
+   };
+ 
+   useEffect(() => {
+-    fetchReadingList();
++    fetchReadingList().catch(() => setError('Unable to load your reading list.'));
+ 
+     const handleKeyDown = (event: KeyboardEvent) => {
+       if (event.key === 'Escape') {
+         onClose();
+       }
+     };
++    const updated = (event: Event) => setReadingList((event as CustomEvent<string[]>).detail);
++    window.addEventListener('reading-list-updated', updated);
+     window.addEventListener('keydown', handleKeyDown);
+ 
+     return () => {
++      window.removeEventListener('reading-list-updated', updated);
+       window.removeEventListener('keydown', handleKeyDown);
+     };
+   }, [onClose]);
+ 
+-  const handleRemove = async (slug: string) => {
+-    await fetch(`${import.meta.env.BASE_URL}api/reading-list.json`, {
+-      method: 'POST',
+-      headers: {
+-        'Content-Type': 'application/json',
+-      },
+-      body: JSON.stringify({ slug }),
+-    });
+-    fetchReadingList();
++  const updateList = async (slug: string) => {
++    try {
++      setError('');
++      const data = await toggleReadingList(slug);
++      setReadingList(data.readingList);
++      return data;
++    } catch (error) {
++      const message = error instanceof Error ? error.message : String(error);
++      setError(message);
++      return { isError: true, error: message };
++    }
++  };
++
++  const handleSubmit = (event: React.FormEvent<HTMLFormElement>) => {
++    event.preventDefault();
++    const slug = String(new FormData(event.currentTarget).get('slug') || '');
++    const result = articles.some(article => article.slug === slug)
++      ? updateList(slug)
++      : Promise.resolve({ isError: true, error: 'Unknown article slug' });
++    respondToAgent(event.nativeEvent, result);
+   };
+ 
+   const readingListArticles = articles.filter(article => readingList.includes(article.slug));
+@@ -60,6 +75,15 @@ export default function ReadingListFlyout({ articles, onClose }: Props) {
+         </button>
+         <div className="p-4">
+           <h3 className="text-lg font-semibold text-gray-800 mb-3">Your Reading List</h3>
++          <form toolname="reading_list_form" tooldescription="Toggle an article in your reading list. Adds an unsaved article or removes a saved article. Returns saved slugs." toolautosubmit="" onSubmit={handleSubmit} className="flex gap-2">
++            <label htmlFor="reading-list-slug" className="sr-only">Article</label>
++            <select id="reading-list-slug" name="slug" required toolparamdescription="Slug of the article to add or remove" className="border p-2 min-w-0 flex-1">
++              <option value="">Choose an article</option>
++              {articles.map(article => <option key={article.slug} value={article.slug}>{article.title}</option>)}
++            </select>
++            <button type="submit" className="px-3 py-1 bg-gray-800 text-white rounded">Add / remove</button>
++          </form>
++          {error && <p role="alert">{error}</p>}
+         </div>
+         <div className="p-4 max-h-[60vh] overflow-y-auto">
+           {readingListArticles.length === 0 && (
+@@ -72,7 +96,7 @@ export default function ReadingListFlyout({ articles, onClose }: Props) {
+                   <h4 className="font-bold text-lg text-gray-800 group-hover:text-amber-400">{article.title}</h4>
+                   <p className="text-sm text-gray-600">{article.summary}</p>
+                 </a>
+-                <button onClick={() => handleRemove(article.slug)} className="p-2 text-gray-500 hover:text-amber-400">
++                <button onClick={() => void updateList(article.slug)} aria-label={`Remove ${article.title} from reading list`} className="p-2 text-gray-500 hover:text-amber-400">
+                     <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                     </svg>
+diff --git a/src/components/SearchButton.tsx b/src/components/SearchButton.tsx
+index 3f57913..f33e746 100644
+--- a/src/components/SearchButton.tsx
++++ b/src/components/SearchButton.tsx
+@@ -1,5 +1,6 @@
+ 
+-import React, { useState } from 'react';
++import React, { useState, useEffect } from 'react';
++import { getArticles } from '../lib/browser-tools';
+ import SearchFlyout from './SearchFlyout';
+ 
+ interface Article {
+@@ -11,19 +12,35 @@ interface Article {
+ export default function SearchButton() {
+     const [isFlyoutOpen, setIsFlyoutOpen] = useState(false);
+     const [articles, setArticles] = useState<Article[]>([]);
++    const [query, setQuery] = useState('');
++    const [error, setError] = useState('');
+     const [isLoading, setIsLoading] = useState(false);
+ 
+     const openSearch = async () => {
+         try {
+-            setArticles([]);
++            setError('');
++            setIsLoading(true);
++            setArticles(await getArticles());
++            setQuery('');
+             setIsFlyoutOpen(true);
+         } catch (error) {
+-            console.error('Failed to fetch articles:', error);
++            setError('Unable to load search. Please try again.');
+         } finally {
+             setIsLoading(false);
+         }
+     };
+ 
++    useEffect(() => {
++        const open = (event: Event) => {
++            const { query, articles } = (event as CustomEvent).detail;
++            setQuery(query);
++            setArticles(articles);
++            setIsFlyoutOpen(true);
++        };
++        window.addEventListener('open-article-search', open);
++        return () => window.removeEventListener('open-article-search', open);
++    }, []);
++
+     const closeSearch = () => {
+         setIsFlyoutOpen(false);
+     };
+@@ -34,6 +51,7 @@ export default function SearchButton() {
+                 className="text-gray-700 hover:text-amber-400 w-6 h-6 flex items-center justify-center"
+                 onClick={openSearch}
+                 disabled={isLoading}
++                aria-label="Search articles"
+             >
+                 {isLoading ? (
+                     <div className="w-5 h-5 border-2 border-amber-400 border-t-transparent rounded-full animate-spin" />
+@@ -43,7 +61,8 @@ export default function SearchButton() {
+                     </svg>
+                 )}
+             </button>
+-            {isFlyoutOpen && <SearchFlyout articles={[]} onClose={closeSearch} />}
++            {error && <p role="alert">{error}</p>}
++            {isFlyoutOpen && <SearchFlyout articles={articles} initialQuery={query} onClose={closeSearch} />}
+         </>
+     );
+ }
+diff --git a/src/components/SearchFlyout.tsx b/src/components/SearchFlyout.tsx
+index 9dabc6e..ab33f3f 100644
+--- a/src/components/SearchFlyout.tsx
++++ b/src/components/SearchFlyout.tsx
+@@ -1,4 +1,5 @@
+ 
++import { searchArticles, respondToAgent } from '../lib/browser-tools';
+ import React, { useState, useMemo, useEffect } from 'react';
+ 
+ interface Article {
+@@ -10,6 +11,7 @@ interface Article {
+ 
+ interface Props {
+     articles: Article[];
++    initialQuery?: string;
+     onClose: () => void;
+ }
+ 
+@@ -18,10 +20,12 @@ const getShuffledItems = <T,>(arr: T[], count: number): T[] => {
+     return [...arr].sort(() => 0.5 - Math.random()).slice(0, count);
+ };
+ 
+-export default function SearchFlyout({ articles, onClose }: Props) {
+-    const [searchTerm, setSearchTerm] = useState('');
++export default function SearchFlyout({ articles, initialQuery = '', onClose }: Props) {
++    const [searchTerm, setSearchTerm] = useState(initialQuery);
+     const [suggestions, setSuggestions] = useState<Article[]>([]);
+ 
++    useEffect(() => setSearchTerm(initialQuery), [initialQuery]);
++
+     useEffect(() => {
+         const handleKeyDown = (event: KeyboardEvent) => {
+             if (event.key === 'Escape') {
+@@ -30,33 +34,21 @@ export default function SearchFlyout({ articles, onClose }: Props) {
+         };
+         window.addEventListener('keydown', handleKeyDown);
+         
+-        // Bug: Redundant fetch for suggestions
+-        const fetchSuggestions = async () => {
+-            try {
+-                const response = await fetch(`${import.meta.env.BASE_URL}api/articles.json`);
+-                const data = await response.json();
+-                setSuggestions(getShuffledItems(data, 3));
+-            } catch (error) {
+-                console.error('Failed to fetch suggestions:', error);
+-            }
+-        };
+-
+-        fetchSuggestions();
++        setSuggestions(getShuffledItems(articles, 3));
+ 
+         return () => {
+             window.removeEventListener('keydown', handleKeyDown);
+         };
+-    }, [onClose]);
++    }, [onClose, articles]);
++
++    const filteredArticles = useMemo(() => searchArticles(articles, searchTerm), [articles, searchTerm]);
+ 
+-    const filteredArticles = useMemo(() => {
+-        if (!searchTerm) {
+-            return [];
+-        }
+-        return articles.filter(article =>
+-            article.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
+-            article.summary.toLowerCase().includes(searchTerm.toLowerCase())
+-        );
+-    }, [articles, searchTerm]);
++    const handleSubmit = (event: React.FormEvent<HTMLFormElement>) => {
++        event.preventDefault();
++        const query = String(new FormData(event.currentTarget).get('query') || '');
++        setSearchTerm(query);
++        respondToAgent(event.nativeEvent, Promise.resolve({ articles: searchArticles(articles, query) }));
++    };
+ 
+     return (
+         <div className="fixed inset-0 bg-white/30 backdrop-blur-sm z-[99999] flex justify-center items-start p-4 pt-[15vh]" onClick={onClose}>
+@@ -72,11 +64,13 @@ export default function SearchFlyout({ articles, onClose }: Props) {
+                             <h3 className="text-sm font-semibold text-gray-500 mb-3">Featured</h3>
+                             <ul className="grid grid-cols-3 gap-4 mb-4">
+                                 {suggestions.map(article => {
+-                                    const imagePath = article.image ? article.image.replace(/^\//, '') : '';
++                                    const imagePath = article.image?.startsWith('http')
++                                        ? article.image
++                                        : `${import.meta.env.BASE_URL}${article.image?.replace(/^\//, '') || ''}`;
+                                     return (
+                                         <li key={article.slug}>
+                                             <a href={`${import.meta.env.BASE_URL}articles/${article.slug}`} className="block hover:bg-gray-100 p-2 rounded-md transition-colors">
+-                                                <img src={`${import.meta.env.BASE_URL}${imagePath}`} alt={article.title} className="w-full h-20 object-cover rounded-md mb-2" />
++                                                <img src={imagePath} alt={article.title} className="w-full h-20 object-cover rounded-md mb-2" />
+                                                 <h4 className="font-bold text-sm text-gray-800 group-hover:text-amber-400">{article.title}</h4>
+                                             </a>
+                                         </li>
+@@ -86,14 +80,22 @@ export default function SearchFlyout({ articles, onClose }: Props) {
+                         </div>
+                     )}
+                     <h3 className="text-sm font-semibold text-gray-500 mb-3">Search</h3>
+-                    <input
+-                        type="text"
+-                        placeholder="Search for articles..."
+-                        className="w-full p-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-amber-400 focus:border-transparent transition"
+-                        value={searchTerm}
+-                        onChange={e => setSearchTerm(e.target.value)}
+-                        autoFocus
+-                    />
++                    <form toolname="search_articles_form" tooldescription="Search article titles and summaries and return matching articles." toolautosubmit="" onSubmit={handleSubmit}>
++                        <label htmlFor="article-query" className="sr-only">Search articles</label>
++                        <input
++                            id="article-query"
++                            name="query"
++                            required
++                            toolparamdescription="Words to search for in article titles and summaries"
++                            type="text"
++                            placeholder="Search for articles..."
++                            className="w-full p-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-amber-400 focus:border-transparent transition"
++                            value={searchTerm}
++                            onChange={e => setSearchTerm(e.target.value)}
++                            autoFocus
++                        />
++                        <button type="submit" className="mt-2 px-3 py-1 bg-gray-800 text-white rounded">Search</button>
++                    </form>
+                 </div>
+                 <div className="p-4 max-h-[60vh] overflow-y-auto">
+                     {searchTerm && filteredArticles.length === 0 && (
+diff --git a/src/layouts/Layout.astro b/src/layouts/Layout.astro
+index dcf9696..561f265 100644
+--- a/src/layouts/Layout.astro
++++ b/src/layouts/Layout.astro
+@@ -35,6 +35,12 @@ const baseUrl = import.meta.env.BASE_URL;
+     <link rel="icon" href=`${baseUrl}/favicon.svg` />
+ 
+     <ClientRouter />
++    <script>
++      import { registerBrowserTools } from '../lib/browser-tools';
++      // Astro executes bundled scripts once. These tools read current state on
++      // invocation and remain valid across ClientRouter page transitions.
++      void registerBrowserTools();
++    </script>
+   </head>
+   <body class="bg-gray-100">
+     <div class="mx-auto">
+diff --git a/src/lib/browser-tools.ts b/src/lib/browser-tools.ts
+new file mode 100644
+index 0000000..f581603
+--- /dev/null
++++ b/src/lib/browser-tools.ts
+@@ -0,0 +1,146 @@
++export interface Article {
++  slug: string;
++  title: string;
++  summary: string;
++  image?: string;
++}
++
++export async function requestJson(path: string, init?: RequestInit) {
++  const response = await fetch(`${import.meta.env.BASE_URL}api/${path}`, init);
++  if (!response.ok) {
++    throw new Error(`Request failed: ${response.status} ${response.statusText}`);
++  }
++  return response.json();
++}
++
++export const getArticles = (): Promise<Article[]> => requestJson('articles.json');
++export const getReadingList = (): Promise<{ readingList: string[] }> => requestJson('reading-list.json');
++export async function toggleReadingList(slug: string) {
++  const data: { readingList: string[] } = await requestJson('reading-list.json', {
++    method: 'POST',
++    headers: { 'Content-Type': 'application/json' },
++    body: JSON.stringify({ slug }),
++  });
++  window.dispatchEvent(new CustomEvent('reading-list-updated', { detail: data.readingList }));
++  return data;
++}
++
++export function searchArticles(articles: Article[], query: string) {
++  const term = query.trim().toLowerCase();
++  return term ? articles.filter(article =>
++    article.title.toLowerCase().includes(term) || article.summary.toLowerCase().includes(term)
++  ) : [];
++}
++
++// Read native form values: agent-filled inputs need not fire React's onChange.
++export function respondToAgent(event: Event, result: Promise<unknown>) {
++  const submission = event as SubmitEvent & {
++    agentInvoked?: boolean;
++    respondWith?: (result: Promise<unknown>) => void;
++  };
++  if (submission.agentInvoked && submission.respondWith) submission.respondWith(result);
++}
++
++interface BrowserTool {
++  name: string;
++  description: string;
++  inputSchema: object;
++  annotations?: { readOnlyHint: boolean };
++  execute: (input: Record<string, unknown>) => Promise<unknown>;
++}
++interface ModelContext {
++  registerTool: (tool: BrowserTool) => void | Promise<void>;
++}
++
++export async function registerBrowserTools() {
++  const context = (document as Document & { modelContext?: ModelContext }).modelContext
++    ?? (navigator as Navigator & { modelContext?: ModelContext }).modelContext;
++  if (!context?.registerTool) return;
++
++  const stringInput = (name: string, description: string) => ({
++    type: 'object', properties: { [name]: { type: 'string', minLength: 1, description } },
++    required: [name], additionalProperties: false,
++  });
++  const requiredString = (input: Record<string, unknown>, name: string) => {
++    const value = input[name];
++    if (typeof value !== 'string' || !value.trim()) throw new Error(`${name} is required`);
++    return value.trim();
++  };
++  const emptyInput = { type: 'object', properties: {}, additionalProperties: false };
++  const tools: BrowserTool[] = [
++    {
++      name: 'search_articles',
++      description: 'Search The DevTools Times article titles and summaries. Opens search and returns matching articles.',
++      inputSchema: stringInput('query', 'Words to find in article titles or summaries'),
++      annotations: { readOnlyHint: true },
++      execute: async input => {
++        const query = requiredString(input, 'query');
++        const articles = await getArticles();
++        window.dispatchEvent(new CustomEvent('open-article-search', { detail: { query, articles } }));
++        return { articles: searchArticles(articles, query) };
++      },
++    },
++    {
++      name: 'get_reading_list',
++      description: 'Get the current session reading list and open its form.',
++      inputSchema: emptyInput,
++      annotations: { readOnlyHint: true },
++      execute: async () => {
++        const [articles, data] = await Promise.all([getArticles(), getReadingList()]);
++        window.dispatchEvent(new CustomEvent('open-reading-list'));
++        return { articles: articles.filter(article => data.readingList.includes(article.slug)) };
++      },
++    },
++    {
++      name: 'toggle_reading_list',
++      description: 'Toggle an article in the session reading list: removes it if saved, otherwise adds it. Returns saved slugs.',
++      inputSchema: stringInput('slug', 'Article slug from search results'),
++      annotations: { readOnlyHint: false },
++      execute: async input => {
++        const slug = requiredString(input, 'slug');
++        if (!(await getArticles()).some(article => article.slug === slug)) throw new Error('Unknown article slug');
++        return toggleReadingList(slug);
++      },
++    },
++    {
++      name: 'get_current_article',
++      description: 'Read the title and visible body of the article on the current page. Fails on pages without an article.',
++      inputSchema: emptyInput,
++      annotations: { readOnlyHint: true },
++      execute: async () => {
++        const article = document.querySelector('main article');
++        const body = article?.querySelector<HTMLElement>('.prose');
++        if (!body) throw new Error('The current page is not an article');
++        return { title: article?.querySelector('h1')?.textContent?.trim(), text: body.innerText, url: location.href };
++      },
++    },
++    ...[
++      ['get_coffee_brew', 'coffee-brew', 'Request the coffee article brewing stats. The demo endpoint may return a server error.'],
++      ['get_plant_stats', 'plant-stats', 'Request the plant article stats. The demo endpoint may reject oversized cookie headers.'],
++      ['get_tide_levels', 'tide-levels', 'Request the coastal article tide levels. The demo endpoint may redirect to an unavailable endpoint.'],
++    ].map(([name, path, description]): BrowserTool => ({
++      name, description, inputSchema: emptyInput, annotations: { readOnlyHint: true },
++      execute: async () => requestJson(path),
++    })),
++    {
++      name: 'get_article_popularity',
++      description: 'Request popularity stats for an article ID.',
++      inputSchema: stringInput('id', 'Article ID or slug'),
++      annotations: { readOnlyHint: true },
++      execute: async input => requestJson(`article-popularity?id=${encodeURIComponent(requiredString(input, 'id'))}`),
++    },
++  ];
++  for (const tool of tools) {
++    try {
++      await context.registerTool({
++        ...tool,
++        execute: async input => {
++          try { return await tool.execute(input); }
++          catch (error) { return { isError: true, error: error instanceof Error ? error.message : String(error) }; }
++        },
++      });
++    } catch (error) {
++      console.warn(`Unable to register browser tool ${tool.name}`, error);
++    }
++  }
++}
+diff --git a/src/pages/articles/[slug].astro b/src/pages/articles/[slug].astro
+index 24fea39..3a8cee7 100644
+--- a/src/pages/articles/[slug].astro
++++ b/src/pages/articles/[slug].astro
+@@ -32,7 +32,7 @@ const relatedArticles = allArticles.filter(a => a.id !== article.id).slice(0, 3)
+ const articleImage = await getArticleImage(article);
+ const relatedArticleImages = await Promise.all(relatedArticles.map(getArticleImage));
+ const readingList = await Astro.session?.get('readingList') || [];
+-const isBookmarked = readingList.includes(article.slug);
++const isBookmarked = readingList.includes(article.id);
+ ---
+ 
+ <Layout title={article.data.title}>
+@@ -99,7 +99,7 @@ const isBookmarked = readingList.includes(article.slug);
+                 <a href="#" class="w-8 h-8 rounded-full bg-gray-600 text-white flex items-center justify-center">
+                     <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path d="M2.003 5.884L10 10.884l7.997-5V4H2.003v1.884zM18 6.116l-8 4.05-8-4.05V16h16V6.116zM2 4h16v-1c0-.552-.448-1-1-1H3c-.552 0-1 .448-1 1v1z"/></svg>
+                 </a>
+-                <BookmarkButton client:visible slug={article.slug} initialIsBookmarked={isBookmarked} />
++                <BookmarkButton client:visible slug={article.id} initialIsBookmarked={isBookmarked} />
+             </div>
+ 
+         </div>
+diff --git a/src/webmcp.d.ts b/src/webmcp.d.ts
+new file mode 100644
+index 0000000..888f625
+--- /dev/null
++++ b/src/webmcp.d.ts
+@@ -0,0 +1,16 @@
++import 'react';
++
++// Experimental declarative WebMCP attributes, ignored by unsupported browsers.
++declare module 'react' {
++  interface FormHTMLAttributes<T> {
++    toolname?: string;
++    tooldescription?: string;
++    toolautosubmit?: string;
++  }
++  interface InputHTMLAttributes<T> {
++    toolparamdescription?: string;
++  }
++  interface SelectHTMLAttributes<T> {
++    toolparamdescription?: string;
++  }
++}
+diff --git a/tests/browser-tools.test.mjs b/tests/browser-tools.test.mjs
+new file mode 100644
+index 0000000..b55beca
+--- /dev/null
++++ b/tests/browser-tools.test.mjs
+@@ -0,0 +1,100 @@
++import { test, beforeEach } from 'node:test';
++import assert from 'node:assert/strict';
++import { readFile } from 'node:fs/promises';
++import { stripTypeScriptTypes } from 'node:module';
++
++// Load only the client module; no Astro server entrypoint or live server.
++const source = (await readFile(new URL('../src/lib/browser-tools.ts', import.meta.url), 'utf8'))
++  .replaceAll('import.meta.env.BASE_URL', JSON.stringify('/devtools-times/'));
++const api = await import(`data:text/javascript;base64,${Buffer.from(stripTypeScriptTypes(source)).toString('base64')}`);
++const articles = [{ slug: 'coffee', title: 'Coffee Alchemy', summary: 'Roast science' }];
++let registered;
++let requests;
++beforeEach(() => {
++  registered = new Map();
++  requests = [];
++  globalThis.document = { modelContext: { registerTool(tool) { registered.set(tool.name, tool); } }, querySelector: () => null };
++  globalThis.window = new EventTarget();
++  globalThis.fetch = async (url, init) => {
++    requests.push({ url, init });
++    return Response.json(url.endsWith('articles.json') ? articles : { readingList: ['coffee'] });
++  };
++});
++
++test('unsupported browsers skip registration', async () => {
++  globalThis.document = {};
++  await api.registerBrowserTools();
++  assert.equal(registered.size, 0);
++});
++
++test('registers all utilities with schemas and callable implementations', async () => {
++  await api.registerBrowserTools();
++  assert.deepEqual([...registered.keys()], [
++    'search_articles', 'get_reading_list', 'toggle_reading_list', 'get_current_article',
++    'get_coffee_brew', 'get_plant_stats', 'get_tide_levels', 'get_article_popularity',
++  ]);
++  for (const tool of registered.values()) {
++    assert.equal(tool.inputSchema.type, 'object');
++    assert.ok(tool.description);
++  }
++});
++
++test('search is case-insensitive, trims input, and opens the flyout', async () => {
++  await api.registerBrowserTools();
++  let opened;
++  window.addEventListener('open-article-search', event => { opened = event.detail; });
++  const result = await registered.get('search_articles').execute({ query: ' SCIENCE ' });
++  assert.deepEqual(result.articles, articles);
++  assert.equal(opened.query, 'SCIENCE');
++  assert.equal(requests[0].url, '/devtools-times/api/articles.json');
++  assert.deepEqual(api.searchArticles(articles, '  '), []);
++  assert.deepEqual(api.searchArticles(articles, 'missing'), []);
++});
++
++test('reading list uses session endpoint and broadcasts updates to bookmarks', async () => {
++  await api.registerBrowserTools();
++  const list = await registered.get('get_reading_list').execute({});
++  assert.deepEqual(list.articles, articles);
++  let updated;
++  window.addEventListener('reading-list-updated', event => { updated = event.detail; });
++  await registered.get('toggle_reading_list').execute({ slug: 'coffee' });
++  assert.deepEqual(updated, ['coffee']);
++  const post = requests.find(request => request.init?.method === 'POST');
++  assert.equal(post.url, '/devtools-times/api/reading-list.json');
++  assert.deepEqual(JSON.parse(post.init.body), { slug: 'coffee' });
++});
++
++test('rejects invalid inputs and unknown slugs without mutating the list', async () => {
++  await api.registerBrowserTools();
++  assert.equal((await registered.get('search_articles').execute({ query: '' })).isError, true);
++  assert.equal((await registered.get('toggle_reading_list').execute({ slug: 'unknown' })).isError, true);
++  assert.ok(requests.every(request => !request.init?.method));
++});
++
++test('reports article widget HTTP failures and encodes popularity IDs', async () => {
++  await api.registerBrowserTools();
++  await registered.get('get_article_popularity').execute({ id: 'coffee & tea' });
++  assert.equal(requests[0].url, '/devtools-times/api/article-popularity?id=coffee%20%26%20tea');
++  globalThis.fetch = async () => new Response(null, { status: 500, statusText: 'Internal Server Error' });
++  const result = await registered.get('get_coffee_brew').execute({});
++  assert.equal(result.isError, true);
++  assert.match(result.error, /500/);
++});
++
++test('current article reads the current DOM on every call', async () => {
++  await api.registerBrowserTools();
++  const tool = registered.get('get_current_article');
++  assert.equal((await tool.execute({})).isError, true);
++  globalThis.location = { href: 'https://example.test/devtools-times/articles/coffee' };
++  document.querySelector = () => ({ querySelector: selector => selector === 'h1' ? { textContent: ' Coffee ' } : { innerText: 'Article text' } });
++  assert.deepEqual(await tool.execute({}), { title: 'Coffee', text: 'Article text', url: location.href });
++  document.querySelector = () => null;
++  assert.equal((await tool.execute({})).isError, true);
++});
++
++test('declarative submissions return a result only for agent invocations', async () => {
++  let result;
++  api.respondToAgent({ agentInvoked: true, respondWith: value => { result = value; } }, Promise.resolve({ articles }));
++  assert.deepEqual(await result, { articles });
++  api.respondToAgent({}, Promise.resolve({}));
++});

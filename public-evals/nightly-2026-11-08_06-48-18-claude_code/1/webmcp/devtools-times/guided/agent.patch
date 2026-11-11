@@ -1,0 +1,925 @@
+diff --git a/package.json b/package.json
+index bfffcf0..3605766 100644
+--- a/package.json
++++ b/package.json
+@@ -20,10 +20,12 @@
+     "react": "^19.3.1",
+     "react-dom": "^19.3.1",
+     "sharp": "^0.35.5",
+-    "tailwindcss": "^4.3.3"
++    "tailwindcss": "^4.3.3",
++    "use-webmcp-tool": "^0.3.0"
+   },
+   "devDependencies": {
+-    "@tailwindcss/typography": "^0.5.20"
++    "@tailwindcss/typography": "^0.5.20",
++    "webmcp-types": "^0.1.10"
+   },
+   "pnpm": {
+     "onlyBuiltDependencies": [
+diff --git a/src/components/ArticleAgentTools.tsx b/src/components/ArticleAgentTools.tsx
+new file mode 100644
+index 0000000..0c2f600
+--- /dev/null
++++ b/src/components/ArticleAgentTools.tsx
+@@ -0,0 +1,168 @@
++import { useEffect } from 'react';
++import { useWebMCP } from 'use-webmcp-tool';
++
++/**
++ * Client-side article utilities exposed as WebMCP tools on article pages.
++ * Reads the rendered article body (`[data-article-body]`). Renders nothing.
++ */
++
++interface Props {
++  article: {
++    slug: string;
++    title: string;
++    summary: string;
++    author: string;
++    date: string;
++    category: string;
++    tags: string[];
++    readingTime?: number;
++  };
++}
++
++const TEXT_SIZES = ['small', 'medium', 'large', 'x-large'] as const;
++type TextSize = (typeof TEXT_SIZES)[number];
++const TEXT_SIZE_VALUES: Record<TextSize, string> = {
++  small: '0.875rem',
++  medium: '1rem',
++  large: '1.125rem',
++  'x-large': '1.25rem',
++};
++const TEXT_SIZE_KEY = 'article-text-size';
++const WORDS_PER_MINUTE = 230;
++
++const getBody = () => document.querySelector<HTMLElement>('[data-article-body]');
++
++/** Top-level blocks of the article body (paragraphs, headings, lists, quotes). */
++function getBlocks(): HTMLElement[] {
++  const body = getBody();
++  if (!body) return [];
++  return Array.from(body.children).filter(
++    (el): el is HTMLElement => el instanceof HTMLElement && (el.textContent ?? '').trim().length > 0,
++  );
++}
++
++const blockText = (el: HTMLElement) => (el.textContent ?? '').replace(/\s+/g, ' ').trim();
++const isHeading = (el: HTMLElement) => /^H[1-6]$/.test(el.tagName);
++
++function applyTextSize(size: TextSize) {
++  const body = getBody();
++  if (!body) return;
++  body.style.fontSize = TEXT_SIZE_VALUES[size];
++}
++
++function readSavedTextSize(): TextSize | null {
++  try {
++    const saved = localStorage.getItem(TEXT_SIZE_KEY);
++    return TEXT_SIZES.includes(saved as TextSize) ? (saved as TextSize) : null;
++  } catch {
++    return null;
++  }
++}
++
++export default function ArticleAgentTools({ article }: Props) {
++  // Restore the reader's preferred text size.
++  useEffect(() => {
++    const saved = readSavedTextSize();
++    if (saved) applyTextSize(saved);
++  }, []);
++
++  useWebMCP({
++    name: 'get-article-content',
++    description:
++      'Returns the article open on this page: its metadata, full text split into numbered blocks, section headings, word count and reading time. Use to summarize, quote or answer questions about the article.',
++    inputSchema: { type: 'object', properties: {} },
++    execute() {
++      const blocks = getBlocks();
++      if (blocks.length === 0) return { error: 'The article body is not available on this page.' };
++      const texts = blocks.map(blockText);
++      const wordCount = texts.join(' ').split(/\s+/).filter(Boolean).length;
++      return {
++        ...article,
++        url: location.href,
++        wordCount,
++        readingTimeMinutes: article.readingTime ?? Math.max(1, Math.round(wordCount / WORDS_PER_MINUTE)),
++        sections: blocks
++          .map((el, index) => ({ index, el }))
++          .filter(({ el }) => isHeading(el))
++          .map(({ index, el }) => ({ index, heading: blockText(el) })),
++        blocks: texts.map((text, index) => ({ index, text })),
++      };
++    },
++    annotations: { readOnlyHint: true },
++  });
++
++  useWebMCP<{ text: string }>({
++    name: 'find-in-article',
++    description:
++      'Finds the passages in the article open on this page that contain a word or phrase. Returns the matching block numbers and their text.',
++    inputSchema: {
++      type: 'object',
++      properties: {
++        text: { type: 'string', description: 'Word or phrase to look for, matched case-insensitively.' },
++      },
++      required: ['text'],
++    },
++    execute({ text }) {
++      if (typeof text !== 'string' || !text.trim()) return { error: 'Pass a word or phrase to find.' };
++      const needle = text.trim().toLowerCase();
++      const matches = getBlocks()
++        .map((el, index) => ({ index, text: blockText(el) }))
++        .filter((block) => block.text.toLowerCase().includes(needle));
++      return { query: text, count: matches.length, matches };
++    },
++    annotations: { readOnlyHint: true },
++  });
++
++  useWebMCP<{ index: number }>({
++    name: 'scroll-to-article-passage',
++    description: 'Scrolls the page to a passage or section of the open article and briefly highlights it for the reader.',
++    inputSchema: {
++      type: 'object',
++      properties: {
++        index: {
++          type: 'integer',
++          minimum: 0,
++          description: 'Block number returned by get-article-content or find-in-article.',
++        },
++      },
++      required: ['index'],
++    },
++    execute({ index }) {
++      const blocks = getBlocks();
++      if (!Number.isInteger(index) || index < 0 || index >= blocks.length) {
++        return { error: `Block number must be a whole number from 0 to ${blocks.length - 1}.` };
++      }
++      const target = blocks[index];
++      const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
++      target.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'center' });
++      target.classList.add('agent-highlight');
++      setTimeout(() => target.classList.remove('agent-highlight'), 2500);
++      return { message: `Scrolled to block ${index}.`, text: blockText(target) };
++    },
++  });
++
++  useWebMCP<{ size: TextSize }>({
++    name: 'set-article-text-size',
++    description: "Changes the article body text size to make it easier to read. The choice is remembered on this device.",
++    inputSchema: {
++      type: 'object',
++      properties: {
++        size: { type: 'string', enum: [...TEXT_SIZES], description: 'Text size for the article body.' },
++      },
++      required: ['size'],
++    },
++    execute({ size }) {
++      if (!TEXT_SIZES.includes(size)) return { error: 'Unsupported text size.', sizes: TEXT_SIZES };
++      if (!getBody()) return { error: 'The article body is not available on this page.' };
++      applyTextSize(size);
++      try {
++        localStorage.setItem(TEXT_SIZE_KEY, size);
++      } catch {
++        // Storage may be unavailable (private mode); the change still applies to this page.
++      }
++      return { message: `Article text size set to ${size}.` };
++    },
++  });
++
++  return null;
++}
+diff --git a/src/components/Header.astro b/src/components/Header.astro
+index 980b279..0174084 100644
+--- a/src/components/Header.astro
++++ b/src/components/Header.astro
+@@ -21,6 +21,26 @@ const todaysDate = new Date().toLocaleDateString('en-US', { weekday: 'long', yea
+       <div class="flex items-center space-x-3">
+         <SearchButton client:load />
+         <ReadingListButton client:load />
++        <form
++          role="search"
++          action={`${baseUrl}search`}
++          method="get"
++          class="agent-form flex items-center"
++          toolname="search-articles"
++          tooldescription="Search The DevTools Times articles by keyword. Returns matching headlines with summaries and links."
++          toolautosubmit
++        >
++          <label for="site-search" class="sr-only">Search articles</label>
++          <input
++            id="site-search"
++            type="search"
++            name="q"
++            required
++            placeholder="Search…"
++            toolparamdescription="Keywords matched against headlines, summaries, topics, tags and authors, e.g. housing, cycling."
++            class="w-32 sm:w-48 text-sm py-1 px-2 border border-gray-300 rounded focus:ring-2 focus:ring-amber-400 focus:border-transparent"
++          />
++        </form>
+       </div>
+ 
+       <!-- Right: Buttons -->
+diff --git a/src/components/ReadingListFlyout.tsx b/src/components/ReadingListFlyout.tsx
+index 10bfbad..24ab046 100644
+--- a/src/components/ReadingListFlyout.tsx
++++ b/src/components/ReadingListFlyout.tsx
+@@ -60,6 +60,9 @@ export default function ReadingListFlyout({ articles, onClose }: Props) {
+         </button>
+         <div className="p-4">
+           <h3 className="text-lg font-semibold text-gray-800 mb-3">Your Reading List</h3>
++          <a href={`${import.meta.env.BASE_URL}reading-list`} className="text-sm font-semibold text-gray-600 hover:text-amber-400">
++            Manage reading list
++          </a>
+         </div>
+         <div className="p-4 max-h-[60vh] overflow-y-auto">
+           {readingListArticles.length === 0 && (
+diff --git a/src/components/SearchFlyout.tsx b/src/components/SearchFlyout.tsx
+index 9dabc6e..e7eed93 100644
+--- a/src/components/SearchFlyout.tsx
++++ b/src/components/SearchFlyout.tsx
+@@ -86,14 +86,19 @@ export default function SearchFlyout({ articles, onClose }: Props) {
+                         </div>
+                     )}
+                     <h3 className="text-sm font-semibold text-gray-500 mb-3">Search</h3>
++                    <form role="search" action={`${import.meta.env.BASE_URL}search`} method="get">
++                    <label htmlFor="search-flyout-query" className="sr-only">Search articles</label>
+                     <input
+-                        type="text"
++                        id="search-flyout-query"
++                        type="search"
++                        name="q"
+                         placeholder="Search for articles..."
+                         className="w-full p-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-amber-400 focus:border-transparent transition"
+                         value={searchTerm}
+                         onChange={e => setSearchTerm(e.target.value)}
+                         autoFocus
+                     />
++                    </form>
+                 </div>
+                 <div className="p-4 max-h-[60vh] overflow-y-auto">
+                     {searchTerm && filteredArticles.length === 0 && (
+diff --git a/src/components/SiteAgentTools.tsx b/src/components/SiteAgentTools.tsx
+new file mode 100644
+index 0000000..2d3166f
+--- /dev/null
++++ b/src/components/SiteAgentTools.tsx
+@@ -0,0 +1,108 @@
++import { useWebMCP } from 'use-webmcp-tool';
++import { navigate } from 'astro:transitions/client';
++import type { ArticleSummary } from '../utils/articles';
++
++/**
++ * Site-wide WebMCP tools, available on every page. Renders nothing.
++ * Search and reading-list editing are exposed declaratively by their forms
++ * (see Header.astro, reading-list.astro and scripts/agent-forms.ts).
++ */
++
++interface Props {
++  categories: string[];
++}
++
++const BASE_URL = import.meta.env.BASE_URL;
++const absoluteUrl = (path: string) => new URL(`${BASE_URL}${path}`, location.origin).href;
++
++async function fetchArticles(signal: AbortSignal): Promise<ArticleSummary[]> {
++  const response = await fetch(`${BASE_URL}api/articles.json`, { signal });
++  if (!response.ok) throw new Error(`Could not load articles (status ${response.status}).`);
++  return response.json();
++}
++
++const toListing = ({ slug, title, summary, category, author, date }: ArticleSummary) => ({
++  slug,
++  title,
++  summary,
++  category,
++  author,
++  date,
++  url: absoluteUrl(`articles/${slug}`),
++});
++
++export default function SiteAgentTools({ categories }: Props) {
++  useWebMCP<{ category?: string; limit?: number }>({
++    name: 'list-articles',
++    description:
++      'Lists published articles, newest first, optionally limited to one section. Use to browse what the paper has published rather than to search by keyword.',
++    inputSchema: {
++      type: 'object',
++      properties: {
++        category: { type: 'string', enum: categories, description: 'Only include articles from this section.' },
++        limit: { type: 'integer', minimum: 1, maximum: 50, default: 10, description: 'How many articles to return.' },
++      },
++    },
++    async execute({ category, limit = 10 }, { signal }) {
++      if (category !== undefined && !categories.includes(category)) {
++        return { error: `Unknown section "${category}".`, sections: categories };
++      }
++      if (!Number.isInteger(limit) || limit < 1 || limit > 50) {
++        return { error: 'Limit must be a whole number from 1 to 50.' };
++      }
++      const articles = await fetchArticles(signal);
++      const filtered = category ? articles.filter((article) => article.category === category) : articles;
++      const sorted = [...filtered].sort((a, b) => b.date.localeCompare(a.date));
++      return { total: filtered.length, articles: sorted.slice(0, limit).map(toListing) };
++    },
++    annotations: { readOnlyHint: true },
++  });
++
++  useWebMCP({
++    name: 'get-reading-list',
++    description: "Returns the articles the reader has saved to their reading list.",
++    inputSchema: { type: 'object', properties: {} },
++    async execute(_args, { signal }) {
++      const [listResponse, articles] = await Promise.all([
++        fetch(`${BASE_URL}api/reading-list.json`, { signal }),
++        fetchArticles(signal),
++      ]);
++      if (!listResponse.ok) throw new Error(`Could not load the reading list (status ${listResponse.status}).`);
++      const { readingList } = (await listResponse.json()) as { readingList: string[] };
++      const saved = readingList
++        .map((slug) => articles.find((article) => article.slug === slug))
++        .filter((article): article is ArticleSummary => article !== undefined)
++        .map(toListing);
++      return { count: saved.length, articles: saved, manageUrl: absoluteUrl('reading-list') };
++    },
++    annotations: { readOnlyHint: true },
++  });
++
++  useWebMCP<{ slug: string }>({
++    name: 'open-article',
++    description: 'Opens an article in the current tab so the reader can see it.',
++    inputSchema: {
++      type: 'object',
++      properties: {
++        slug: {
++          type: 'string',
++          description: 'The article identifier returned by search-articles or list-articles, e.g. housing-crisis.',
++        },
++      },
++      required: ['slug'],
++    },
++    async execute({ slug }, { signal }) {
++      if (typeof slug !== 'string' || !slug) return { error: 'Pass the slug of an article.' };
++      const articles = await fetchArticles(signal);
++      const article = articles.find((item) => item.slug === slug);
++      if (!article) {
++        return { error: `No article found with slug "${slug}".`, availableSlugs: articles.map((item) => item.slug) };
++      }
++      signal.throwIfAborted();
++      await navigate(`${BASE_URL}articles/${slug}`);
++      return { message: `Opened "${article.title}".`, url: absoluteUrl(`articles/${slug}`) };
++    },
++  });
++
++  return null;
++}
+diff --git a/src/layouts/Layout.astro b/src/layouts/Layout.astro
+index dcf9696..796734a 100644
+--- a/src/layouts/Layout.astro
++++ b/src/layouts/Layout.astro
+@@ -2,6 +2,8 @@
+ import Header from "../components/Header.astro";
+ import Footer from "../components/Footer.astro";
+ import AdSlotFireplace from "../components/AdSlotFireplace.tsx";
++import SiteAgentTools from "../components/SiteAgentTools.tsx";
++import { getCollection } from "astro:content";
+ import "../styles/global.css";
+ 
+ import { ClientRouter } from "astro:transitions";
+@@ -12,6 +14,7 @@ export interface Props {
+ 
+ const { title } = Astro.props;
+ const baseUrl = import.meta.env.BASE_URL;
++const categories = [...new Set((await getCollection("articles")).map((article) => article.data.category))].sort();
+ ---
+ 
+ <!doctype html>
+@@ -51,5 +54,10 @@ const baseUrl = import.meta.env.BASE_URL;
+       </div>
+     </div>
+     <Footer />
++    <!-- WebMCP tools for in-browser AI agents -->
++    <SiteAgentTools client:idle transition:persist="site-agent-tools" categories={categories} />
++    <script>
++      import "../scripts/agent-forms";
++    </script>
+   </body>
+ </html>
+diff --git a/src/pages/api/articles.json.ts b/src/pages/api/articles.json.ts
+index 4cd4be4..cd4cc6e 100644
+--- a/src/pages/api/articles.json.ts
++++ b/src/pages/api/articles.json.ts
+@@ -1,16 +1,24 @@
+-
+ import { getCollection } from 'astro:content';
+ import type { APIRoute } from 'astro';
++import { searchArticles, toArticleSummary } from '../../utils/articles';
+ 
+-export const GET: APIRoute = async ({ params, request }) => {
++export const GET: APIRoute = async ({ url }) => {
+     const articles = await getCollection('articles');
+-    const formattedArticles = articles.map(article => ({
+-        slug: article.id,
+-        title: article.data.title,
+-        summary: article.data.summary,
+-        image: article.data.image,
+-    }));
++    let formattedArticles = articles.map(toArticleSummary);
++
++    // Optional filters, used by the search form and agent tools.
++    const query = url.searchParams.get('q');
++    if (query) {
++        formattedArticles = searchArticles(formattedArticles, query);
++    }
++    const category = url.searchParams.get('category');
++    if (category) {
++        formattedArticles = formattedArticles.filter(
++            (article) => article.category.toLowerCase() === category.toLowerCase(),
++        );
++    }
+ 
+-    // Simulate a network delay to make the INP issue more noticeable
+-    return new Response(JSON.stringify(formattedArticles));
++    return new Response(JSON.stringify(formattedArticles), {
++        headers: { 'Content-Type': 'application/json' },
++    });
+ }
+diff --git a/src/pages/api/reading-list.json.ts b/src/pages/api/reading-list.json.ts
+index 3084fe3..f3f6e7c 100644
+--- a/src/pages/api/reading-list.json.ts
++++ b/src/pages/api/reading-list.json.ts
+@@ -1,31 +1,43 @@
+-
+ import type { APIRoute } from 'astro';
++import { getEntry } from 'astro:content';
++
++type ReadingListAction = 'add' | 'remove' | 'toggle';
++const ACTIONS: ReadingListAction[] = ['add', 'remove', 'toggle'];
++
++const json = (body: unknown, status = 200) =>
++  new Response(JSON.stringify(body), {
++    status,
++    headers: { 'Content-Type': 'application/json' },
++  });
+ 
+ export const POST: APIRoute = async ({ request, session }) => {
+-  const { slug } = await request.json();
++  const { slug, action = 'toggle' } = await request.json();
+   if (!slug) {
+-    return new Response(JSON.stringify({ error: 'Slug is required' }), { status: 400 });
++    return json({ error: 'Slug is required' }, 400);
++  }
++  if (!ACTIONS.includes(action)) {
++    return json({ error: `Unknown action "${action}". Use one of: ${ACTIONS.join(', ')}` }, 400);
++  }
++  if (!(await getEntry('articles', slug))) {
++    return json({ error: `No article found with slug "${slug}"` }, 404);
+   }
+ 
+-  let readingList = await session?.get('readingList') || [];
++  let readingList: string[] = await session?.get('readingList') || [];
++  const isSaved = readingList.includes(slug);
+ 
+-  if (readingList.includes(slug)) {
++  if (isSaved && action !== 'add') {
+     readingList = readingList.filter((item: string) => item !== slug);
+-  } else {
+-    readingList.push(slug);
++  } else if (!isSaved && action !== 'remove') {
++    readingList = [...readingList, slug];
+   }
+ 
+   await session?.set('readingList', readingList);
+ 
+-  return new Response(JSON.stringify({ readingList }), {
+-    headers: { 'Content-Type': 'application/json' },
+-  });
++  return json({ readingList });
+ };
+ 
+ export const GET: APIRoute = async ({ session }) => {
+   const readingList = await session?.get('readingList') || [];
+ 
+-  return new Response(JSON.stringify({ readingList }), {
+-    headers: { 'Content-Type': 'application/json' },
+-  });
++  return json({ readingList });
+ };
+diff --git a/src/pages/articles/[slug].astro b/src/pages/articles/[slug].astro
+index 24fea39..c415616 100644
+--- a/src/pages/articles/[slug].astro
++++ b/src/pages/articles/[slug].astro
+@@ -8,6 +8,7 @@ import { Image } from 'astro:assets';
+ import { getArticleImage } from '../../utils/images';
+ import BookmarkButton from '../../components/BookmarkButton.tsx';
+ import ArticleTeaser from '../../components/ArticleTeaser.astro';
++import ArticleAgentTools from '../../components/ArticleAgentTools.tsx';
+ 
+ export const getStaticPaths = (async () => {
+   const articles = await getCollection('articles');
+@@ -32,7 +33,7 @@ const relatedArticles = allArticles.filter(a => a.id !== article.id).slice(0, 3)
+ const articleImage = await getArticleImage(article);
+ const relatedArticleImages = await Promise.all(relatedArticles.map(getArticleImage));
+ const readingList = await Astro.session?.get('readingList') || [];
+-const isBookmarked = readingList.includes(article.slug);
++const isBookmarked = readingList.includes(article.id);
+ ---
+ 
+ <Layout title={article.data.title}>
+@@ -99,15 +100,28 @@ const isBookmarked = readingList.includes(article.slug);
+                 <a href="#" class="w-8 h-8 rounded-full bg-gray-600 text-white flex items-center justify-center">
+                     <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path d="M2.003 5.884L10 10.884l7.997-5V4H2.003v1.884zM18 6.116l-8 4.05-8-4.05V16h16V6.116zM2 4h16v-1c0-.552-.448-1-1-1H3c-.552 0-1 .448-1 1v1z"/></svg>
+                 </a>
+-                <BookmarkButton client:visible slug={article.slug} initialIsBookmarked={isBookmarked} />
++                <BookmarkButton client:visible slug={article.id} initialIsBookmarked={isBookmarked} />
+             </div>
+ 
+         </div>
+ 
+         <!-- Article Body Content -->
+-        <div class="prose max-w-none">
++        <div class="prose max-w-none" data-article-body>
+             <Content />
+         </div>
++        <ArticleAgentTools
++            client:idle
++            article={{
++                slug: article.id,
++                title: article.data.title,
++                summary: article.data.summary,
++                author: article.data.author,
++                date: article.data.date.toISOString().slice(0, 10),
++                category: article.data.category,
++                tags: article.data.tags ?? [],
++                readingTime: article.data.readingTime,
++            }}
++        />
+ 
+         <!-- ADVERTISEMENT -->
+         <section class="p-4 md:p-6 text-center">
+diff --git a/src/pages/reading-list.astro b/src/pages/reading-list.astro
+new file mode 100644
+index 0000000..328dc1a
+--- /dev/null
++++ b/src/pages/reading-list.astro
+@@ -0,0 +1,113 @@
++---
++import Layout from '../layouts/Layout.astro';
++import { getCollection } from 'astro:content';
++import { sortByNewest, toArticleSummary } from '../utils/articles';
++
++const baseUrl = import.meta.env.BASE_URL;
++const articles = sortByNewest((await getCollection('articles')).map(toArticleSummary));
++
++// Progressive enhancement: the forms below work without JavaScript via POST + redirect.
++if (Astro.request.method === 'POST') {
++  const formData = await Astro.request.formData();
++  const intent = formData.get('intent');
++  const slug = String(formData.get('slug') ?? '');
++  if (articles.some((article) => article.slug === slug)) {
++    const current: string[] = (await Astro.session?.get('readingList')) || [];
++    const next =
++      intent === 'remove'
++        ? current.filter((item) => item !== slug)
++        : current.includes(slug)
++          ? current
++          : [...current, slug];
++    await Astro.session?.set('readingList', next);
++  }
++  return Astro.redirect(`${baseUrl}reading-list`, 303);
++}
++
++const readingList: string[] = (await Astro.session?.get('readingList')) || [];
++const savedArticles = readingList
++  .map((slug) => articles.find((article) => article.slug === slug))
++  .filter((article) => article !== undefined);
++const unsavedArticles = articles.filter((article) => !readingList.includes(article.slug));
++---
++
++<Layout title="Reading List | The DevTools Times">
++  <section class="max-w-3xl mx-auto px-4 py-8 md:py-12">
++    <h1 class="text-3xl md:text-4xl font-brand text-gray-900 mb-6">Your Reading List</h1>
++
++    {savedArticles.length === 0 ? (
++      <p class="text-gray-500 py-4">Your reading list is empty.</p>
++    ) : (
++      <ul class="space-y-2 mb-8">
++        {savedArticles.map((article) => (
++          <li>
++            <a href={`${baseUrl}articles/${article.slug}`} class="block hover:bg-gray-100 p-4 rounded-md transition-colors">
++              <h2 class="font-bold text-lg text-gray-800">{article.title}</h2>
++              <p class="text-sm text-gray-600">{article.summary}</p>
++            </a>
++          </li>
++        ))}
++      </ul>
++    )}
++
++    <div class="grid gap-6 md:grid-cols-2 border-t border-gray-200 pt-6">
++      {unsavedArticles.length > 0 && (
++        <form
++          method="post"
++          action={`${baseUrl}reading-list`}
++          class="agent-form space-y-3"
++          toolname="add-to-reading-list"
++          tooldescription="Save an article to the reader's reading list so they can read it later."
++          toolautosubmit
++        >
++          <input type="hidden" name="intent" value="add" />
++          <label for="add-slug" class="block text-sm font-semibold text-gray-800">Add an article</label>
++          <select
++            id="add-slug"
++            name="slug"
++            required
++            toolparamdescription="The article to save to the reading list."
++            class="w-full p-2 border border-gray-300 rounded-md bg-white"
++          >
++            <option value="">Choose an article…</option>
++            {unsavedArticles.map((article) => (
++              <option value={article.slug}>{article.title}</option>
++            ))}
++          </select>
++          <button type="submit" class="bg-gray-800 text-white text-sm font-semibold py-2 px-4 rounded hover:bg-gray-700">
++            Add to reading list
++          </button>
++        </form>
++      )}
++
++      {savedArticles.length > 0 && (
++        <form
++          method="post"
++          action={`${baseUrl}reading-list`}
++          class="agent-form space-y-3"
++          toolname="remove-from-reading-list"
++          tooldescription="Remove a saved article from the reader's reading list."
++          toolautosubmit
++        >
++          <input type="hidden" name="intent" value="remove" />
++          <label for="remove-slug" class="block text-sm font-semibold text-gray-800">Remove an article</label>
++          <select
++            id="remove-slug"
++            name="slug"
++            required
++            toolparamdescription="The saved article to take off the reading list."
++            class="w-full p-2 border border-gray-300 rounded-md bg-white"
++          >
++            <option value="">Choose an article…</option>
++            {savedArticles.map((article) => (
++              <option value={article.slug}>{article.title}</option>
++            ))}
++          </select>
++          <button type="submit" class="bg-gray-500 text-white text-sm font-semibold py-2 px-4 rounded hover:bg-gray-400">
++            Remove from reading list
++          </button>
++        </form>
++      )}
++    </div>
++  </section>
++</Layout>
+diff --git a/src/pages/search.astro b/src/pages/search.astro
+new file mode 100644
+index 0000000..c231577
+--- /dev/null
++++ b/src/pages/search.astro
+@@ -0,0 +1,50 @@
++---
++import Layout from '../layouts/Layout.astro';
++import { getCollection } from 'astro:content';
++import { searchArticles, sortByNewest, toArticleSummary } from '../utils/articles';
++
++const baseUrl = import.meta.env.BASE_URL;
++const query = (Astro.url.searchParams.get('q') ?? '').trim();
++const articles = (await getCollection('articles')).map(toArticleSummary);
++const results = query ? sortByNewest(searchArticles(articles, query)) : [];
++---
++
++<Layout title={query ? `Search: ${query} | The DevTools Times` : 'Search | The DevTools Times'}>
++  <section class="max-w-3xl mx-auto px-4 py-8 md:py-12">
++    <h1 class="text-3xl md:text-4xl font-brand text-gray-900 mb-6">Search</h1>
++
++    <form role="search" action={`${baseUrl}search`} method="get" class="flex gap-2 mb-8">
++      <label for="search-page-query" class="sr-only">Search articles</label>
++      <input
++        id="search-page-query"
++        type="search"
++        name="q"
++        value={query}
++        required
++        placeholder="Search for articles..."
++        class="flex-grow p-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-amber-400 focus:border-transparent"
++      />
++      <button type="submit" class="bg-gray-800 text-white text-sm font-semibold py-2 px-4 rounded hover:bg-gray-700">
++        Search
++      </button>
++    </form>
++
++    {query && (
++      <p class="text-sm text-gray-500 mb-4" role="status">
++        {results.length} {results.length === 1 ? 'result' : 'results'} for “{query}”
++      </p>
++    )}
++
++    <ul class="space-y-2">
++      {results.map((article) => (
++        <li>
++          <a href={`${baseUrl}articles/${article.slug}`} class="block hover:bg-gray-100 p-4 rounded-md transition-colors">
++            <p class="text-xs font-semibold text-gray-500 uppercase">{article.category}</p>
++            <h2 class="font-bold text-lg text-gray-800">{article.title}</h2>
++            <p class="text-sm text-gray-600">{article.summary}</p>
++          </a>
++        </li>
++      ))}
++    </ul>
++  </section>
++</Layout>
+diff --git a/src/scripts/agent-forms.ts b/src/scripts/agent-forms.ts
+new file mode 100644
+index 0000000..d0870db
+--- /dev/null
++++ b/src/scripts/agent-forms.ts
+@@ -0,0 +1,90 @@
++/**
++ * Handles submissions of declarative WebMCP forms (`<form toolname="…">`) made by
++ * an AI agent: instead of navigating, the result is returned to the agent through
++ * `SubmitEvent.respondWith()`. Normal user submissions are left untouched.
++ *
++ * The listener lives on `document`, so it survives Astro ClientRouter page swaps.
++ */
++import { navigate } from 'astro:transitions/client';
++import type { ArticleSummary } from '../utils/articles';
++
++type AgentSubmitEvent = SubmitEvent & {
++  agentInvoked?: boolean;
++  respondWith?: (result: Promise<unknown>) => void;
++};
++
++type FormToolHandler = (form: HTMLFormElement, data: FormData) => Promise<unknown>;
++
++const BASE_URL = import.meta.env.BASE_URL;
++const articleUrl = (slug: string) => new URL(`${BASE_URL}articles/${slug}`, location.origin).href;
++
++async function fetchJson<T>(input: string, init?: RequestInit): Promise<T> {
++  const response = await fetch(input, init);
++  const body = await response.json();
++  if (!response.ok) throw new Error(body?.error ?? `Request failed with status ${response.status}`);
++  return body as T;
++}
++
++async function updateReadingList(data: FormData, action: 'add' | 'remove') {
++  const slug = String(data.get('slug') ?? '');
++  if (!slug) return { error: 'Choose an article.' };
++  try {
++    const { readingList } = await fetchJson<{ readingList: string[] }>(`${BASE_URL}api/reading-list.json`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({ slug, action }),
++    });
++    // Re-render the reading list page so the user sees the change before the agent gets the result.
++    await navigate(location.href, { history: 'replace' });
++    return {
++      message: action === 'add' ? `Saved "${slug}" to the reading list.` : `Removed "${slug}" from the reading list.`,
++      readingList: readingList.map((item) => ({ slug: item, url: articleUrl(item) })),
++    };
++  } catch (error) {
++    return { error: error instanceof Error ? error.message : String(error) };
++  }
++}
++
++const handlers: Record<string, FormToolHandler> = {
++  'search-articles': async (_form, data) => {
++    const query = String(data.get('q') ?? '').trim();
++    if (!query) return { error: 'Enter at least one keyword to search for.' };
++    try {
++      const results = await fetchJson<ArticleSummary[]>(`${BASE_URL}api/articles.json?q=${encodeURIComponent(query)}`);
++      return {
++        query,
++        count: results.length,
++        results: results.map(({ slug, title, summary, category, author, date }) => ({
++          slug,
++          title,
++          summary,
++          category,
++          author,
++          date,
++          url: articleUrl(slug),
++        })),
++        searchPageUrl: new URL(`${BASE_URL}search?q=${encodeURIComponent(query)}`, location.origin).href,
++      };
++    } catch (error) {
++      return { error: error instanceof Error ? error.message : String(error) };
++    }
++  },
++  'add-to-reading-list': (_form, data) => updateReadingList(data, 'add'),
++  'remove-from-reading-list': (_form, data) => updateReadingList(data, 'remove'),
++};
++
++document.addEventListener(
++  'submit',
++  (event) => {
++    const submitEvent = event as AgentSubmitEvent;
++    const form = submitEvent.target;
++    if (!submitEvent.agentInvoked || !(form instanceof HTMLFormElement)) return;
++    const handler = handlers[form.getAttribute('toolname') ?? ''];
++    if (!handler || !submitEvent.respondWith) return;
++
++    // Capture phase + preventDefault keeps ClientRouter from navigating.
++    submitEvent.preventDefault();
++    submitEvent.respondWith(handler(form, new FormData(form)));
++  },
++  { capture: true },
++);
+diff --git a/src/styles/global.css b/src/styles/global.css
+index e9a9abb..2c89843 100644
+--- a/src/styles/global.css
++++ b/src/styles/global.css
+@@ -4,4 +4,19 @@
+   font-family: "Grenze", serif;
+   font-weight: 500;
+   font-style: normal;
+-}
+\ No newline at end of file
++}
++/* WebMCP: show the reader which form an AI agent is filling in. */
++form.agent-form:tool-form-active {
++  outline: 2px dashed var(--color-amber-400);
++  outline-offset: 4px;
++}
++
++button:tool-submit-active {
++  outline: 2px dashed var(--color-amber-500);
++}
++
++/* Passage highlighted by the scroll-to-article-passage agent tool. */
++.agent-highlight {
++  background-color: var(--color-amber-100);
++  transition: background-color 0.3s;
++}
+diff --git a/src/utils/articles.ts b/src/utils/articles.ts
+new file mode 100644
+index 0000000..a4be280
+--- /dev/null
++++ b/src/utils/articles.ts
+@@ -0,0 +1,47 @@
++import type { CollectionEntry } from 'astro:content';
++
++/** Serializable article summary shared by the JSON API, the search page and agent tools. */
++export interface ArticleSummary {
++  slug: string;
++  title: string;
++  summary: string;
++  author: string;
++  date: string;
++  category: string;
++  tags: string[];
++  readingTime?: number;
++  image: string;
++}
++
++export function toArticleSummary(article: CollectionEntry<'articles'>): ArticleSummary {
++  return {
++    slug: article.id,
++    title: article.data.title,
++    summary: article.data.summary,
++    author: article.data.author,
++    date: article.data.date.toISOString().slice(0, 10),
++    category: article.data.category,
++    tags: article.data.tags ?? [],
++    readingTime: article.data.readingTime,
++    image: article.data.image,
++  };
++}
++
++/** Case-insensitive keyword search: every word must match the title, summary, category, author or a tag. */
++export function searchArticles<T extends Pick<ArticleSummary, 'title' | 'summary' | 'category' | 'author' | 'tags'>>(
++  articles: T[],
++  query: string,
++): T[] {
++  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
++  if (terms.length === 0) return [];
++  return articles.filter((article) => {
++    const haystack = [article.title, article.summary, article.category, article.author, ...article.tags]
++      .join(' ')
++      .toLowerCase();
++    return terms.every((term) => haystack.includes(term));
++  });
++}
++
++export function sortByNewest<T extends Pick<ArticleSummary, 'date'>>(articles: T[]): T[] {
++  return [...articles].sort((a, b) => b.date.localeCompare(a.date));
++}
+diff --git a/tsconfig.json b/tsconfig.json
+index 69c1600..f74c219 100644
+--- a/tsconfig.json
++++ b/tsconfig.json
+@@ -9,6 +9,7 @@
+   ],
+   "compilerOptions": {
+     "jsx": "react-jsx",
+-    "jsxImportSource": "react"
++    "jsxImportSource": "react",
++    "types": ["webmcp-types"]
+   }
+ }
+\ No newline at end of file

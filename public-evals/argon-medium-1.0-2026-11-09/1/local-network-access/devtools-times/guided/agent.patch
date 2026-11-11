@@ -1,0 +1,760 @@
+diff --git a/global.d.ts b/global.d.ts
+index 22f7b64..f886302 100644
+--- a/global.d.ts
++++ b/global.d.ts
+@@ -2,6 +2,10 @@ declare global {
+   interface Window {
+     adNetwork: any; // Replace 'any' with a more specific type if you know it
+   }
++
++  interface RequestInit {
++    targetAddressSpace?: 'local' | 'loopback' | 'public';
++  }
+ }
+ 
+ export {};
+\ No newline at end of file
+diff --git a/src/components/DiagnosticsWidget.tsx b/src/components/DiagnosticsWidget.tsx
+new file mode 100644
+index 0000000..408e0db
+--- /dev/null
++++ b/src/components/DiagnosticsWidget.tsx
+@@ -0,0 +1,718 @@
++import React, { useState, useEffect, useRef, useCallback } from 'react';
++
++export type LnaPermissionName = 'local-network' | 'loopback-network';
++export type TargetAddressSpace = 'local' | 'loopback';
++
++/**
++ * Cross-browser permission check for granular Local Network Access permissions.
++ * Never queries the legacy 'local-network-access' alias, which crashes older Chrome renderers.
++ */
++export async function queryLnaPermissionSafe(
++  permissionName: LnaPermissionName,
++  onChange?: (state: PermissionState) => void
++): Promise<{ state: PermissionState; cleanup?: () => void }> {
++  if (typeof navigator === 'undefined' || !navigator.permissions?.query) {
++    return { state: 'prompt' };
++  }
++  try {
++    const status = await navigator.permissions.query({
++      name: permissionName as PermissionName,
++    });
++    const handleChange = () => {
++      onChange?.(status.state);
++    };
++    status.addEventListener('change', handleChange);
++    return {
++      state: status.state,
++      cleanup: () => status.removeEventListener('change', handleChange),
++    };
++  } catch {
++    // Unrecognized permission name in browsers without LNA support; fall back to 'prompt'
++    // so requests still run on an explicit user gesture.
++    return { state: 'prompt' };
++  }
++}
++
++/**
++ * Connects to a hardware test device on the user's private Wi-Fi LAN (RFC 1918 / .local).
++ * Explicitly declares targetAddressSpace: 'local' for Mixed Content exemption and DNS verification.
++ */
++export async function fetchLocalDeviceStatus(
++  deviceUrl = 'http://192.168.1.100:8080/api/status'
++): Promise<Record<string, unknown>> {
++  const request = new Request(deviceUrl, {
++    method: 'GET',
++    mode: 'cors',
++    targetAddressSpace: 'local',
++  });
++
++  const response = await fetch(request);
++  if (!response.ok) {
++    throw new Error(`Hardware device responded with HTTP ${response.status}`);
++  }
++  return response.json();
++}
++
++/**
++ * Connects to a local companion CLI daemon running on the user's loopback interface (127.0.0.1 / localhost).
++ * Explicitly declares targetAddressSpace: 'loopback' for Mixed Content exemption and DNS verification.
++ */
++export async function fetchLoopbackDaemon(
++  daemonUrl = 'http://127.0.0.1:45678/health'
++): Promise<Record<string, unknown>> {
++  const request = new Request(daemonUrl, {
++    method: 'GET',
++    mode: 'cors',
++    targetAddressSpace: 'loopback',
++  });
++
++  const response = await fetch(request);
++  if (!response.ok) {
++    throw new Error(`Companion CLI responded with HTTP ${response.status}`);
++  }
++  return response.json();
++}
++
++/**
++ * Opens a WebSocket connection to a local or loopback endpoint for live telemetry.
++ * Passes only the subprotocol array as the second argument (never a targetAddressSpace options object).
++ */
++export function openLocalWebSocket(wsUrl: string): WebSocket {
++  return new WebSocket(wsUrl, ['v1.telemetry']);
++}
++
++interface EndpointState {
++  url: string;
++  touched: boolean;
++  validationError: string | null;
++  permissionState: PermissionState;
++  connectionStatus: 'idle' | 'connecting' | 'connected' | 'error';
++  payload: Record<string, unknown> | null;
++  errorMessage: string | null;
++  wsStatus: 'closed' | 'connecting' | 'open' | 'error';
++  wsLastMessage: string | null;
++}
++
++function validateEndpointUrl(value: string, space: TargetAddressSpace): string | null {
++  const trimmed = value.trim();
++  if (!trimmed) {
++    return 'Please enter an endpoint URL.';
++  }
++  try {
++    const parsed = new URL(trimmed);
++    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
++      return 'URL must start with http:// or https://.';
++    }
++    if (space === 'loopback') {
++      const host = parsed.hostname.toLowerCase();
++      const isLoopback =
++        host === '127.0.0.1' ||
++        host === 'localhost' ||
++        host === '[::1]' ||
++        host === '::1' ||
++        host.startsWith('127.');
++      if (!isLoopback) {
++        return 'Loopback CLI URL must target 127.0.0.1, [::1], or localhost.';
++      }
++    }
++    return null;
++  } catch {
++    return 'Please enter a valid URL (e.g., http://192.168.1.100:8080/api/status).';
++  }
++}
++
++function deriveWebSocketUrl(httpUrl: string): string {
++  try {
++    const parsed = new URL(httpUrl);
++    parsed.protocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:';
++    parsed.pathname = '/stream';
++    parsed.search = '';
++    return parsed.toString();
++  } catch {
++    return 'ws://192.168.1.100:8080/stream';
++  }
++}
++
++export default function DiagnosticsWidget() {
++  const [isExpanded, setIsExpanded] = useState(true);
++  const [isSecure, setIsSecure] = useState(true);
++
++  const [lanState, setLanState] = useState<EndpointState>({
++    url: 'http://192.168.1.100:8080/api/status',
++    touched: false,
++    validationError: null,
++    permissionState: 'prompt',
++    connectionStatus: 'idle',
++    payload: null,
++    errorMessage: null,
++    wsStatus: 'closed',
++    wsLastMessage: null,
++  });
++
++  const [cliState, setCliState] = useState<EndpointState>({
++    url: 'http://127.0.0.1:45678/health',
++    touched: false,
++    validationError: null,
++    permissionState: 'prompt',
++    connectionStatus: 'idle',
++    payload: null,
++    errorMessage: null,
++    wsStatus: 'closed',
++    wsLastMessage: null,
++  });
++
++  const lanInputRef = useRef<HTMLInputElement>(null);
++  const cliInputRef = useRef<HTMLInputElement>(null);
++  const lanWsRef = useRef<WebSocket | null>(null);
++  const cliWsRef = useRef<WebSocket | null>(null);
++
++  const connectLanDevice = useCallback(async (targetUrl: string) => {
++    setLanState((prev) => ({
++      ...prev,
++      connectionStatus: 'connecting',
++      errorMessage: null,
++    }));
++    try {
++      const data = await fetchLocalDeviceStatus(targetUrl);
++      setLanState((prev) => ({
++        ...prev,
++        connectionStatus: 'connected',
++        payload: data,
++        errorMessage: null,
++      }));
++    } catch (err) {
++      const msg =
++        err instanceof Error
++          ? err.message
++          : 'Network error while connecting to LAN hardware device.';
++      setLanState((prev) => ({
++        ...prev,
++        connectionStatus: 'error',
++        errorMessage: `${msg} Ensure the hardware test device is powered on, connected to the same Wi-Fi LAN, returns CORS headers (Access-Control-Allow-Origin), and is allowed under Local network permissions.`,
++      }));
++    }
++  }, []);
++
++  const connectLoopbackCli = useCallback(async (targetUrl: string) => {
++    setCliState((prev) => ({
++      ...prev,
++      connectionStatus: 'connecting',
++      errorMessage: null,
++    }));
++    try {
++      const data = await fetchLoopbackDaemon(targetUrl);
++      setCliState((prev) => ({
++        ...prev,
++        connectionStatus: 'connected',
++        payload: data,
++        errorMessage: null,
++      }));
++    } catch (err) {
++      const msg =
++        err instanceof Error
++          ? err.message
++          : 'Network error while connecting to local companion CLI.';
++      setCliState((prev) => ({
++        ...prev,
++        connectionStatus: 'error',
++        errorMessage: `${msg} Ensure the companion CLI is running on 127.0.0.1, includes Access-Control-Allow-Origin headers, and is allowed under Loopback network permissions.`,
++      }));
++    }
++  }, []);
++
++  useEffect(() => {
++    if (typeof window !== 'undefined') {
++      setIsSecure(window.isSecureContext);
++    }
++
++    let cleanupLan: (() => void) | undefined;
++    let cleanupCli: (() => void) | undefined;
++
++    // 1. Pre-check 'local-network' permission; auto-connect ONLY if already 'granted'
++    queryLnaPermissionSafe('local-network', (newState) => {
++      setLanState((prev) => ({ ...prev, permissionState: newState }));
++    }).then(({ state, cleanup }) => {
++      cleanupLan = cleanup;
++      setLanState((prev) => ({ ...prev, permissionState: state }));
++      if (state === 'granted') {
++        connectLanDevice('http://192.168.1.100:8080/api/status');
++      }
++    });
++
++    // 2. Pre-check 'loopback-network' permission; auto-connect ONLY if already 'granted'
++    queryLnaPermissionSafe('loopback-network', (newState) => {
++      setCliState((prev) => ({ ...prev, permissionState: newState }));
++    }).then(({ state, cleanup }) => {
++      cleanupCli = cleanup;
++      setCliState((prev) => ({ ...prev, permissionState: state }));
++      if (state === 'granted') {
++        connectLoopbackCli('http://127.0.0.1:45678/health');
++      }
++    });
++
++    return () => {
++      cleanupLan?.();
++      cleanupCli?.();
++      lanWsRef.current?.close();
++      cliWsRef.current?.close();
++    };
++  }, [connectLanDevice, connectLoopbackCli]);
++
++  const handleLanSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
++    e.preventDefault();
++    const error = validateEndpointUrl(lanState.url, 'local');
++    if (error) {
++      setLanState((prev) => ({ ...prev, touched: true, validationError: error }));
++      lanInputRef.current?.focus();
++      return;
++    }
++    await connectLanDevice(lanState.url.trim());
++  };
++
++  const handleCliSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
++    e.preventDefault();
++    const error = validateEndpointUrl(cliState.url, 'loopback');
++    if (error) {
++      setCliState((prev) => ({ ...prev, touched: true, validationError: error }));
++      cliInputRef.current?.focus();
++      return;
++    }
++    await connectLoopbackCli(cliState.url.trim());
++  };
++
++  const toggleWebSocket = (space: TargetAddressSpace) => {
++    const isLan = space === 'local';
++    const currentRef = isLan ? lanWsRef : cliWsRef;
++    const setState = isLan ? setLanState : setCliState;
++    const currentUrl = isLan ? lanState.url : cliState.url;
++
++    if (currentRef.current && currentRef.current.readyState <= WebSocket.OPEN) {
++      currentRef.current.close();
++      currentRef.current = null;
++      setState((prev) => ({ ...prev, wsStatus: 'closed' }));
++      return;
++    }
++
++    const wsUrl = deriveWebSocketUrl(currentUrl);
++    setState((prev) => ({ ...prev, wsStatus: 'connecting', wsLastMessage: null }));
++
++    try {
++      const socket = openLocalWebSocket(wsUrl);
++      currentRef.current = socket;
++
++      socket.addEventListener('open', () => {
++        setState((prev) => ({
++          ...prev,
++          wsStatus: 'open',
++          wsLastMessage: `Connected to ${wsUrl} (subprotocol: v1.telemetry)`,
++        }));
++      });
++
++      socket.addEventListener('message', (event) => {
++        setState((prev) => ({
++          ...prev,
++          wsLastMessage: typeof event.data === 'string' ? event.data : 'Binary telemetry frame received',
++        }));
++      });
++
++      socket.addEventListener('error', () => {
++        setState((prev) => ({
++          ...prev,
++          wsStatus: 'error',
++          wsLastMessage: `WebSocket connection to ${wsUrl} failed. Verify the endpoint is reachable and permitted.`,
++        }));
++      });
++
++      socket.addEventListener('close', () => {
++        setState((prev) => ({
++          ...prev,
++          wsStatus: prev.wsStatus === 'error' ? 'error' : 'closed',
++        }));
++      });
++    } catch (err) {
++      setState((prev) => ({
++        ...prev,
++        wsStatus: 'error',
++        wsLastMessage: err instanceof Error ? err.message : 'Failed to open WebSocket.',
++      }));
++    }
++  };
++
++  const renderPermissionBadge = (
++    permissionName: LnaPermissionName,
++    state: PermissionState
++  ) => {
++    const badgeStyles: Record<PermissionState, string> = {
++      granted: 'bg-emerald-100 text-emerald-900 border-emerald-300',
++      prompt: 'bg-amber-100 text-amber-900 border-amber-300',
++      denied: 'bg-red-100 text-red-900 border-red-300',
++    };
++    const badgeIcons: Record<PermissionState, string> = {
++      granted: '✓ Granted',
++      prompt: '● Prompt on Connect',
++      denied: '✕ Denied',
++    };
++
++    return (
++      <span
++        data-permission-status={permissionName}
++        className={`inline-flex items-center gap-1 text-xs font-semibold px-2.5 py-0.5 rounded border ${badgeStyles[state]}`}
++      >
++        <span>{badgeIcons[state]}</span>
++        <span className="sr-only">({state})</span>
++      </span>
++    );
++  };
++
++  return (
++    <section
++      aria-label="Developer Diagnostics Connection Widget"
++      className="bg-slate-50 border-b border-gray-300 text-gray-900"
++    >
++      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-3">
++        <div className="flex flex-wrap items-center justify-between gap-2">
++          <div className="flex items-center gap-2.5">
++            <span
++              aria-hidden="true"
++              className="inline-flex items-center justify-center w-6 h-6 rounded bg-gray-900 text-amber-400 font-mono text-xs font-bold"
++            >
++              LNA
++            </span>
++            <div>
++              <h2 className="text-sm font-bold tracking-tight text-gray-900">
++                Developer Diagnostics Bridge
++              </h2>
++              <p className="text-xs text-gray-600">
++                Connect your browser directly to a private Wi-Fi LAN hardware test device and your local companion CLI via Local Network Access.
++              </p>
++            </div>
++          </div>
++
++          <button
++            type="button"
++            aria-expanded={isExpanded}
++            aria-controls="diagnostics-widget-panel"
++            onClick={() => setIsExpanded((prev) => !prev)}
++            className="text-xs font-semibold text-gray-800 bg-white hover:bg-gray-100 border border-gray-300 rounded px-3 py-1.5 transition"
++          >
++            {isExpanded ? 'Hide Diagnostics' : 'Open Diagnostics'}
++          </button>
++        </div>
++
++        <div id="diagnostics-widget-panel" hidden={!isExpanded} className="mt-4">
++          {!isSecure && (
++            <div
++              role="alert"
++              className="mb-4 p-3 rounded border border-amber-400 bg-amber-50 text-xs text-amber-950"
++            >
++              <strong>Secure Context Required:</strong> Local Network Access permissions (
++              <code>local-network</code> and <code>loopback-network</code>) require an{' '}
++              <code>https://</code> origin. Requests initiated from an insecure{' '}
++              <code>http://</code> top-level context will be denied by the browser.
++            </div>
++          )}
++
++          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
++            {/* Card 1: Hardware Test Device on Private Wi-Fi LAN */}
++            <div className="bg-white border border-gray-300 rounded-md p-4 shadow-xs flex flex-col justify-between">
++              <div>
++                <div className="flex items-start justify-between gap-2 mb-2">
++                  <div>
++                    <h3
++                      id="lan-device-heading"
++                      className="text-sm font-bold text-gray-900"
++                    >
++                      Hardware Test Device (Private Wi-Fi LAN)
++                    </h3>
++                    <p className="text-xs text-gray-600">
++                      Address space: <code className="font-mono">local</code> (Permission:{' '}
++                      <code className="font-mono">local-network</code>)
++                    </p>
++                  </div>
++                  {renderPermissionBadge('local-network', lanState.permissionState)}
++                </div>
++
++                {lanState.permissionState === 'prompt' && (
++                  <p className="text-xs text-gray-700 bg-gray-100 border border-gray-200 rounded p-2.5 mb-3">
++                    <strong>Why access is needed:</strong> Connecting reads live telemetry and firmware status from your on-LAN hardware rig (e.g., <code>192.168.1.x</code> or <code>.local</code>). Your browser will prompt for <strong>Local network</strong> permission when you click Connect.
++                  </p>
++                )}
++
++                <div
++                  data-remediation="local-network"
++                  hidden={lanState.permissionState !== 'denied'}
++                  className="text-xs text-red-900 bg-red-50 border border-red-300 rounded p-3 mb-3"
++                >
++                  <strong>Local Network Permission Denied:</strong> To connect to your LAN hardware test device, open your browser&apos;s <strong>Site settings</strong> (click the tune/lock icon in the address bar), set <strong>Local network</strong> to <strong>Allow</strong>, and retry.
++                </div>
++
++                <form
++                  aria-labelledby="lan-device-heading"
++                  onSubmit={handleLanSubmit}
++                  noValidate
++                  className="space-y-3"
++                >
++                  <div className="flex flex-col items-start gap-1">
++                    <label
++                      htmlFor="lan-endpoint-input"
++                      className="text-xs font-semibold text-gray-800"
++                    >
++                      LAN Device Endpoint URL <span aria-hidden="true">*</span>
++                    </label>
++                    <input
++                      ref={lanInputRef}
++                      id="lan-endpoint-input"
++                      name="lanEndpoint"
++                      type="url"
++                      required
++                      value={lanState.url}
++                      autoCorrect="off"
++                      autoCapitalize="none"
++                      spellCheck={false}
++                      enterKeyHint="go"
++                      aria-invalid={Boolean(lanState.validationError)}
++                      aria-describedby="lan-endpoint-help lan-endpoint-status"
++                      onChange={(e) => {
++                        const val = e.target.value;
++                        setLanState((prev) => ({
++                          ...prev,
++                          url: val,
++                          validationError: prev.validationError ? null : prev.validationError,
++                        }));
++                      }}
++                      onBlur={() => {
++                        if (lanState.touched || lanState.url !== 'http://192.168.1.100:8080/api/status') {
++                          setLanState((prev) => ({
++                            ...prev,
++                            touched: true,
++                            validationError: validateEndpointUrl(prev.url, 'local'),
++                          }));
++                        }
++                      }}
++                      className="w-full px-3 py-2 text-base sm:text-sm font-mono border border-gray-400 rounded focus:outline-2 focus:outline-offset-2 focus:outline-amber-500"
++                    />
++                    <span id="lan-endpoint-help" className="text-xs text-gray-600">
++                      Example: <code>http://192.168.1.100:8080/api/status</code> or <code>http://devkit.local:8080/api/status</code>
++                    </span>
++                    {lanState.validationError && (
++                      <p role="alert" className="text-xs font-semibold text-red-700">
++                        ✕ {lanState.validationError}
++                      </p>
++                    )}
++                  </div>
++
++                  <div className="flex flex-wrap items-center gap-2 pt-1">
++                    <button
++                      type="submit"
++                      disabled={lanState.connectionStatus === 'connecting'}
++                      className="bg-gray-900 hover:bg-gray-800 disabled:bg-gray-400 text-white text-xs font-semibold px-3.5 py-2 rounded transition cursor-pointer"
++                    >
++                      {lanState.connectionStatus === 'connecting'
++                        ? 'Connecting to LAN Device...'
++                        : 'Connect to LAN Device'}
++                    </button>
++                    <button
++                      type="button"
++                      onClick={() => toggleWebSocket('local')}
++                      className="bg-white hover:bg-gray-100 text-gray-800 border border-gray-300 text-xs font-semibold px-3 py-2 rounded transition cursor-pointer"
++                    >
++                      {lanState.wsStatus === 'open'
++                        ? 'Stop WS Telemetry'
++                        : 'Stream WS Telemetry'}
++                    </button>
++                  </div>
++                </form>
++              </div>
++
++              <div
++                id="lan-endpoint-status"
++                role="status"
++                aria-live="polite"
++                className="mt-3 pt-3 border-t border-gray-200 text-xs"
++              >
++                {lanState.connectionStatus === 'idle' && (
++                  <p className="text-gray-600">
++                    Status: Ready to connect (declares <code>targetAddressSpace: &apos;local&apos;</code>).
++                  </p>
++                )}
++                {lanState.connectionStatus === 'connecting' && (
++                  <p className="text-amber-800 font-medium">
++                    ⟳ Requesting LAN hardware status...
++                  </p>
++                )}
++                {lanState.connectionStatus === 'connected' && (
++                  <div className="text-emerald-900 bg-emerald-50 border border-emerald-200 rounded p-2">
++                    <p className="font-semibold">✓ Connected to Hardware Test Device</p>
++                    <pre className="mt-1 font-mono text-[11px] overflow-x-auto">
++                      {JSON.stringify(lanState.payload, null, 2)}
++                    </pre>
++                  </div>
++                )}
++                {lanState.connectionStatus === 'error' && (
++                  <div className="text-red-900 bg-red-50 border border-red-200 rounded p-2">
++                    <p className="font-semibold">✕ Connection Failed</p>
++                    <p className="mt-0.5">{lanState.errorMessage}</p>
++                  </div>
++                )}
++                {lanState.wsLastMessage && (
++                  <p className="mt-1.5 font-mono text-[11px] text-gray-700">
++                    [WebSocket] {lanState.wsLastMessage}
++                  </p>
++                )}
++              </div>
++            </div>
++
++            {/* Card 2: Local Companion CLI on Loopback (127.0.0.1) */}
++            <div className="bg-white border border-gray-300 rounded-md p-4 shadow-xs flex flex-col justify-between">
++              <div>
++                <div className="flex items-start justify-between gap-2 mb-2">
++                  <div>
++                    <h3
++                      id="loopback-cli-heading"
++                      className="text-sm font-bold text-gray-900"
++                    >
++                      Local Companion CLI (Loopback)
++                    </h3>
++                    <p className="text-xs text-gray-600">
++                      Address space: <code className="font-mono">loopback</code> (Permission:{' '}
++                      <code className="font-mono">loopback-network</code>)
++                    </p>
++                  </div>
++                  {renderPermissionBadge('loopback-network', cliState.permissionState)}
++                </div>
++
++                {cliState.permissionState === 'prompt' && (
++                  <p className="text-xs text-gray-700 bg-gray-100 border border-gray-200 rounded p-2.5 mb-3">
++                    <strong>Why access is needed:</strong> Connecting links this browser session with the companion CLI daemon running on your machine (<code>127.0.0.1</code>) to inspect local build traces. Your browser will prompt for <strong>Loopback network</strong> permission when you click Connect.
++                  </p>
++                )}
++
++                <div
++                  data-remediation="loopback-network"
++                  hidden={cliState.permissionState !== 'denied'}
++                  className="text-xs text-red-900 bg-red-50 border border-red-300 rounded p-3 mb-3"
++                >
++                  <strong>Loopback Network Permission Denied:</strong> To connect to your local companion CLI on <code>127.0.0.1</code>, open your browser&apos;s <strong>Site settings</strong>, set <strong>Loopback network</strong> to <strong>Allow</strong>, and retry.
++                </div>
++
++                <form
++                  aria-labelledby="loopback-cli-heading"
++                  onSubmit={handleCliSubmit}
++                  noValidate
++                  className="space-y-3"
++                >
++                  <div className="flex flex-col items-start gap-1">
++                    <label
++                      htmlFor="cli-endpoint-input"
++                      className="text-xs font-semibold text-gray-800"
++                    >
++                      Loopback CLI Endpoint URL <span aria-hidden="true">*</span>
++                    </label>
++                    <input
++                      ref={cliInputRef}
++                      id="cli-endpoint-input"
++                      name="cliEndpoint"
++                      type="url"
++                      required
++                      value={cliState.url}
++                      autoCorrect="off"
++                      autoCapitalize="none"
++                      spellCheck={false}
++                      enterKeyHint="go"
++                      aria-invalid={Boolean(cliState.validationError)}
++                      aria-describedby="cli-endpoint-help cli-endpoint-status"
++                      onChange={(e) => {
++                        const val = e.target.value;
++                        setCliState((prev) => ({
++                          ...prev,
++                          url: val,
++                          validationError: prev.validationError ? null : prev.validationError,
++                        }));
++                      }}
++                      onBlur={() => {
++                        if (cliState.touched || cliState.url !== 'http://127.0.0.1:45678/health') {
++                          setCliState((prev) => ({
++                            ...prev,
++                            touched: true,
++                            validationError: validateEndpointUrl(prev.url, 'loopback'),
++                          }));
++                        }
++                      }}
++                      className="w-full px-3 py-2 text-base sm:text-sm font-mono border border-gray-400 rounded focus:outline-2 focus:outline-offset-2 focus:outline-amber-500"
++                    />
++                    <span id="cli-endpoint-help" className="text-xs text-gray-600">
++                      Example: <code>http://127.0.0.1:45678/health</code> or <code>http://localhost:45678/health</code>
++                    </span>
++                    {cliState.validationError && (
++                      <p role="alert" className="text-xs font-semibold text-red-700">
++                        ✕ {cliState.validationError}
++                      </p>
++                    )}
++                  </div>
++
++                  <div className="flex flex-wrap items-center gap-2 pt-1">
++                    <button
++                      type="submit"
++                      disabled={cliState.connectionStatus === 'connecting'}
++                      className="bg-gray-900 hover:bg-gray-800 disabled:bg-gray-400 text-white text-xs font-semibold px-3.5 py-2 rounded transition cursor-pointer"
++                    >
++                      {cliState.connectionStatus === 'connecting'
++                        ? 'Connecting to Local CLI...'
++                        : 'Connect to Local CLI'}
++                    </button>
++                    <button
++                      type="button"
++                      onClick={() => toggleWebSocket('loopback')}
++                      className="bg-white hover:bg-gray-100 text-gray-800 border border-gray-300 text-xs font-semibold px-3 py-2 rounded transition cursor-pointer"
++                    >
++                      {cliState.wsStatus === 'open'
++                        ? 'Stop CLI WS Stream'
++                        : 'Stream CLI Logs (WS)'}
++                    </button>
++                  </div>
++                </form>
++              </div>
++
++              <div
++                id="cli-endpoint-status"
++                role="status"
++                aria-live="polite"
++                className="mt-3 pt-3 border-t border-gray-200 text-xs"
++              >
++                {cliState.connectionStatus === 'idle' && (
++                  <p className="text-gray-600">
++                    Status: Ready to connect (declares <code>targetAddressSpace: &apos;loopback&apos;</code>).
++                  </p>
++                )}
++                {cliState.connectionStatus === 'connecting' && (
++                  <p className="text-amber-800 font-medium">
++                    ⟳ Contacting local companion CLI on 127.0.0.1...
++                  </p>
++                )}
++                {cliState.connectionStatus === 'connected' && (
++                  <div className="text-emerald-900 bg-emerald-50 border border-emerald-200 rounded p-2">
++                    <p className="font-semibold">✓ Connected to Local Companion CLI</p>
++                    <pre className="mt-1 font-mono text-[11px] overflow-x-auto">
++                      {JSON.stringify(cliState.payload, null, 2)}
++                    </pre>
++                  </div>
++                )}
++                {cliState.connectionStatus === 'error' && (
++                  <div className="text-red-900 bg-red-50 border border-red-200 rounded p-2">
++                    <p className="font-semibold">✕ Connection Failed</p>
++                    <p className="mt-0.5">{cliState.errorMessage}</p>
++                  </div>
++                )}
++                {cliState.wsLastMessage && (
++                  <p className="mt-1.5 font-mono text-[11px] text-gray-700">
++                    [WebSocket] {cliState.wsLastMessage}
++                  </p>
++                )}
++              </div>
++            </div>
++          </div>
++        </div>
++      </div>
++    </section>
++  );
++}
+diff --git a/src/layouts/Layout.astro b/src/layouts/Layout.astro
+index dcf9696..75f9f69 100644
+--- a/src/layouts/Layout.astro
++++ b/src/layouts/Layout.astro
+@@ -2,6 +2,7 @@
+ import Header from "../components/Header.astro";
+ import Footer from "../components/Footer.astro";
+ import AdSlotFireplace from "../components/AdSlotFireplace.tsx";
++import DiagnosticsWidget from "../components/DiagnosticsWidget.tsx";
+ import "../styles/global.css";
+ 
+ import { ClientRouter } from "astro:transitions";
+@@ -45,6 +46,7 @@ const baseUrl = import.meta.env.BASE_URL;
+         <div>
+           <Header />
+         </div>
++        <DiagnosticsWidget client:load />
+         <main class="bg-white relative">
+           <slot />
+         </main>

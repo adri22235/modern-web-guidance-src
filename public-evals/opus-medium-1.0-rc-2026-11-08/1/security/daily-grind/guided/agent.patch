@@ -1,0 +1,366 @@
+diff --git a/index.html b/index.html
+index 66c9173..6452589 100644
+--- a/index.html
++++ b/index.html
+@@ -4,8 +4,10 @@
+ <head>
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <meta name="description" content="The Daily Grind: ethically sourced, locally roasted artisanal coffee.">
++  <meta name="referrer" content="strict-origin-when-cross-origin">
+   <title>The Daily Grind | Artisanal Coffee</title>
+-  <style>
++  <style nonce="{{CSP_NONCE}}">
+     :root {
+       --primary: #4e342e;
+       --secondary: #d7ccc8;
+@@ -55,18 +57,28 @@
+       margin-left: 20px;
+     }
+ 
+-    nav a {
++    nav a,
++    .logout-link {
+       color: white;
+       text-decoration: none;
+       font-size: 0.9rem;
+       transition: color 0.3s;
+     }
+ 
+-    nav a:hover {
++    nav a:hover,
++    .logout-link:hover {
+       color: var(--accent);
+     }
+ 
++    .logout-form {
++      display: inline;
++    }
++
+     .logout-link {
++      background: none;
++      font: inherit;
++      font-size: 0.9rem;
++      cursor: pointer;
+       border: 1px solid var(--accent);
+       padding: 5px 12px;
+       border-radius: 4px;
+@@ -76,7 +88,11 @@
+     .hero {
+       height: 60vh;
+       background: linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)),
+-        url('https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?auto=format&fit=crop&w=1350&q=80');
++        url("https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?auto=format&fit=crop&w=1350&q=80");
++      /* Browsers with url() request modifiers send no Referer to the image CDN;
++         others drop this declaration and fall back to the document policy. */
++      background-image: linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)),
++        url("https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?auto=format&fit=crop&w=1350&q=80" referrer-policy(no-referrer));
+       background-size: cover;
+       background-position: center;
+       display: flex;
+@@ -107,6 +123,10 @@
+       margin-top: 20px;
+     }
+ 
++    .section-title {
++      text-align: center;
++    }
++
+     .card {
+       background: white;
+       padding: 20px;
+@@ -157,14 +177,18 @@
+ 
+ <body>
+ 
+-  <nav>
++  <nav aria-label="Main">
+     <div class="logo">THE DAILY GRIND</div>
+     <ul>
+       <li><a href="/menu">Menu</a></li>
+       <li><a href="/locations">Locations</a></li>
+       <li><a href="/rewards">Rewards</a></li>
+       <li><a href="/account">My Account</a></li>
+-      <li><a href="/logout" class="logout-link">Logout</a></li>
++      <li>
++        <form method="post" action="/logout" class="logout-form">
++          <button type="submit" class="logout-link">Logout</button>
++        </form>
++      </li>
+     </ul>
+   </nav>
+ 
+@@ -176,7 +200,7 @@
+ 
+   <main class="container">
+     <section>
+-      <h2 style="text-align: center;">Seasonal Favorites</h2>
++      <h2 class="section-title">Seasonal Favorites</h2>
+       <div class="grid">
+         <div class="card">
+           <h3>Maple Oat Latte</h3>
+diff --git a/server.js b/server.js
+index 52c2fd5..51a8c72 100644
+--- a/server.js
++++ b/server.js
+@@ -1,30 +1,248 @@
+ const http = require('node:http');
+ const fs = require('node:fs');
+ const path = require('node:path');
++const crypto = require('node:crypto');
+ 
+ const PORT = parseInt(process.env.PORT || '11222', 10);
+ const WORK_DIR = __dirname;
+ 
++// Start HSTS with a short max-age and ramp up (e.g. to 31536000) once HTTPS is
++// confirmed everywhere; a long max-age on a misconfigured host is hard to undo.
++const HSTS_MAX_AGE = parseInt(process.env.HSTS_MAX_AGE || '300', 10);
++
++const SESSION_COOKIE = '__Host-session';
++const REPORT_PATH = '/reports';
++const MAX_REPORT_BYTES = 64 * 1024;
++const NONCE_PLACEHOLDER = '{{CSP_NONCE}}';
++
++// The template is trusted, developer-authored markup. Only the explicit
++// placeholder token is substituted; no request data is ever interpolated.
++const INDEX_TEMPLATE = fs.readFileSync(path.join(WORK_DIR, 'index.html'), 'utf8');
++
++function createNonce() {
++  return crypto.randomBytes(16).toString('base64');
++}
++
++function buildCsp(nonce) {
++  return [
++    "default-src 'self'",
++    `script-src 'nonce-${nonce}' 'strict-dynamic' 'report-sample'`,
++    `style-src 'nonce-${nonce}' 'report-sample'`,
++    "img-src 'self' https://images.unsplash.com",
++    "connect-src 'self'",
++    "object-src 'none'",
++    "base-uri 'none'",
++    "form-action 'self'",
++    "frame-ancestors 'none'",
++    "require-trusted-types-for 'script'",
++    "trusted-types 'none'",
++    'report-to csp-endpoint',
++  ].join('; ');
++}
++
++function setSecurityHeaders(res, nonce) {
++  res.setHeader('Reporting-Endpoints', `csp-endpoint="${REPORT_PATH}", default="${REPORT_PATH}"`);
++  res.setHeader('Content-Security-Policy', buildCsp(nonce));
++  res.setHeader('X-Frame-Options', 'DENY');
++  res.setHeader('X-Content-Type-Options', 'nosniff');
++  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
++  res.setHeader('Strict-Transport-Security', `max-age=${HSTS_MAX_AGE}; includeSubDomains`);
++  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
++  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
++  res.setHeader(
++    'Permissions-Policy',
++    'camera=(), microphone=(), geolocation=(), payment=(), usb=(), focus-without-user-activation=()',
++  );
++  res.setHeader('Vary', 'Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-Site');
++}
++
++// Fetch Metadata resource isolation: reject cross-site requests unless they are
++// plain top-level GET navigations (e.g. someone following a link to the site).
++function isAllowedByFetchMetadata(req) {
++  const site = req.headers['sec-fetch-site'];
++  if (!site) return true; // Legacy browsers don't send Fetch Metadata.
++  if (site === 'same-origin' || site === 'none') return true;
++
++  const mode = req.headers['sec-fetch-mode'];
++  const dest = req.headers['sec-fetch-dest'];
++  return (
++    mode === 'navigate' &&
++    (req.method === 'GET' || req.method === 'HEAD') &&
++    dest !== 'object' &&
++    dest !== 'embed'
++  );
++}
++
++function sendHtml(req, res, status, html, extraHeaders = {}) {
++  res.writeHead(status, {
++    'Content-Type': 'text/html; charset=utf-8',
++    'Cache-Control': 'no-store',
++    ...extraHeaders,
++  });
++  res.end(req.method === 'HEAD' ? undefined : html);
++}
++
++function sendText(res, status, text, extraHeaders = {}) {
++  res.writeHead(status, {
++    'Content-Type': 'text/plain; charset=utf-8',
++    'Cache-Control': 'no-store',
++    ...extraHeaders,
++  });
++  res.end(text);
++}
++
++function simplePage(nonce, title, bodyHtml) {
++  return `<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="UTF-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <title>${title} | The Daily Grind</title>
++  <style nonce="${nonce}">
++    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: #3e2723; background: #fafafa; display: grid; place-items: center; min-height: 100vh; margin: 0; text-align: center; padding: 20px; }
++    h1 { color: #4e342e; margin-bottom: 0.5rem; }
++    .btn { display: inline-block; background: #4e342e; color: white; padding: 10px 20px; border: 0; border-radius: 5px; margin-top: 15px; font: inherit; text-decoration: none; cursor: pointer; }
++  </style>
++</head>
++<body>
++  <main>
++${bodyHtml}
++  </main>
++</body>
++</html>`;
++}
++
++function handleLogout(req, res, nonce) {
++  if (req.method === 'POST') {
++    // Clear-Site-Data wipes cookies, storage and cached authenticated pages in
++    // supporting browsers; the expired cookie covers browsers that ignore it.
++    const html = simplePage(
++      nonce,
++      'Signed out',
++      `    <h1>You've been signed out</h1>
++    <p>Thanks for stopping by. See you for your next cup!</p>
++    <a href="/" class="btn">Back to home</a>`,
++    );
++    sendHtml(req, res, 200, html, {
++      'Clear-Site-Data': '"cookies", "storage", "cache"',
++      'Set-Cookie': `${SESSION_COOKIE}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax`,
++    });
++    return;
++  }
++
++  // GET only renders a confirmation form, so a cross-site link or <img> can't
++  // force a sign-out. The state change happens on POST.
++  const html = simplePage(
++    nonce,
++    'Sign out',
++    `    <h1>Sign out?</h1>
++    <p>You'll need to sign in again to see your rewards and orders.</p>
++    <form method="post" action="/logout">
++      <button type="submit" class="btn">Sign out</button>
++    </form>`,
++  );
++  sendHtml(req, res, 200, html);
++}
++
++function summarizeReport(report) {
++  // Log only what's needed to debug; drop query strings and samples that may
++  // carry tokens or PII.
++  const body = report.body || report['csp-report'] || {};
++  const stripQuery = (value) => {
++    if (typeof value !== 'string') return value;
++    try {
++      const url = new URL(value);
++      return `${url.origin}${url.pathname}`;
++    } catch {
++      return value.slice(0, 100);
++    }
++  };
++  return {
++    type: report.type || 'csp-violation',
++    directive: body.effectiveDirective || body['effective-directive'] || body['violated-directive'],
++    blocked: stripQuery(body.blockedURL || body['blocked-uri']),
++    document: stripQuery(body.documentURL || body['document-uri'] || report.url),
++    disposition: body.disposition,
++  };
++}
++
++function handleReport(req, res) {
++  const type = (req.headers['content-type'] || '').split(';')[0].trim();
++  if (type !== 'application/reports+json' && type !== 'application/csp-report') {
++    sendText(res, 415, 'Unsupported Media Type');
++    return;
++  }
++
++  let size = 0;
++  const chunks = [];
++  req.on('data', (chunk) => {
++    size += chunk.length;
++    if (size > MAX_REPORT_BYTES) {
++      sendText(res, 413, 'Payload Too Large', { Connection: 'close' });
++      req.destroy();
++      return;
++    }
++    chunks.push(chunk);
++  });
++  req.on('end', () => {
++    if (res.headersSent) return;
++    try {
++      const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
++      const reports = Array.isArray(parsed) ? parsed : [parsed];
++      for (const report of reports.slice(0, 50)) {
++        console.warn('[security-report]', JSON.stringify(summarizeReport(report)));
++      }
++    } catch {
++      sendText(res, 400, 'Bad Request');
++      return;
++    }
++    res.writeHead(204, { 'Cache-Control': 'no-store' });
++    res.end();
++  });
++}
++
+ const server = http.createServer((req, res) => {
+-  const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+-  const pathname = parsedUrl.pathname;
++  const nonce = createNonce();
++  setSecurityHeaders(res, nonce);
++
++  // Reject disallowed cross-site requests before any routing or session work.
++  if (!isAllowedByFetchMetadata(req)) {
++    sendText(res, 403, 'Forbidden');
++    return;
++  }
++
++  let pathname;
++  try {
++    pathname = new URL(req.url, 'http://localhost').pathname;
++  } catch {
++    sendText(res, 400, 'Bad Request');
++    return;
++  }
+ 
+   if (pathname === '/logout' || pathname === '/logout/') {
+-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+-    res.end('Logged out');
++    if (!['GET', 'HEAD', 'POST'].includes(req.method)) {
++      sendText(res, 405, 'Method Not Allowed', { Allow: 'GET, HEAD, POST' });
++      return;
++    }
++    handleLogout(req, res, nonce);
+     return;
+   }
+ 
+-  const filePath = path.join(WORK_DIR, 'index.html');
+-  fs.readFile(filePath, (err, data) => {
+-    if (err) {
+-      res.writeHead(500);
+-      res.end('Server error');
++  if (pathname === REPORT_PATH) {
++    if (req.method !== 'POST') {
++      sendText(res, 405, 'Method Not Allowed', { Allow: 'POST' });
+       return;
+     }
+-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+-    res.end(data);
+-  });
++    handleReport(req, res);
++    return;
++  }
++
++  if (req.method !== 'GET' && req.method !== 'HEAD') {
++    sendText(res, 405, 'Method Not Allowed', { Allow: 'GET, HEAD' });
++    return;
++  }
++
++  sendHtml(req, res, 200, INDEX_TEMPLATE.replaceAll(NONCE_PLACEHOLDER, nonce));
+ });
+ 
+ server.listen(PORT, () => {

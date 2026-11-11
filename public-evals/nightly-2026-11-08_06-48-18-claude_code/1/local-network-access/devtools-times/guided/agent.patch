@@ -1,0 +1,494 @@
+diff --git a/src/components/DiagnosticsConnect.tsx b/src/components/DiagnosticsConnect.tsx
+new file mode 100644
+index 0000000..35be3e3
+--- /dev/null
++++ b/src/components/DiagnosticsConnect.tsx
+@@ -0,0 +1,432 @@
++import { useEffect, useId, useRef, useState } from 'react';
++import {
++  CpuChipIcon,
++  CommandLineIcon,
++  ExclamationTriangleIcon,
++} from '@heroicons/react/24/outline';
++
++/**
++ * Developer diagnostics connection widget.
++ *
++ * Connects from the (public, https) site to:
++ *  - a hardware test device on the reader's private LAN  -> Local Network Access "local-network"
++ *  - a companion CLI on the reader's own machine          -> Local Network Access "loopback-network"
++ *
++ * Requests are only ever issued from an explicit user click (or automatically when the
++ * permission is already granted), declare `targetAddressSpace` so the browser can exempt
++ * http:// from mixed-content blocking and verify the resolved IP, and the target address is
++ * validated client-side so this widget can't be pointed at public hosts or used to scan.
++ */
++
++type AddressSpace = 'local' | 'loopback';
++type LnaPermission = 'local-network' | 'loopback-network';
++type PermState = PermissionState | 'unsupported';
++
++type ConnStatus =
++  | { kind: 'idle' }
++  | { kind: 'connecting' }
++  | { kind: 'ok'; httpStatus: number; ms: number; body: string }
++  | { kind: 'error'; message: string };
++
++interface TargetConfig {
++  id: string;
++  title: string;
++  description: string;
++  space: AddressSpace;
++  permission: LnaPermission;
++  defaultUrl: string;
++  placeholder: string;
++  hint: string;
++  Icon: typeof CpuChipIcon;
++}
++
++const TARGETS: TargetConfig[] = [
++  {
++    id: 'lan-device',
++    title: 'Hardware test device (Wi‑Fi LAN)',
++    description:
++      'Reach a test board or IoT device on your private network, e.g. 192.168.1.x, 10.x.x.x or device.local.',
++    space: 'local',
++    permission: 'local-network',
++    defaultUrl: 'http://192.168.1.100:8080/api/status',
++    placeholder: 'http://192.168.1.100:8080/api/status',
++    hint: 'Allowed hosts: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, fc00::/7, fe80::/10, *.local',
++    Icon: CpuChipIcon,
++  },
++  {
++    id: 'companion-cli',
++    title: 'Companion CLI (this computer)',
++    description:
++      'Reach the DevTools Times companion CLI running locally, e.g. started with `devtools-times-cli serve`.',
++    space: 'loopback',
++    permission: 'loopback-network',
++    defaultUrl: 'http://127.0.0.1:45678/health',
++    placeholder: 'http://127.0.0.1:45678/health',
++    hint: 'Allowed hosts: 127.0.0.0/8, [::1], localhost',
++    Icon: CommandLineIcon,
++  },
++];
++
++const STORAGE_PREFIX = 'devtools-times:diagnostics:';
++const REQUEST_TIMEOUT_MS = 8000;
++const MAX_BODY_CHARS = 4000;
++
++/* ------------------------------------------------------------------ */
++/* Address validation                                                  */
++/* ------------------------------------------------------------------ */
++
++function parseIPv4(host: string): number[] | null {
++  const parts = host.split('.');
++  if (parts.length !== 4) return null;
++  const nums = parts.map((p) => (/^\d{1,3}$/.test(p) ? Number(p) : NaN));
++  return nums.every((n) => n >= 0 && n <= 255) ? nums : null;
++}
++
++function isPrivateIPv4([a, b]: number[]): boolean {
++  return (
++    a === 10 ||
++    (a === 172 && b >= 16 && b <= 31) ||
++    (a === 192 && b === 168) ||
++    (a === 169 && b === 254)
++  );
++}
++
++/** Classify a URL hostname (as normalised by the URL parser) into an address space. */
++function classifyHost(hostname: string): AddressSpace | 'public' {
++  const host = hostname.toLowerCase();
++  if (host === 'localhost' || host.endsWith('.localhost')) return 'loopback';
++  if (host.endsWith('.local')) return 'local';
++
++  if (host.startsWith('[') && host.endsWith(']')) {
++    const v6 = host.slice(1, -1);
++    if (v6 === '::1') return 'loopback';
++    if (/^f[cd][0-9a-f]{0,2}:/.test(v6)) return 'local'; // fc00::/7 (ULA)
++    if (/^fe[89ab][0-9a-f]?:/.test(v6)) return 'local'; // fe80::/10 (link-local)
++    return 'public';
++  }
++
++  const v4 = parseIPv4(host);
++  if (v4) {
++    if (v4[0] === 127) return 'loopback';
++    if (isPrivateIPv4(v4)) return 'local';
++  }
++  return 'public';
++}
++
++function validateUrl(raw: string, space: AddressSpace): { url: URL } | { error: string } {
++  let url: URL;
++  try {
++    url = new URL(raw.trim());
++  } catch {
++    return { error: 'Enter a full URL, e.g. http://192.168.1.100:8080/api/status' };
++  }
++  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
++    return { error: 'Only http:// and https:// URLs are supported.' };
++  }
++  if (url.username || url.password) {
++    return { error: 'Credentials in the URL are not allowed.' };
++  }
++  const actual = classifyHost(url.hostname);
++  if (actual !== space) {
++    return {
++      error:
++        space === 'local'
++          ? 'This host is not a private LAN address. Use a 192.168.x.x / 10.x.x.x / 172.16–31.x.x address or a .local name.'
++          : 'This host is not a loopback address. Use 127.0.0.1, [::1] or localhost.',
++    };
++  }
++  return { url };
++}
++
++/* ------------------------------------------------------------------ */
++/* Local Network Access helpers                                        */
++/* ------------------------------------------------------------------ */
++
++/**
++ * Query the granular LNA permission. Never query the legacy 'local-network-access'
++ * name: it crashes the renderer in some older Chrome versions.
++ */
++async function queryPermission(name: LnaPermission): Promise<PermissionStatus | null> {
++  if (!navigator.permissions?.query) return null;
++  try {
++    return await navigator.permissions.query({ name: name as PermissionName });
++  } catch {
++    // Unrecognised permission name (Firefox, Safari, older Chromium).
++    return null;
++  }
++}
++
++async function probe(url: URL, space: AddressSpace, signal: AbortSignal) {
++  const started = performance.now();
++  const init: RequestInit & { targetAddressSpace: AddressSpace } = {
++    method: 'GET',
++    mode: 'cors',
++    credentials: 'omit',
++    cache: 'no-store',
++    redirect: 'error',
++    referrerPolicy: 'no-referrer',
++    headers: { Accept: 'application/json, text/plain;q=0.9' },
++    signal,
++    // Exempts http:// from mixed-content blocking and makes the browser verify that the
++    // resolved IP really is in this address space before sending anything.
++    targetAddressSpace: space,
++  };
++  const response = await fetch(url, init);
++  const text = await response.text();
++  const ms = Math.round(performance.now() - started);
++
++  let body = text;
++  if ((response.headers.get('content-type') ?? '').includes('json')) {
++    try {
++      body = JSON.stringify(JSON.parse(text), null, 2);
++    } catch {
++      /* show raw text */
++    }
++  }
++  if (body.length > MAX_BODY_CHARS) body = `${body.slice(0, MAX_BODY_CHARS)}\n… (truncated)`;
++  return { httpStatus: response.status, ok: response.ok, ms, body };
++}
++
++/* ------------------------------------------------------------------ */
++/* UI                                                                  */
++/* ------------------------------------------------------------------ */
++
++const PERM_LABEL: Record<PermState, string> = {
++  granted: 'Allowed',
++  prompt: 'Will ask',
++  denied: 'Blocked',
++  unsupported: 'Not reported by browser',
++};
++
++const PERM_CLASS: Record<PermState, string> = {
++  granted: 'bg-green-100 text-green-800',
++  prompt: 'bg-amber-100 text-amber-800',
++  denied: 'bg-red-100 text-red-800',
++  unsupported: 'bg-gray-100 text-gray-700',
++};
++
++function TargetPanel({ target }: { target: TargetConfig }) {
++  const inputId = useId();
++  const hintId = useId();
++  const errorId = useId();
++  const [rawUrl, setRawUrl] = useState(target.defaultUrl);
++  const [validationError, setValidationError] = useState<string | null>(null);
++  const [perm, setPerm] = useState<PermState>('unsupported');
++  const [status, setStatus] = useState<ConnStatus>({ kind: 'idle' });
++  const abortRef = useRef<AbortController | null>(null);
++
++  async function connect(urlString: string) {
++    const result = validateUrl(urlString, target.space);
++    if ('error' in result) {
++      setValidationError(result.error);
++      return;
++    }
++    setValidationError(null);
++    localStorage.setItem(STORAGE_PREFIX + target.id, result.url.href);
++
++    abortRef.current?.abort();
++    const controller = new AbortController();
++    abortRef.current = controller;
++    setStatus({ kind: 'connecting' });
++
++    try {
++      const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]);
++      const r = await probe(result.url, target.space, signal);
++      if (controller.signal.aborted) return;
++      setStatus(
++        r.ok
++          ? { kind: 'ok', httpStatus: r.httpStatus, ms: r.ms, body: r.body }
++          : { kind: 'error', message: `Responded with HTTP ${r.httpStatus}.` },
++      );
++    } catch (err) {
++      if (controller.signal.aborted) return;
++      const name = (err as Error)?.name;
++      setStatus({
++        kind: 'error',
++        message:
++          name === 'TimeoutError'
++            ? `No response within ${REQUEST_TIMEOUT_MS / 1000}s.`
++            : 'Could not connect. The permission may have been declined, the target may be offline, or it may not send CORS headers for this site.',
++      });
++    }
++  }
++
++  // Restore saved address, read permission state, and auto-connect only when already granted.
++  useEffect(() => {
++    const saved = localStorage.getItem(STORAGE_PREFIX + target.id);
++    const initialUrl = saved && 'url' in validateUrl(saved, target.space) ? saved : target.defaultUrl;
++    setRawUrl(initialUrl);
++
++    let permStatus: PermissionStatus | null = null;
++    const onChange = () => permStatus && setPerm(permStatus.state);
++    let cancelled = false;
++
++    queryPermission(target.permission).then((s) => {
++      if (cancelled || !s) return;
++      permStatus = s;
++      setPerm(s.state);
++      s.addEventListener('change', onChange);
++      if (s.state === 'granted' && saved) connect(initialUrl);
++    });
++
++    return () => {
++      cancelled = true;
++      permStatus?.removeEventListener('change', onChange);
++      abortRef.current?.abort();
++    };
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [target.id]);
++
++  const { Icon } = target;
++  const busy = status.kind === 'connecting';
++
++  return (
++    <section
++      aria-labelledby={`${inputId}-title`}
++      className="border border-gray-300 rounded-md p-5 flex flex-col gap-4 bg-white"
++    >
++      <header className="flex items-start gap-3">
++        <Icon className="h-7 w-7 text-gray-700 shrink-0" aria-hidden="true" />
++        <div className="flex-1">
++          <h2 id={`${inputId}-title`} className="font-bold text-lg text-gray-900">
++            {target.title}
++          </h2>
++          <p className="text-sm text-gray-600">{target.description}</p>
++        </div>
++        <span
++          className={`text-xs font-semibold px-2 py-1 rounded whitespace-nowrap ${PERM_CLASS[perm]}`}
++          title={`Browser permission: ${target.permission}`}
++        >
++          {PERM_LABEL[perm]}
++        </span>
++      </header>
++
++      <form
++        className="flex flex-col gap-2"
++        noValidate
++        onSubmit={(e) => {
++          e.preventDefault();
++          connect(rawUrl);
++        }}
++      >
++        <label htmlFor={inputId} className="text-sm font-semibold text-gray-800">
++          Endpoint URL
++        </label>
++        <div className="flex flex-col sm:flex-row gap-2">
++          <input
++            id={inputId}
++            type="url"
++            inputMode="url"
++            autoComplete="off"
++            spellCheck={false}
++            required
++            value={rawUrl}
++            placeholder={target.placeholder}
++            onChange={(e) => {
++              setRawUrl(e.target.value);
++              setValidationError(null);
++            }}
++            aria-invalid={validationError ? true : undefined}
++            aria-describedby={validationError ? `${errorId} ${hintId}` : hintId}
++            className="flex-1 border border-gray-300 rounded px-3 py-2 font-mono text-sm focus:outline-2 focus:outline-amber-400 aria-invalid:border-red-500"
++          />
++          <button
++            type="submit"
++            disabled={busy}
++            className="bg-gray-900 text-white font-semibold text-sm px-4 py-2 rounded hover:bg-gray-700 disabled:opacity-60 disabled:cursor-wait"
++          >
++            {busy ? 'Connecting…' : status.kind === 'ok' ? 'Reconnect' : 'Connect'}
++          </button>
++        </div>
++        <p id={hintId} className="text-xs text-gray-500">
++          {target.hint}
++        </p>
++        {validationError && (
++          <p id={errorId} className="text-sm text-red-700">
++            {validationError}
++          </p>
++        )}
++      </form>
++
++      {perm === 'prompt' && status.kind === 'idle' && (
++        <p className="text-sm text-gray-700">
++          When you click <strong>Connect</strong>, your browser will ask whether The DevTools Times may
++          access {target.space === 'local' ? 'devices on your local network' : 'apps on this device'}.
++          Nothing is contacted until you do.
++        </p>
++      )}
++
++      {perm === 'denied' && (
++        <div className="flex gap-2 text-sm bg-red-50 border border-red-200 rounded p-3 text-red-900">
++          <ExclamationTriangleIcon className="h-5 w-5 shrink-0" aria-hidden="true" />
++          <p>
++            Access is blocked. Open the site settings (the icon left of the address bar), set{' '}
++            <strong>{target.space === 'local' ? 'Local network' : 'Loopback network'}</strong> to
++            “Allow” or “Ask”, then reload this page.
++          </p>
++        </div>
++      )}
++
++      <div role="status" aria-live="polite" className="text-sm">
++        {status.kind === 'connecting' && <p className="text-gray-600">Connecting…</p>}
++        {status.kind === 'error' && (
++          <div className="bg-red-50 border border-red-200 rounded p-3 text-red-900">
++            <p className="font-semibold">Connection failed</p>
++            <p>{status.message}</p>
++            <ul className="list-disc ml-5 mt-2 text-red-800">
++              {target.space === 'local' ? (
++                <>
++                  <li>Check the device is powered on and on the same Wi‑Fi network.</li>
++                  <li>Confirm its IP address in your router or the device display.</li>
++                </>
++              ) : (
++                <li>
++                  Make sure the companion CLI is running and listening on the port in the URL.
++                </li>
++              )}
++              <li>
++                The target must reply with <code>Access-Control-Allow-Origin</code> for this site.
++              </li>
++            </ul>
++          </div>
++        )}
++        {status.kind === 'ok' && (
++          <div className="flex flex-col gap-2">
++            <p className="text-green-800 font-semibold">
++              Connected — HTTP {status.httpStatus} in {status.ms} ms
++            </p>
++            {status.body && (
++              <pre className="bg-gray-900 text-gray-100 text-xs p-3 rounded overflow-auto max-h-64">
++                {status.body}
++              </pre>
++            )}
++          </div>
++        )}
++      </div>
++    </section>
++  );
++}
++
++export default function DiagnosticsConnect() {
++  const [insecure, setInsecure] = useState(false);
++  useEffect(() => setInsecure(!window.isSecureContext), []);
++
++  return (
++    <div className="flex flex-col gap-6">
++      {insecure && (
++        <div className="flex gap-2 text-sm bg-amber-50 border border-amber-300 rounded p-3 text-amber-900">
++          <ExclamationTriangleIcon className="h-5 w-5 shrink-0" aria-hidden="true" />
++          <p>
++            This page isn’t loaded over HTTPS, so browsers will refuse local network access. Open the
++            site via <code>https://</code> to use these tools.
++          </p>
++        </div>
++      )}
++      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
++        {TARGETS.map((t) => (
++          <TargetPanel key={t.id} target={t} />
++        ))}
++      </div>
++    </div>
++  );
++}
+diff --git a/src/components/Footer.astro b/src/components/Footer.astro
+index 5f2d281..d742b89 100644
+--- a/src/components/Footer.astro
++++ b/src/components/Footer.astro
+@@ -51,6 +51,7 @@ const baseUrl = import.meta.env.BASE_URL;
+             <h3 class="font-bold text-xs uppercase tracking-wider mb-3">Science & Tech</h3>
+             <ul class="space-y-2">
+                 <li><a href="/category/science" class="text-sm hover:underline">Science</a></li>
++                <li><a href={`${baseUrl}diagnostics`} class="text-sm hover:underline">Developer Diagnostics</a></li>
+             </ul>
+         </div>
+ 
+diff --git a/src/pages/diagnostics.astro b/src/pages/diagnostics.astro
+new file mode 100644
+index 0000000..78ac8e0
+--- /dev/null
++++ b/src/pages/diagnostics.astro
+@@ -0,0 +1,38 @@
++---
++import Layout from '../layouts/Layout.astro';
++import DiagnosticsConnect from '../components/DiagnosticsConnect';
++
++const siteOrigin = new URL(Astro.site ?? Astro.url).origin;
++---
++
++<Layout title="Developer Diagnostics | The DevTools Times">
++  <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-10 flex flex-col gap-8">
++    <header class="border-b border-gray-300 pb-6">
++      <p class="text-xs font-bold uppercase tracking-wider text-amber-600">Developer tools</p>
++      <h1 class="text-3xl md:text-4xl font-bold text-gray-900 mt-1">Diagnostics connection</h1>
++      <p class="text-gray-700 mt-3 max-w-3xl">
++        Connect this page to a hardware test device on your private Wi‑Fi network and to the
++        companion CLI running on your own machine. Requests go directly from your browser to those
++        targets — nothing is relayed through our servers — and only after you click
++        <strong>Connect</strong> and approve your browser’s permission prompt.
++      </p>
++    </header>
++
++    <DiagnosticsConnect client:only="react" />
++
++    <section class="prose prose-sm max-w-3xl text-gray-700">
++      <h2>Setting up your targets</h2>
++      <p>
++        Your device or CLI must allow cross-origin requests from this site by answering
++        <code>GET</code> requests (and <code>OPTIONS</code> preflights) with:
++      </p>
++      <pre><code>Access-Control-Allow-Origin: {siteOrigin}</code></pre>
++      <p>
++        Only allow this exact origin — avoid <code>*</code>, so other websites can’t read data from
++        your device. Browsers that support Local Network Access (Chrome and Edge 145+) will ask you
++        once per site for “Local network” and “Loopback network” access; you can change that later
++        in site settings.
++      </p>
++    </section>
++  </div>
++</Layout>

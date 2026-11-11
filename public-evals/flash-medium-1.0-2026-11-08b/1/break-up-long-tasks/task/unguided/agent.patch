@@ -1,0 +1,373 @@
+diff --git a/coffee-simulator.worker.js b/coffee-simulator.worker.js
+new file mode 100644
+--- a/coffee-simulator.worker.js
++++ b/coffee-simulator.worker.js
+@@ -0,0 +1,368 @@
++/**
++ * The Daily Grind - Coffee Flavor Profile Simulation Worker
++ * Simulates high-volume recipe blends in a background thread to prevent UI freezing.
++ */
++
++// Coffee origin flavor baselines (scale: 0 - 100)
++const COFFEE_ORIGINS = {
++  ethiopia: {
++    name: 'Ethiopian Yirgacheffe',
++    region: 'East Africa',
++    acidity: 88,
++    body: 46,
++    sweetness: 82,
++    bitterness: 22,
++    aroma: 95,
++    notes: ['Bergamot', 'Jasmine', 'Lemon Blossom', 'Peach']
++  },
++  colombia: {
++    name: 'Colombian Supremo',
++    region: 'South America',
++    acidity: 68,
++    body: 65,
++    sweetness: 78,
++    bitterness: 35,
++    aroma: 76,
++    notes: ['Caramel', 'Red Apple', 'Milk Chocolate', 'Citrus']
++  },
++  sumatra: {
++    name: 'Sumatran Mandheling',
++    region: 'Southeast Asia',
++    acidity: 32,
++    body: 92,
++    sweetness: 54,
++    bitterness: 65,
++    aroma: 72,
++    notes: ['Dark Chocolate', 'Cedar', 'Earthy Spice', 'Cacao']
++  },
++  brazil: {
++    name: 'Brazilian Cerrado',
++    region: 'South America',
++    acidity: 42,
++    body: 76,
++    sweetness: 75,
++    bitterness: 42,
++    aroma: 68,
++    notes: ['Hazelnut', 'Toffee', 'Brown Sugar', 'Milk Chocolate']
++  },
++  kenya: {
++    name: 'Kenyan AA',
++    region: 'East Africa',
++    acidity: 92,
++    body: 72,
++    sweetness: 80,
++    bitterness: 30,
++    aroma: 91,
++    notes: ['Blackcurrant', 'Grapefruit', 'Blackberry', 'Winey']
++  },
++  guatemala: {
++    name: 'Guatemalan Antigua',
++    region: 'Central America',
++    acidity: 72,
++    body: 68,
++    sweetness: 77,
++    bitterness: 38,
++    aroma: 84,
++    notes: ['Orange Zest', 'Cocoa Powder', 'Cinnamon', 'Honey']
++  }
++};
++
++// Roast level sensory modifiers (multipliers / deltas)
++const ROAST_MODIFIERS = {
++  light: {
++    acidityMul: 1.15,
++    bodyMul: 0.85,
++    sweetnessMul: 1.05,
++    bitternessMul: 0.70,
++    aromaMul: 1.10,
++    extraNotes: ['Floral', 'Bright Citrus', 'Green Tea']
++  },
++  'medium-light': {
++    acidityMul: 1.06,
++    bodyMul: 0.94,
++    sweetnessMul: 1.10,
++    bitternessMul: 0.85,
++    aromaMul: 1.05,
++    extraNotes: ['Crisp Fruit', 'Honey']
++  },
++  medium: {
++    acidityMul: 1.00,
++    bodyMul: 1.02,
++    sweetnessMul: 1.12,
++    bitternessMul: 1.00,
++    aromaMul: 1.00,
++    extraNotes: ['Caramelized', 'Toasted Graham']
++  },
++  'medium-dark': {
++    acidityMul: 0.80,
++    bodyMul: 1.18,
++    sweetnessMul: 0.95,
++    bitternessMul: 1.22,
++    aromaMul: 0.92,
++    extraNotes: ['Bakers Chocolate', 'Roasted Walnut']
++  },
++  dark: {
++    acidityMul: 0.55,
++    bodyMul: 1.16,
++    sweetnessMul: 0.78,
++    bitternessMul: 1.48,
++    aromaMul: 0.84,
++    extraNotes: ['Smoky', 'Charcoal', 'Dark Molasses']
++  }
++};
++
++// Brew method extraction kinetics modifiers
++const BREW_MODIFIERS = {
++  espresso: {
++    acidityMul: 1.02,
++    bodyMul: 1.25,
++    sweetnessMul: 1.08,
++    bitternessMul: 1.18,
++    aromaMul: 1.12
++  },
++  'pour-over': {
++    acidityMul: 1.14,
++    bodyMul: 0.88,
++    sweetnessMul: 1.02,
++    bitternessMul: 0.86,
++    aromaMul: 1.15
++  },
++  'french-press': {
++    acidityMul: 0.92,
++    bodyMul: 1.22,
++    sweetnessMul: 1.04,
++    bitternessMul: 1.08,
++    aromaMul: 0.96
++  },
++  'cold-brew': {
++    acidityMul: 0.65,
++    bodyMul: 1.10,
++    sweetnessMul: 1.22,
++    bitternessMul: 0.70,
++    aromaMul: 0.88
++  }
++};
++
++let isCancelled = false;
++
++function clamp(val, min = 0, max = 100) {
++  return Math.max(min, Math.min(max, val));
++}
++
++// Generates random blend proportions that sum to 100%
++function generateProportions(numComponents) {
++  if (numComponents === 1) return [100];
++  const cuts = [];
++  for (let i = 0; i < numComponents - 1; i++) {
++    cuts.push(Math.random());
++  }
++  cuts.sort((a, b) => a - b);
++  const proportions = [];
++  let prev = 0;
++  for (let i = 0; i < cuts.length; i++) {
++    proportions.push(Math.round((cuts[i] - prev) * 100));
++    prev = cuts[i];
++  }
++  proportions.push(Math.round((1 - prev) * 100));
++
++  // Normalize to guarantee exact sum of 100
++  const sum = proportions.reduce((acc, v) => acc + v, 0);
++  const diff = 100 - sum;
++  proportions[0] += diff;
++  return proportions;
++}
++
++// Compute Euclidean compatibility match percentage with target profile
++function computeMatchScore(profile, target) {
++  const diffAcidity = profile.acidity - target.acidity;
++  const diffBody = profile.body - target.body;
++  const diffSweetness = profile.sweetness - target.sweetness;
++  const diffBitterness = profile.bitterness - target.bitterness;
++  const diffAroma = profile.aroma - target.aroma;
++
++  const distanceSquared =
++    diffAcidity * diffAcidity * 1.2 +
++    diffBody * diffBody * 1.1 +
++    diffSweetness * diffSweetness * 1.2 +
++    diffBitterness * diffBitterness * 1.0 +
++    diffAroma * diffAroma * 0.9;
++
++  const maxDistSquared = 100 * 100 * 5.4;
++  const score = Math.max(0, 100 * (1 - Math.sqrt(distanceSquared / maxDistSquared)));
++  return Math.round(score * 10) / 10;
++}
++
++// Run the simulation in chunked batches inside the worker
++function runSimulation(config) {
++  isCancelled = false;
++  const startTime = performance.now();
++
++  const total = config.batchSize || 10000;
++  const chunkSize = config.chunkSize || 1000;
++  const target = config.targetProfile || {
++    acidity: 65,
++    body: 70,
++    sweetness: 75,
++    bitterness: 35,
++    aroma: 80
++  };
++  const roastKey = config.roastLevel || 'medium';
++  const brewKey = config.brewMethod || 'pour-over';
++  const selectedOrigins = (config.origins && config.origins.length > 0)
++    ? config.origins
++    : Object.keys(COFFEE_ORIGINS);
++
++  const roastMod = ROAST_MODIFIERS[roastKey] || ROAST_MODIFIERS.medium;
++  const brewMod = BREW_MODIFIERS[brewKey] || BREW_MODIFIERS['pour-over'];
++
++  let processed = 0;
++  let sumAcidity = 0;
++  let sumBody = 0;
++  let sumSweetness = 0;
++  let sumBitterness = 0;
++  let sumAroma = 0;
++
++  // Track top 5 blends
++  const topBlends = [];
++
++  function processChunk() {
++    if (isCancelled) {
++      self.postMessage({ type: 'CANCELLED', processed, total });
++      return;
++    }
++
++    const endIdx = Math.min(processed + chunkSize, total);
++    for (let i = processed; i < endIdx; i++) {
++      // Pick 2 to 4 origins from selected list
++      const numBeans = Math.min(selectedOrigins.length, Math.floor(Math.random() * 3) + 2);
++      const shuffled = [...selectedOrigins].sort(() => 0.5 - Math.random());
++      const chosenKeys = shuffled.slice(0, numBeans);
++      const ratios = generateProportions(numBeans);
++
++      let blendAcidity = 0;
++      let blendBody = 0;
++      let blendSweetness = 0;
++      let blendBitterness = 0;
++      let blendAroma = 0;
++      const blendComponents = [];
++      const notesSet = new Set();
++
++      for (let k = 0; k < numBeans; k++) {
++        const key = chosenKeys[k];
++        const origin = COFFEE_ORIGINS[key];
++        const fraction = ratios[k] / 100;
++
++        blendAcidity += origin.acidity * fraction;
++        blendBody += origin.body * fraction;
++        blendSweetness += origin.sweetness * fraction;
++        blendBitterness += origin.bitterness * fraction;
++        blendAroma += origin.aroma * fraction;
++
++        blendComponents.push({
++          key,
++          name: origin.name,
++          percentage: ratios[k]
++        });
++
++        // Add 1-2 tasting notes from dominant origins
++        if (fraction >= 0.2) {
++          origin.notes.forEach(note => notesSet.add(note));
++        }
++      }
++
++      // Add roast extras
++      roastMod.extraNotes.slice(0, 2).forEach(n => notesSet.add(n));
++
++      // Introduce Monte Carlo thermal & extraction micro-variations (-3 to +3)
++      const variance = (Math.random() - 0.5) * 6;
++
++      const finalAcidity = clamp(Math.round((blendAcidity * roastMod.acidityMul * brewMod.acidityMul) + variance));
++      const finalBody = clamp(Math.round((blendBody * roastMod.bodyMul * brewMod.bodyMul) + variance * 0.8));
++      const finalSweetness = clamp(Math.round((blendSweetness * roastMod.sweetnessMul * brewMod.sweetnessMul) + variance * 0.6));
++      const finalBitterness = clamp(Math.round((blendBitterness * roastMod.bitternessMul * brewMod.bitternessMul) - variance * 0.5));
++      const finalAroma = clamp(Math.round((blendAroma * roastMod.aromaMul * brewMod.aromaMul) + variance * 0.7));
++
++      const profile = {
++        acidity: finalAcidity,
++        body: finalBody,
++        sweetness: finalSweetness,
++        bitterness: finalBitterness,
++        aroma: finalAroma
++      };
++
++      const matchScore = computeMatchScore(profile, target);
++
++      sumAcidity += finalAcidity;
++      sumBody += finalBody;
++      sumSweetness += finalSweetness;
++      sumBitterness += finalBitterness;
++      sumAroma += finalAroma;
++
++      // Update top blends list if score qualifies
++      if (topBlends.length < 5 || matchScore > topBlends[topBlends.length - 1].matchScore) {
++        const candidate = {
++          id: i + 1,
++          components: blendComponents,
++          profile,
++          matchScore,
++          tastingNotes: Array.from(notesSet).slice(0, 5),
++          roastLevel: roastKey,
++          brewMethod: brewKey
++        };
++
++        topBlends.push(candidate);
++        topBlends.sort((a, b) => b.matchScore - a.matchScore);
++        if (topBlends.length > 5) {
++          topBlends.pop();
++        }
++      }
++    }
++
++    processed = endIdx;
++    const now = performance.now();
++    const elapsed = (now - startTime) / 1000;
++    const speed = Math.round(processed / (elapsed || 0.001));
++
++    const currentStats = {
++      avgAcidity: Math.round(sumAcidity / processed),
++      avgBody: Math.round(sumBody / processed),
++      avgSweetness: Math.round(sumSweetness / processed),
++      avgBitterness: Math.round(sumBitterness / processed),
++      avgAroma: Math.round(sumAroma / processed),
++      speed,
++      elapsed: elapsed.toFixed(1)
++    };
++
++    if (processed < total) {
++      self.postMessage({
++        type: 'PROGRESS',
++        processed,
++        total,
++        currentStats,
++        topBlends
++      });
++      // Yield to next microtask/event queue in worker
++      setTimeout(processChunk, 0);
++    } else {
++      self.postMessage({
++        type: 'COMPLETE',
++        processed,
++        total,
++        currentStats,
++        topBlends,
++        elapsed: elapsed.toFixed(2)
++      });
++    }
++  }
++
++  processChunk();
++}
++
++self.onmessage = function (e) {
++  const data = e.data || {};
++  if (data.type === 'START') {
++    runSimulation(data.config || {});
++  } else if (data.type === 'STOP') {
++    isCancelled = true;
++  }
++};

@@ -1,0 +1,379 @@
+diff --git a/equipment.js b/equipment.js
+new file mode 100644
+index 0000000..49c4d6f
+--- /dev/null
++++ b/equipment.js
+@@ -0,0 +1,101 @@
++/* Status checks stay in the visitor's browser: never proxy LAN/loopback requests. */
++(() => {
++  'use strict';
++
++  function validateEndpoint(value, device) {
++    let url;
++    try { url = new URL(value); } catch { throw new Error('Enter a complete HTTP or HTTPS status URL.'); }
++    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) {
++      throw new Error('Use an HTTP or HTTPS URL without credentials or a fragment.');
++    }
++    const host = url.hostname;
++    const parts = host.split('.').map(Number);
++    const ipv4 = parts.length === 4 && parts.every(part => Number.isInteger(part) && part >= 0 && part <= 255);
++    const loopback = ['localhost', '[::1]'].includes(host) || (ipv4 && parts[0] === 127);
++    const privateIP = ipv4 && (parts[0] === 10 || (parts[0] === 192 && parts[1] === 168) ||
++      (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31));
++    if (device === 'helper' ? !loopback : !privateIP) {
++      throw new Error(device === 'helper'
++        ? 'Use a loopback address: 127.0.0.1, localhost, or [::1].'
++        : 'Use the brewer’s private IPv4 address (192.168.x.x, 10.x.x.x, or 172.16–31.x.x).');
++    }
++    return url;
++  }
++
++  document.querySelectorAll('[data-device]').forEach(form => {
++    const device = form.dataset.device;
++    const input = form.elements.endpoint;
++    const connect = form.querySelector('[type="submit"]');
++    const disconnect = form.querySelector('[data-disconnect]');
++    const badge = form.querySelector('.connection-status');
++    const message = form.querySelector('.connection-message');
++    let active = null;
++
++    function render(state, detail) {
++      badge.dataset.state = state;
++      badge.textContent = { disconnected: 'Not connected', connecting: 'Connecting…', connected: 'Connected', error: 'Connection failed' }[state];
++      message.textContent = detail;
++      input.disabled = state === 'connecting' || state === 'connected';
++      connect.disabled = state === 'connecting';
++      connect.textContent = state === 'connected' ? 'Check again' : `Connect ${device}`;
++      disconnect.disabled = !['connecting', 'connected'].includes(state);
++      disconnect.textContent = state === 'connecting' ? 'Cancel' : 'Disconnect';
++      form.setAttribute('aria-busy', String(state === 'connecting'));
++    }
++
++    disconnect.addEventListener('click', () => {
++      const previous = active;
++      active = null;
++      previous?.abort();
++      render('disconnected', 'Disconnected. Connect again whenever you’re ready.');
++      input.focus();
++    });
++
++    form.addEventListener('submit', async event => {
++      event.preventDefault();
++      if (active) return;
++      let endpoint;
++      try {
++        endpoint = validateEndpoint(input.value.trim(), device);
++      } catch (error) {
++        render('error', error.message);
++        input.focus();
++        return;
++      }
++      if (!window.isSecureContext) {
++        render('error', 'Open this page over HTTPS or localhost before connecting to local equipment.');
++        return;
++      }
++      const controller = new AbortController();
++      active = controller;
++      let timedOut = false;
++      render('connecting', 'Checking equipment. Allow network access if your browser asks.');
++      const timeout = setTimeout(() => { timedOut = true; controller.abort(); }, 20000);
++      try {
++        const response = await fetch(endpoint.href, {
++          method: 'GET', mode: 'cors', credentials: 'omit', cache: 'no-store',
++          redirect: 'error', signal: controller.signal,
++        });
++        if (!response.ok) throw new Error(`Equipment returned HTTP ${response.status}. Check the status URL and device configuration.`);
++        let data;
++        try { data = await response.json(); } catch { throw new Error('The endpoint did not return JSON. Check the status URL.'); }
++        if (!data || Array.isArray(data) || typeof data.status !== 'string' || !data.status.trim()) {
++          throw new Error('Expected a JSON object with a nonempty status string. Check the endpoint’s API format.');
++        }
++        if (active !== controller) return;
++        const name = typeof data.name === 'string' && data.name.trim() ? data.name.slice(0, 80) : (device === 'brewer' ? 'Brewer' : 'Desktop helper');
++        render('connected', `${name}: ${data.status.slice(0, 120)}. Last checked ${new Date().toLocaleTimeString()}.`);
++      } catch (error) {
++        if (active !== controller) return;
++        render('error', timedOut
++          ? 'No response within 20 seconds. Check the device, network, and browser permissions, then try again.'
++          : error instanceof TypeError
++            ? 'Could not reach equipment. Check the address, Wi-Fi or running helper, browser network permissions, CORS, and HTTPS support. See troubleshooting below.'
++            : error.message);
++      } finally {
++        clearTimeout(timeout);
++        if (active === controller) active = null;
++      }
++    });
++  });
++})();
+diff --git a/index.html b/index.html
+index 66c9173..e40ba31 100644
+--- a/index.html
++++ b/index.html
+@@ -135,6 +135,42 @@
+       background: #3e2723;
+     }
+ 
++    .equipment { margin-top: 48px; scroll-margin-top: 100px; }
++    .equipment-heading { max-width: 680px; }
++    .eyebrow { color: #795548; font-size: .8rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
++    .equipment h2 { font-size: 2rem; margin: 4px 0 8px; }
++    .equipment-intro { color: #6d554e; }
++    .connection-card { text-align: left; padding: 26px; border: 1px solid #e8ded8; }
++    .connection-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
++    .connection-title h3 { margin: 0; }
++    .connection-status { font-size: .8rem; font-weight: 600; background: #f1eeec; color: #65534d; padding: 3px 10px; border-radius: 20px; }
++    .connection-status[data-state="connected"] { background: #e5f1e6; color: #285a33; }
++    .connection-status[data-state="connecting"] { background: #fff1da; color: #795114; }
++    .connection-status[data-state="error"] { background: #fbe9e7; color: #9a3025; }
++    .connection-description { min-height: 52px; margin-bottom: 18px; font-size: .95rem; }
++    .connection-card label { display: block; font-size: .85rem; font-weight: 600; margin-bottom: 6px; }
++    .connection-card input { width: 100%; min-width: 0; padding: 12px; border: 1px solid #bca9a0; border-radius: 5px; color: var(--text); background: #fffdfb; font: inherit; font-size: .9rem; }
++    .connection-card input:disabled { opacity: .7; }
++    .field-hint { font-size: .8rem; color: #705d56; margin-top: 6px; }
++    .connection-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 18px 0 12px; }
++    .connection-actions button { font: inherit; font-size: .9rem; font-weight: 600; cursor: pointer; margin: 0; border: 1px solid var(--primary); }
++    .connection-actions .secondary { background: transparent; color: var(--primary); }
++    .connection-actions button:disabled { cursor: default; opacity: .5; }
++    a:focus-visible, button:focus-visible, input:focus-visible, summary:focus-visible { outline: 3px solid #bd7416; outline-offset: 4px; }
++    .connection-message { font-size: .85rem; min-height: 3em; overflow-wrap: anywhere; }
++    .connection-help { margin-top: 20px; padding: 18px 22px; background: #f2ece7; border-radius: 8px; font-size: .9rem; }
++    .connection-help summary { cursor: pointer; font-weight: 600; }
++    .connection-help p { margin-top: 12px; }
++    .connection-help code { overflow-wrap: anywhere; }
++    @media (max-width: 640px) {
++      nav { align-items: flex-start; gap: 12px; flex-direction: column; }
++      nav ul { flex-wrap: wrap; gap: 8px 14px; }
++      nav ul li { margin: 0; }
++      .hero h1 { font-size: 2.3rem; }
++      .equipment h2 { font-size: 1.65rem; }
++      .connection-card { padding: 20px; }
++    }
++
+     footer {
+       background: var(--secondary);
+       text-align: center;
+@@ -163,6 +199,7 @@
+       <li><a href="/menu">Menu</a></li>
+       <li><a href="/locations">Locations</a></li>
+       <li><a href="/rewards">Rewards</a></li>
++      <li><a href="#equipment">Connect Equipment</a></li>
+       <li><a href="/account">My Account</a></li>
+       <li><a href="/logout" class="logout-link">Logout</a></li>
+     </ul>
+@@ -195,6 +232,54 @@
+         </div>
+       </div>
+     </section>
++
++    <section class="equipment" id="equipment" aria-labelledby="equipment-heading">
++      <div class="equipment-heading">
++        <p class="eyebrow">Your coffee, connected</p>
++        <h2 id="equipment-heading">Connect your brewing setup</h2>
++        <p class="equipment-intro">At the counter or at your own desk, check in with your equipment right from this browser. Connect either device, or both.</p>
++      </div>
++      <div class="grid">
++        <form class="card connection-card" data-device="brewer">
++          <div class="connection-title">
++            <h3>Wi-Fi coffee brewer</h3>
++            <span class="connection-status" data-state="disconnected">Not connected</span>
++          </div>
++          <p class="connection-description">For baristas and customers on the shop’s private Wi-Fi. Use the brewer’s local network address.</p>
++          <label for="brewer-url">Brewer status URL</label>
++          <input id="brewer-url" name="endpoint" type="url" value="http://192.168.1.100/api/status" required aria-describedby="brewer-hint brewer-message" spellcheck="false" autocapitalize="none" autocomplete="off">
++          <p class="field-hint" id="brewer-hint">Use your brewer’s private IP, port, and status endpoint.</p>
++          <div class="connection-actions">
++            <button class="btn" type="submit">Connect brewer</button>
++            <button class="btn secondary" type="button" data-disconnect disabled>Disconnect</button>
++          </div>
++          <p class="connection-message" id="brewer-message" role="status" aria-live="polite" aria-atomic="true">Ready when you are. Join the shop’s Wi-Fi first.</p>
++        </form>
++        <form class="card connection-card" data-device="helper">
++          <div class="connection-title">
++            <h3>Desktop brewing helper</h3>
++            <span class="connection-status" data-state="disconnected">Not connected</span>
++          </div>
++          <p class="connection-description">Connect to the companion helper on this computer. Open the desktop app before connecting.</p>
++          <label for="helper-url">Helper status URL</label>
++          <input id="helper-url" name="endpoint" type="url" value="http://127.0.0.1:8000/api/status" required aria-describedby="helper-hint helper-message" spellcheck="false" autocapitalize="none" autocomplete="off">
++          <p class="field-hint" id="helper-hint">Use 127.0.0.1, localhost, or [::1] and the helper’s port.</p>
++          <div class="connection-actions">
++            <button class="btn" type="submit">Connect helper</button>
++            <button class="btn secondary" type="button" data-disconnect disabled>Disconnect</button>
++          </div>
++          <p class="connection-message" id="helper-message" role="status" aria-live="polite" aria-atomic="true">Ready when you are. The helper must run on this device.</p>
++        </form>
++      </div>
++      <details class="connection-help">
++        <summary>Connection requirements &amp; troubleshooting</summary>
++        <p>Allow local network or loopback access if your browser asks. Use this page over HTTPS or localhost. Browser support varies; some browsers block HTTP equipment from an HTTPS page. Use a supported browser or a trusted HTTPS endpoint if that happens.</p>
++        <p>These example URLs are starting points. Set the correct port and path for your equipment. The endpoint must return a successful HTTP response with a JSON object containing a nonempty <code>status</code> string, such as <code>{"status":"ready","name":"Counter brewer"}</code>. A connection checks status only; it does not start a brew or continuously monitor equipment.</p>
++        <p>The brewer or helper must allow this page’s exact origin through CORS. Browser network permission does not replace CORS. If connection fails, check Wi-Fi, the running helper, firewall rules, browser site permissions, and the device’s CORS configuration. Your computer’s loopback address always points to this computer.</p>
++        <p>Requests go directly from your browser to the address you enter, only when you connect or check again. Addresses are not saved. Disconnect clears the panel and cancels any pending check; it does not turn off equipment.</p>
++      </details>
++      <noscript><p>Enable JavaScript to connect to brewing equipment.</p></noscript>
++    </section>
+   </main>
+ 
+   <footer>
+@@ -207,6 +292,7 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script src="equipment.js" defer></script>
+ </body>
+ 
+ </html>
+diff --git a/package.json b/package.json
+index 2bd4d77..a2a2adc 100644
+--- a/package.json
++++ b/package.json
+@@ -2,6 +2,7 @@
+   "name": "daily-grind",
+   "version": "1.0.0",
+   "scripts": {
++    "test": "node --test tests/*.test.cjs",
+     "start": "pnpm dlx statikk --port ${PORT:-11222}"
+   },
+   "pnpm": {
+diff --git a/tests/equipment.test.cjs b/tests/equipment.test.cjs
+new file mode 100644
+index 0000000..f956a92
+--- /dev/null
++++ b/tests/equipment.test.cjs
+@@ -0,0 +1,136 @@
++const { test } = require('node:test');
++const assert = require('node:assert/strict');
++const { readFileSync } = require('node:fs');
++const { runInNewContext } = require('node:vm');
++const source = readFileSync(require('node:path').join(__dirname, '../equipment.js'), 'utf8');
++
++function setup(fetch, secure = true) {
++  function panel(device, value) {
++    const handlers = {};
++    const input = { value, focus() {} };
++    const nodes = Object.fromEntries(['[type="submit"]', '[data-disconnect]', '.connection-status', '.connection-message']
++      .map(key => [key, { dataset: {}, addEventListener(type, fn) { handlers[type] = fn; } }]));
++    return { dataset: { device }, elements: { endpoint: input }, nodes,
++      querySelector: key => nodes[key], setAttribute() {},
++      addEventListener(type, fn) { handlers[type] = fn; },
++      submit: () => handlers.submit({ preventDefault() {} }),
++      disconnect: () => handlers.click(),
++      state: () => nodes['.connection-status'].dataset.state,
++      message: () => nodes['.connection-message'].textContent,
++    };
++  }
++  const brewer = panel('brewer', 'http://192.168.1.100/api/status');
++  const helper = panel('helper', 'http://127.0.0.1:8000/api/status');
++  const timers = new Set();
++  runInNewContext(source, {
++    document: { querySelectorAll: () => [brewer, helper] }, window: { isSecureContext: secure },
++    fetch, URL, AbortController, TypeError, Date,
++    setTimeout(fn) { timers.add(fn); return fn; }, clearTimeout(fn) { timers.delete(fn); },
++  });
++  return { brewer, helper, timers };
++}
++
++test('both devices connect directly with readable CORS responses and no credentials', async () => {
++  const calls = [];
++  const { brewer, helper, timers } = setup(async (url, options) => {
++    calls.push({ url, options });
++    return { ok: true, json: async () => ({ status: 'ready', name: 'Counter brewer' }) };
++  });
++  assert.equal(calls.length, 0, 'no automatic local network requests');
++  await Promise.all([brewer.submit(), helper.submit()]);
++  assert.equal(brewer.state(), 'connected');
++  assert.equal(helper.state(), 'connected');
++  assert.match(brewer.message(), /Counter brewer: ready/);
++  assert.equal(calls[0].url, 'http://192.168.1.100/api/status');
++  assert.equal(calls[1].url, 'http://127.0.0.1:8000/api/status');
++  for (const { options } of calls) {
++    assert.equal(options.mode, 'cors');
++    assert.equal(options.credentials, 'omit');
++    assert.equal(options.redirect, 'error');
++  }
++  await brewer.submit();
++  assert.equal(calls.length, 3, 'check again makes a fresh request');
++  brewer.disconnect();
++  assert.equal(brewer.state(), 'disconnected');
++  assert.equal(helper.state(), 'connected');
++  assert.equal(timers.size, 0);
++});
++
++test('rejects public addresses, misleading loopback hosts, and credentialed URLs', async () => {
++  let calls = 0;
++  const { brewer, helper } = setup(() => { calls++; });
++  for (const value of ['http://example.com/status', 'http://127.0.0.1/status', 'http://user:pass@192.168.1.1/status', 'ftp://192.168.1.1/status']) {
++    brewer.elements.endpoint.value = value;
++    await brewer.submit();
++    assert.equal(brewer.state(), 'error');
++  }
++  for (const value of ['http://127.evil.example/status', 'http://192.168.1.1/status', 'https://example.com/status']) {
++    helper.elements.endpoint.value = value;
++    await helper.submit();
++    assert.equal(helper.state(), 'error');
++  }
++  assert.equal(calls, 0);
++});
++
++test('supports private ranges and loopback alternatives', async () => {
++  const { brewer, helper } = setup(async () => ({ ok: true, json: async () => ({ status: 'idle' }) }));
++  for (const value of ['http://10.0.0.2/status', 'https://172.16.0.2:8443/status', 'http://172.31.255.254/status']) {
++    brewer.elements.endpoint.value = value;
++    await brewer.submit();
++    assert.equal(brewer.state(), 'connected');
++  }
++  for (const value of ['http://localhost:8000/status', 'http://[::1]:8000/status']) {
++    helper.elements.endpoint.value = value;
++    await helper.submit();
++    assert.equal(helper.state(), 'connected');
++  }
++});
++
++test('HTTP, malformed responses, and network failures never claim connection', async () => {
++  for (const response of [
++    { ok: false, status: 404 },
++    { ok: true, json: async () => { throw new SyntaxError(); } },
++    { ok: true, json: async () => ({ unrelated: true }) },
++    { ok: true, json: async () => ({ status: ' ' }) },
++  ]) {
++    const { brewer } = setup(async () => response);
++    await brewer.submit();
++    assert.equal(brewer.state(), 'error');
++    assert.equal(brewer.elements.endpoint.disabled, false);
++  }
++  const { helper } = setup(async () => { throw new TypeError('Failed to fetch'); });
++  await helper.submit();
++  assert.match(helper.message(), /CORS/);
++  assert.equal(helper.state(), 'error');
++});
++
++test('cancelled responses cannot overwrite a new connection', async () => {
++  const pending = [];
++  const { brewer } = setup((url, options) => new Promise(resolve => pending.push({ resolve, options })));
++  const first = brewer.submit();
++  await brewer.submit();
++  assert.equal(pending.length, 1, 'duplicate submissions are ignored');
++  brewer.disconnect();
++  assert.equal(pending[0].options.signal.aborted, true);
++  const second = brewer.submit();
++  pending[1].resolve({ ok: true, json: async () => ({ status: 'new' }) });
++  await second;
++  pending[0].resolve({ ok: true, json: async () => ({ status: 'stale' }) });
++  await first;
++  assert.match(brewer.message(), /new/);
++  assert.doesNotMatch(brewer.message(), /stale/);
++});
++
++test('timeouts and insecure pages show actionable errors', async () => {
++  const { brewer, timers } = setup((url, options) => new Promise((resolve, reject) => {
++    options.signal.addEventListener('abort', () => reject(new Error('Aborted')));
++  }));
++  const pending = brewer.submit();
++  for (const timeout of timers) timeout();
++  await pending;
++  assert.equal(brewer.state(), 'error');
++  assert.match(brewer.message(), /20 seconds/);
++  const insecure = setup(() => assert.fail('must not fetch'), false);
++  await insecure.helper.submit();
++  assert.match(insecure.helper.message(), /HTTPS or localhost/);
++});

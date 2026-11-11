@@ -1,0 +1,289 @@
+diff --git a/README.md b/README.md
+index 4479b53..c488e3d 100644
+--- a/README.md
++++ b/README.md
+@@ -15,3 +15,36 @@ The application will now be running on `http://localhost:11224`.
+ - **[React](https://react.dev/)**: Used for UI components.
+ - **[Tailwind CSS](https://tailwindcss.com/)**: For styling the application.
+ - **[Astro DB](https://docs.astro.build/en/guides/database/)**: Powers the comments feature, using a libSQL-compatible database.
++
++## Diagnostics connections
++
++The homepage includes independent browser-side connection checks for a private
++LAN test device and a loopback companion CLI. Edit the example URLs to match
++your services (`http://192.168.1.100:8080/api/status` and
++`http://127.0.0.1:45678/health`); these are illustrative endpoints, not bundled
++services. Each Connect click sends one GET request and displays the HTTP status,
++elapsed time, and JSON or text response. There is no discovery, polling, server
++proxy, or persistent connection.
++
++Serve the site over HTTPS (localhost is also a secure context for development).
++Use a browser supporting Local Network Access. The two targets use separate
++`local-network` and `loopback-network` permission checks and explicit fetch
++`targetAddressSpace` values. Unsupported permission queries are caught; the
++user can still attempt a connection, subject to their browser's restrictions.
++Denied permissions must be restored in the browser's site settings. Requests
++time out after 15 seconds and can be canceled.
++
++The device must be reachable from the reader's LAN, and the CLI must expose an
++HTTP service on the reader's machine. Both endpoints must support standard CORS,
++for example `Access-Control-Allow-Origin: https://your-deployed-site.example`
++(the origin has no path, including no `/devtools-times/`). Requests omit
++credentials and referrers and reject redirects. Responses are rendered as text
++and the displayed output is capped at 8,000 characters. Browser network errors
++cannot reliably distinguish permission denial, CORS, TLS, and an offline service;
++the widget provides troubleshooting guidance rather than claiming a cause.
++
++The widget runs in the top-level page, where both network permissions default to
++`self`. A deployment must not disable them with a restrictive Permissions-Policy
++header. No access is delegated to third-party frames. See the
++[Chrome Local Network Access guide](https://developer.chrome.com/docs/modern-web-guidance/guides/security/local-network-access)
++for browser permission and deployment details.
+diff --git a/src/components/DiagnosticsConnections.tsx b/src/components/DiagnosticsConnections.tsx
+new file mode 100644
+index 0000000..b341648
+--- /dev/null
++++ b/src/components/DiagnosticsConnections.tsx
+@@ -0,0 +1,215 @@
++import { useEffect, useRef, useState } from 'react';
++
++type AddressSpace = 'local' | 'loopback';
++type NetworkPermission = 'local-network' | 'loopback-network';
++type Permission = PermissionState | 'unknown';
++
++function validateEndpoint(value: string, space: AddressSpace): URL {
++  let url: URL;
++  try {
++    url = new URL(value);
++  } catch {
++    throw new Error('Enter a complete HTTP or HTTPS endpoint URL.');
++  }
++  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) {
++    throw new Error('Use an HTTP or HTTPS URL without credentials or a fragment.');
++  }
++  const host = url.hostname.toLowerCase();
++  const ip = host.split('.').map(Number);
++  const ipv4 = /^\d+\.\d+\.\d+\.\d+$/.test(host) && ip.every(part => part >= 0 && part <= 255);
++  const loopback = (ipv4 && ip[0] === 127) || host === '[::1]' || host === 'localhost' || host.endsWith('.localhost');
++  const privateLan = (ipv4 && (ip[0] === 10 || (ip[0] === 172 && ip[1] >= 16 && ip[1] <= 31) ||
++    (ip[0] === 192 && ip[1] === 168) || (ip[0] === 169 && ip[1] === 254))) ||
++    host.endsWith('.local') || /^\[(?:f[cd][0-9a-f]{2}:|fe[89ab][0-9a-f]:)/.test(host);
++  if (space === 'loopback' ? !loopback : !privateLan) {
++    throw new Error(space === 'loopback'
++      ? 'Use a loopback address such as 127.0.0.1, localhost, or [::1].'
++      : 'Use a private LAN address such as 192.168.1.100 or device.local.');
++  }
++  return url;
++}
++
++function ConnectionCard({ space, title, description, initialUrl }: {
++  space: AddressSpace;
++  title: string;
++  description: string;
++  initialUrl: string;
++}) {
++  const permissionName: NetworkPermission = space === 'local' ? 'local-network' : 'loopback-network';
++  const [endpoint, setEndpoint] = useState(initialUrl);
++  const [permission, setPermission] = useState<Permission>('unknown');
++  const [secure, setSecure] = useState(false);
++  const [status, setStatus] = useState<'idle' | 'checking' | 'success' | 'error'>('idle');
++  const [message, setMessage] = useState('No connection attempted.');
++  const [output, setOutput] = useState('');
++  const activeRequest = useRef<AbortController | null>(null);
++
++  useEffect(() => {
++    setSecure(window.isSecureContext);
++    let disposed = false;
++    let permissionStatus: PermissionStatus | undefined;
++    const updatePermission = () => {
++      if (disposed || !permissionStatus) return;
++      setPermission(permissionStatus.state);
++      if (permissionStatus.state === 'denied') {
++        const request = activeRequest.current;
++        activeRequest.current = null;
++        request?.abort();
++        setStatus('error');
++        setOutput('');
++        setMessage('Access blocked. Allow access in browser site settings, then try again.');
++      }
++    };
++    // Querying permission never contacts a device or triggers a permission prompt.
++    navigator.permissions?.query({ name: permissionName as PermissionName })
++      .then(result => {
++        if (disposed) return;
++        permissionStatus = result;
++        updatePermission();
++        result.addEventListener('change', updatePermission);
++      })
++      .catch(() => { /* Unsupported permission names still allow a user-initiated attempt. */ });
++    return () => {
++      disposed = true;
++      permissionStatus?.removeEventListener('change', updatePermission);
++      activeRequest.current?.abort();
++    };
++  }, [permissionName]);
++
++  function cancel() {
++    const request = activeRequest.current;
++    activeRequest.current = null;
++    request?.abort();
++    setStatus('idle');
++    setMessage('Connection check canceled.');
++  }
++
++  async function connect(event: React.FormEvent<HTMLFormElement>) {
++    event.preventDefault();
++    if (activeRequest.current) return;
++    setOutput('');
++    if (!window.isSecureContext || permission === 'denied') {
++      setStatus('error');
++      setMessage(!window.isSecureContext
++        ? 'Open this site over HTTPS to connect to local devices.'
++        : 'Allow access in browser site settings, then try again.');
++      return;
++    }
++    let url: URL;
++    try {
++      url = validateEndpoint(endpoint.trim(), space);
++    } catch (error) {
++      setStatus('error');
++      setMessage((error as Error).message);
++      return;
++    }
++    const controller = new AbortController();
++    activeRequest.current = controller;
++    setStatus('checking');
++    setMessage('Waiting for permission and endpoint response…');
++    let timedOut = false;
++    const timer = window.setTimeout(() => {
++      timedOut = true;
++      controller.abort();
++    }, 15000);
++    try {
++      // Keep the request in the browser: a server proxy would reach the server's LAN.
++      const options: RequestInit & { targetAddressSpace: AddressSpace } = {
++        method: 'GET',
++        mode: 'cors',
++        credentials: 'omit',
++        cache: 'no-store',
++        redirect: 'error',
++        referrerPolicy: 'no-referrer',
++        targetAddressSpace: space,
++        signal: controller.signal,
++      };
++      const start = performance.now();
++      const response = await fetch(url.href, options);
++      if (!response.ok) throw new Error(`Endpoint returned HTTP ${response.status}. Check the endpoint path and service logs.`);
++      const body = await response.text();
++      if (activeRequest.current !== controller || controller.signal.aborted) return;
++      let formatted = body;
++      try { formatted = JSON.stringify(JSON.parse(body), null, 2); } catch { /* Plain-text health endpoints are supported too. */ }
++      setOutput(formatted.length > 8000 ? `${formatted.slice(0, 8000)}\n… response truncated` : formatted);
++      setStatus('success');
++      setMessage(`Reachable · HTTP ${response.status} · ${Math.round(performance.now() - start)} ms. Checked ${new Date().toLocaleTimeString()}.`);
++    } catch (error) {
++      if (activeRequest.current !== controller) return;
++      setStatus('error');
++      setMessage(timedOut
++        ? 'Timed out after 15 seconds. Check the service and address, and approve browser access before retrying.'
++        : error instanceof TypeError
++          ? 'Could not connect. Check browser site permissions, the service address, CORS settings, and browser support for local network access.'
++          : (error as Error).message);
++    } finally {
++      window.clearTimeout(timer);
++      if (activeRequest.current === controller) activeRequest.current = null;
++    }
++  }
++
++  const badge = { idle: 'Not checked', checking: 'Connecting', success: 'Reachable', error: 'Needs attention' }[status];
++  const color = status === 'success' ? 'bg-emerald-100 text-emerald-900' : status === 'error' ? 'bg-amber-100 text-amber-900' : 'bg-gray-100 text-gray-600';
++
++  return (
++    <div className="min-w-0 rounded-lg border border-gray-200 bg-white p-5">
++      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
++        <h3 className="font-bold text-gray-900">{title}</h3>
++        <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${color}`}>{badge}</span>
++      </div>
++      <p className="mb-4 text-sm text-gray-600">{description}</p>
++      <form onSubmit={connect}>
++        <label htmlFor={`diagnostics-${space}`} className="mb-1 block text-xs font-semibold text-gray-700">Endpoint URL</label>
++        <input id={`diagnostics-${space}`} type="url" required value={endpoint}
++          onChange={event => {
++            setEndpoint(event.target.value);
++            setStatus('idle');
++            setMessage('No connection attempted for this endpoint.');
++            setOutput('');
++          }}
++          disabled={status === 'checking'} spellCheck={false} autoComplete="off"
++          aria-describedby={`diagnostics-${space}-help diagnostics-${space}-status`}
++          className="w-full rounded border border-gray-300 px-3 py-2 font-mono text-sm focus:border-gray-900 focus:outline-none focus:ring-2 focus:ring-amber-300 disabled:bg-gray-50" />
++        <p id={`diagnostics-${space}-help`} className="mt-2 text-xs leading-relaxed text-gray-500">
++          {space === 'local' ? 'Keep the test device on the same Wi-Fi LAN.' : 'Start your companion CLI’s HTTP service on this machine.'}
++        </p>
++        <div className="mt-4 flex flex-wrap items-center gap-3">
++          <button type="submit" disabled={status === 'checking' || !secure || permission === 'denied'}
++            className="rounded bg-gray-900 px-4 py-2 text-sm font-semibold text-white hover:bg-gray-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-500 disabled:cursor-not-allowed disabled:opacity-50">
++            {status === 'checking' ? 'Connecting…' : status === 'success' ? 'Check again' : 'Connect'}
++          </button>
++          {status === 'checking' && <button type="button" onClick={cancel} className="rounded px-2 py-2 text-sm underline focus-visible:outline-2">Cancel</button>}
++          <span className="text-xs text-gray-500">Permission: {permission === 'unknown' ? 'checked by browser on connect' : permission === 'prompt' ? 'ask on connect' : permission}</span>
++        </div>
++      </form>
++      {!secure && <p className="mt-3 text-sm text-amber-900">Open this site over HTTPS to enable connections.</p>}
++      {permission === 'denied' && <p className="mt-3 text-sm text-amber-900">In browser site settings, allow {space === 'local' ? 'Local network' : 'Loopback network'} access, then retry. Reload if your browser does not update the permission here.</p>}
++      <p id={`diagnostics-${space}-status`} role="status" aria-live="polite" className="mt-3 text-xs leading-relaxed text-gray-600">{message}</p>
++      {output && <details className="mt-3 text-xs text-gray-700" open>
++        <summary className="cursor-pointer font-semibold">Endpoint response</summary>
++        <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-gray-50 p-3">{output}</pre>
++      </details>}
++    </div>
++  );
++}
++
++export default function DiagnosticsConnections() {
++  return (
++    <section aria-labelledby="diagnostics-heading" className="mx-4 my-6 rounded-xl border border-gray-200 bg-gray-50 p-4 sm:mx-6 sm:p-6">
++      <div className="mb-5 border-b border-gray-200 pb-4">
++        <p className="mb-1 text-xs font-semibold uppercase tracking-widest text-gray-500">Developer workbench</p>
++        <h2 id="diagnostics-heading" className="font-brand text-3xl text-gray-900">Diagnostics connections</h2>
++        <p className="mt-2 max-w-3xl text-sm leading-relaxed text-gray-600">Check your hardware test device or companion CLI directly from this browser. Connect asks for browser access when needed and sends a single read-only GET request to your endpoint.</p>
++      </div>
++      <div className="grid gap-4 md:grid-cols-2">
++        <ConnectionCard space="local" title="Hardware test device" description="Connect to a device on your private network." initialUrl="http://192.168.1.100:8080/api/status" />
++        <ConnectionCard space="loopback" title="Local companion CLI" description="Connect to the CLI running on your own machine." initialUrl="http://127.0.0.1:45678/health" />
++      </div>
++      <details className="mt-4 text-xs leading-relaxed text-gray-600">
++        <summary className="cursor-pointer font-semibold text-gray-700">Connection requirements & troubleshooting</summary>
++        <p className="mt-2">Use HTTPS for this site and a browser that supports local network access. Allow Local network or Loopback network access when prompted. If access is blocked, change this site’s browser permissions and retry. Browser support varies; a failed request may also mean mixed content or a certificate was blocked.</p>
++        <p className="mt-2">The device and CLI must expose an HTTP(S) endpoint and return a standard Access-Control-Allow-Origin header permitting this site’s origin. JSON and plain-text responses are supported. LAN and loopback permissions are separate; granting one may not grant the other. These checks do not keep a persistent connection open.</p>
++      </details>
++    </section>
++  );
++}
+diff --git a/src/pages/index.astro b/src/pages/index.astro
+index 92f6399..037803d 100644
+--- a/src/pages/index.astro
++++ b/src/pages/index.astro
+@@ -1,5 +1,6 @@
+ ---
+ import Layout from '../layouts/Layout.astro';
++import DiagnosticsConnections from '../components/DiagnosticsConnections';
+ import ArticleTeaser from '../components/ArticleTeaser.astro';
+ import TopStoryTeaserGrid from '../components/TopStoryTeaserGrid.astro';
+ import Ad from '../components/AdSlotBanner';
+@@ -54,6 +55,8 @@ politicsArticles[2] = {
+         </div>
+     </div>
+ 
++    <DiagnosticsConnections client:load />
++
+     <!-- Main Content Area -->
+     <main class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-6 mt-6">
+         <ArticleTeaser article={topArticle} large={true} />
+@@ -81,4 +84,4 @@ politicsArticles[2] = {
+         <TopStoryTeaserGrid title="Politics" articles={politicsArticles} />
+         
+     </div>
+-</Layout>
+\ No newline at end of file
++</Layout>

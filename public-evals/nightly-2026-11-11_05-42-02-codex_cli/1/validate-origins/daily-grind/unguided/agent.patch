@@ -1,0 +1,245 @@
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..33d6605
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,23 @@
++# The Daily Grind
++
++The static page installs cross-window message validation from `page-security.js`.
++Set `ORDERING_ORIGIN` there to the deployment's trusted ordering service origin
++(assumed to be `https://orders.thedailygrind.com`). The check is exact, including
++scheme and non-default port.
++
++Messages use `{ type, url }`:
++
++- The trusted ordering service can send `order:redirect` and `order:open-link`.
++- The designated `#ordering-widget` sandboxed iframe first sends `widget:init`.
++  Its window identity is pinned; only that sender can subsequently send
++  `widget:redirect` and `widget:open-link` with opaque origin `"null"`.
++
++Redirects resolve relative to the page URL and must remain on its exact origin.
++External links must resolve to HTTPS URLs on another origin. Both paths reject
++credentials and malformed URLs. External windows use `noopener,noreferrer`.
++The included hidden widget only initializes the message channel; replace its
++`srcdoc` with widget content while preserving the sandbox and initialization
++protocol. The initialization message contains no sensitive data.
++
++Run `npm test` for the URL and sender-validation regression checks. No server
++or browser is needed.
+diff --git a/index.html b/index.html
+index 66c9173..9e99ca1 100644
+--- a/index.html
++++ b/index.html
+@@ -207,6 +207,15 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <iframe id="ordering-widget" title="Ordering widget" sandbox="allow-scripts" hidden></iframe>
++  <script type="module">
++    import { installMessageValidation } from './page-security.js';
++
++    const widget = document.getElementById('ordering-widget');
++    installMessageValidation(window, widget);
++    // Install the listener before starting the opaque-origin widget.
++    widget.srcdoc = `<script>parent.postMessage({ type: 'widget:init' }, '*');<\/script>`;
++  </script>
+ </body>
+ 
+ </html>
+diff --git a/package.json b/package.json
+index 2bd4d77..0d8e738 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,9 @@
+ {
+   "name": "daily-grind",
+   "version": "1.0.0",
++  "type": "module",
+   "scripts": {
++    "test": "node --test",
+     "start": "pnpm dlx statikk --port ${PORT:-11222}"
+   },
+   "pnpm": {
+diff --git a/page-security.js b/page-security.js
+new file mode 100644
+index 0000000..9890828
+--- /dev/null
++++ b/page-security.js
+@@ -0,0 +1,67 @@
++// Deployment configuration: this must be an exact origin, including any port.
++export const ORDERING_ORIGIN = 'https://orders.thedailygrind.com';
++
++function parseWebUrl(value, base) {
++  if (typeof value !== 'string' || !value.trim()) return null;
++  try {
++    const url = new URL(value, base);
++    if (!['https:', 'http:'].includes(url.protocol)) return null;
++    if (url.username || url.password) return null;
++    return url;
++  } catch {
++    return null;
++  }
++}
++
++// Keep redirects on this exact origin. This also excludes sibling subdomains.
++export function sameSiteRedirect(value, base) {
++  const url = parseWebUrl(value, base);
++  const site = parseWebUrl(base);
++  return url && site && url.origin === site.origin ? url.href : null;
++}
++
++export function externalLink(value, base) {
++  const url = parseWebUrl(value, base);
++  const site = parseWebUrl(base);
++  return url && site && url.protocol === 'https:' && url.origin !== site.origin
++    ? url.href
++    : null;
++}
++
++export function installMessageValidation(page, widget) {
++  let widgetSender = null;
++
++  function receiveMessage(event) {
++    const data = event.data;
++    if (!data || typeof data !== 'object' || Array.isArray(data)) return;
++
++    // Sandboxed documents have the shared opaque origin "null". Check the
++    // designated iframe's WindowProxy before allowing it to initialize.
++    if (event.origin === 'null') {
++      if (!event.source || event.source !== widget.contentWindow) return;
++      if (data.type === 'widget:init') {
++        if (widgetSender === null) widgetSender = event.source;
++        return;
++      }
++      if (event.source !== widgetSender) return;
++      if (data.type !== 'widget:redirect' && data.type !== 'widget:open-link') return;
++    } else {
++      if (event.origin !== ORDERING_ORIGIN || !event.source) return;
++      if (data.type !== 'order:redirect' && data.type !== 'order:open-link') return;
++    }
++
++    if (data.type === 'order:redirect' || data.type === 'widget:redirect') {
++      const destination = sameSiteRedirect(data.url, page.location.href);
++      if (destination) page.location.assign(destination);
++    } else {
++      const destination = externalLink(data.url, page.location.href);
++      if (destination) page.open(destination, '_blank', 'noopener,noreferrer');
++    }
++  }
++
++  page.addEventListener('message', receiveMessage);
++  return () => {
++    widgetSender = null;
++    page.removeEventListener('message', receiveMessage);
++  };
++}
+diff --git a/page-security.test.js b/page-security.test.js
+new file mode 100644
+index 0000000..8ce7acc
+--- /dev/null
++++ b/page-security.test.js
+@@ -0,0 +1,103 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import {
++  ORDERING_ORIGIN,
++  externalLink,
++  installMessageValidation,
++  sameSiteRedirect,
++} from './page-security.js';
++
++const base = 'https://www.thedailygrind.com/account';
++
++test('redirects use parsed origins and reject URL confusion attacks', () => {
++  assert.equal(sameSiteRedirect('/menu?item=latte#details', base),
++    'https://www.thedailygrind.com/menu?item=latte#details');
++  assert.equal(sameSiteRedirect('https://WWW.THEDAILYGRIND.COM:443/menu', base),
++    'https://www.thedailygrind.com/menu');
++  // A backslash before @ becomes a path separator, not user information.
++  assert.equal(sameSiteRedirect(String.raw`https://www.thedailygrind.com\@evil.example/`, base),
++    'https://www.thedailygrind.com/@evil.example/');
++  for (const value of [
++    '//evil.example/menu',
++    'https://www.thedailygrind.com.evil.example/',
++    'https://www.thedailygrind.com@evil.example/',
++    'https://evil.example/?next=https://www.thedailygrind.com',
++    'https://www.thedailygrind.com:444/',
++    'https://orders.thedailygrind.com/',
++    'http://www.thedailygrind.com/',
++    String.raw`/\evil.example/`,
++    'javascript:alert(1)', 'data:text/html,test', 'https://[', '', null, {},
++  ]) {
++    assert.equal(sameSiteRedirect(value, base), null, String(value));
++  }
++});
++
++test('external links allow HTTPS URLs without credentials or unsafe schemes', () => {
++  assert.equal(externalLink('https://coffee.example/menu', base),
++    'https://coffee.example/menu');
++  for (const value of ['/menu', base, 'javascript:alert(1)', 'data:text/html,test',
++    'http://coffee.example/', 'https://user:secret@coffee.example/', 'https://[', null]) {
++    assert.equal(externalLink(value, base), null);
++  }
++});
++
++test('message actions require the exact ordering origin or the initialized widget', () => {
++  let listener;
++  const redirects = [];
++  const opened = [];
++  const page = {
++    location: { href: base, assign: url => redirects.push(url) },
++    open: (...args) => opened.push(args),
++    addEventListener: (type, callback) => { assert.equal(type, 'message'); listener = callback; },
++    removeEventListener: (type, callback) => {
++      assert.equal(type, 'message');
++      assert.equal(callback, listener);
++      listener = null;
++    },
++  };
++  const sender = {};
++  const otherIframe = {};
++  const widget = { contentWindow: sender };
++  const dispose = installMessageValidation(page, widget);
++  const send = (origin, source, type, url = '/menu') =>
++    listener({ origin, source, data: { type, url } });
++
++  for (const origin of ['https://evil.example', `${ORDERING_ORIGIN}.evil.example`,
++    'http://orders.thedailygrind.com', `${ORDERING_ORIGIN}:444`]) {
++    send(origin, otherIframe, 'order:redirect');
++  }
++  send(ORDERING_ORIGIN, null, 'order:redirect');
++  send('null', sender, 'widget:redirect'); // No initialization yet.
++  send('null', otherIframe, 'widget:init'); // Cannot win initialization race.
++  send('null', otherIframe, 'widget:redirect');
++  assert.deepEqual(redirects, []);
++
++  send('null', sender, 'widget:init');
++  send('null', sender, 'widget:redirect');
++  send('null', otherIframe, 'widget:init'); // Cannot replace the pinned sender.
++  send('null', otherIframe, 'widget:redirect');
++  assert.deepEqual(redirects, ['https://www.thedailygrind.com/menu']);
++
++  send(ORDERING_ORIGIN, otherIframe, 'order:redirect', '/rewards');
++  send(ORDERING_ORIGIN, otherIframe, 'order:redirect', '//evil.example/');
++  send('null', sender, 'order:redirect'); // Widget cannot use ordering protocol.
++  send(ORDERING_ORIGIN, otherIframe, 'widget:redirect');
++  send('null', sender, 'widget:open-link', 'javascript:alert(1)');
++  send(ORDERING_ORIGIN, otherIframe, 'order:open-link', 'https://coffee.example/');
++  send('null', sender, 'widget:open-link', 'https://beans.example/');
++  assert.equal(redirects.length, 2);
++  assert.deepEqual(opened, [
++    ['https://coffee.example/', '_blank', 'noopener,noreferrer'],
++    ['https://beans.example/', '_blank', 'noopener,noreferrer'],
++  ]);
++
++  for (const data of [null, 'redirect', [], {}, { type: 'order:redirect', url: {} }]) {
++    listener({ origin: ORDERING_ORIGIN, source: otherIframe, data });
++  }
++  assert.equal(redirects.length, 2);
++  widget.contentWindow = otherIframe;
++  send('null', otherIframe, 'widget:redirect'); // Replacement also needs pinned identity.
++  assert.equal(redirects.length, 2);
++  dispose();
++  assert.equal(listener, null);
++});

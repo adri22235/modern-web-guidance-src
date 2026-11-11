@@ -1,0 +1,255 @@
+diff --git a/index.html b/index.html
+index 66c9173..17e5577 100644
+--- a/index.html
++++ b/index.html
+@@ -5,6 +5,9 @@
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <title>The Daily Grind | Artisanal Coffee</title>
++  <!-- Set content to a collection URL to beacon perf metrics, e.g. "/api/perf-metrics". -->
++  <meta name="dg-perf-endpoint" content="">
++  <script src="/perf-monitor.js" defer></script>
+   <style>
+     :root {
+       --primary: #4e342e;
+@@ -158,37 +161,37 @@
+ <body>
+ 
+   <nav>
+-    <div class="logo">THE DAILY GRIND</div>
++    <div class="logo" data-perf-target="nav:logo">THE DAILY GRIND</div>
+     <ul>
+-      <li><a href="/menu">Menu</a></li>
+-      <li><a href="/locations">Locations</a></li>
+-      <li><a href="/rewards">Rewards</a></li>
+-      <li><a href="/account">My Account</a></li>
+-      <li><a href="/logout" class="logout-link">Logout</a></li>
++      <li><a href="/menu" data-perf-target="nav:menu">Menu</a></li>
++      <li><a href="/locations" data-perf-target="nav:locations">Locations</a></li>
++      <li><a href="/rewards" data-perf-target="nav:rewards">Rewards</a></li>
++      <li><a href="/account" data-perf-target="nav:account">My Account</a></li>
++      <li><a href="/logout" class="logout-link" data-perf-target="nav:logout">Logout</a></li>
+     </ul>
+   </nav>
+ 
+   <header class="hero">
+     <h1>Wake Up Your Senses</h1>
+     <p>Ethically sourced, locally roasted, delivered to your cup.</p>
+-    <a href="/order-online" class="btn">Order Now</a>
++    <a href="/order-online" class="btn" data-perf-target="order-now">Order Now</a>
+   </header>
+ 
+   <main class="container">
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+       <div class="grid">
+-        <div class="card">
++        <div class="card" data-perf-target="seasonal:maple-oat-latte">
+           <h3>Maple Oat Latte</h3>
+           <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+           <a href="/menu/seasonal" class="btn">View Details</a>
+         </div>
+-        <div class="card">
++        <div class="card" data-perf-target="seasonal:dark-roast-espresso">
+           <h3>Dark Roast Espresso</h3>
+           <p>Bold, smokey, and perfect for a morning boost.</p>
+           <a href="/menu/espresso" class="btn">View Details</a>
+         </div>
+-        <div class="card">
++        <div class="card" data-perf-target="seasonal:cold-brew">
+           <h3>Cold Brew</h3>
+           <p>Steeped for 18 hours for maximum smoothness.</p>
+           <a href="/menu/cold-brew" class="btn">View Details</a>
+diff --git a/perf-monitor.js b/perf-monitor.js
+new file mode 100644
+index 0000000..2729f24
+--- /dev/null
++++ b/perf-monitor.js
+@@ -0,0 +1,187 @@
++/*
++ * Daily Grind client-side performance monitor.
++ *
++ * Measures how long it takes from a user interaction (or a client-side view
++ * switch) until the resulting visual update has been painted:
++ *
++ *   - clicks on elements tagged with [data-perf-target] (nav bar, "Order Now",
++ *     "Seasonal Favorites" cards)
++ *   - client-side view switches (history.pushState, popstate, hashchange)
++ *
++ * "Painted" is approximated as: the next animation frame after the work, plus
++ * one macrotask so the frame has actually been committed to the screen. When
++ * the browser supports the Event Timing API, its click `duration` (input ->
++ * next paint, measured by the browser) is attached as well.
++ *
++ * Results are:
++ *   - recorded as `performance.measure()` entries (visible in DevTools),
++ *   - pushed onto `window.__dgPerfMetrics`,
++ *   - dispatched as a `dg:perf` CustomEvent on `window`,
++ *   - optionally beaconed to the URL in <meta name="dg-perf-endpoint">,
++ *     batched and flushed when the page is hidden/unloaded.
++ */
++(function () {
++  'use strict';
++
++  if (typeof window === 'undefined' || !window.performance || !performance.now) return;
++
++  var metrics = (window.__dgPerfMetrics = window.__dgPerfMetrics || []);
++  var pending = [];
++  var endpointMeta = document.querySelector('meta[name="dg-perf-endpoint"]');
++  var endpoint = endpointMeta && endpointMeta.content;
++  var debug = /[?&]perfdebug\b/.test(location.search);
++
++  // Resolves with the timestamp right after the next frame has been painted,
++  // or null if the page is hidden (rAF never fires for background tabs).
++  function afterNextPaint(callback) {
++    if (document.visibilityState === 'hidden') {
++      callback(null);
++      return;
++    }
++    requestAnimationFrame(function () {
++      var channel = new MessageChannel();
++      channel.port1.onmessage = function () {
++        callback(performance.now());
++      };
++      channel.port2.postMessage(null);
++    });
++  }
++
++  function record(metric) {
++    metric.duration = Math.round((metric.end - metric.start) * 10) / 10;
++    metric.page = location.pathname + location.hash;
++
++    try {
++      performance.measure('dg:' + metric.type + ':' + metric.target, {
++        start: metric.start,
++        end: metric.end,
++        detail: metric
++      });
++    } catch (e) {
++      // Older browsers without User Timing L3; the other sinks still work.
++    }
++
++    metrics.push(metric);
++    pending.push(metric);
++    window.dispatchEvent(new CustomEvent('dg:perf', { detail: metric }));
++    if (debug) console.debug('[perf]', metric.type, metric.target, metric.duration + 'ms', metric);
++  }
++
++  function flush() {
++    if (!endpoint || !pending.length) return;
++    var body = JSON.stringify({ metrics: pending.splice(0) });
++    if (navigator.sendBeacon && navigator.sendBeacon(endpoint, body)) return;
++    fetch(endpoint, { method: 'POST', body: body, keepalive: true }).catch(function () {});
++  }
++
++  document.addEventListener('visibilitychange', function () {
++    if (document.visibilityState === 'hidden') flush();
++  });
++  window.addEventListener('pagehide', flush);
++
++  // ---------------------------------------------------------------------------
++  // Click -> paint
++  // ---------------------------------------------------------------------------
++
++  // Event Timing entries keyed by event start time (== event.timeStamp).
++  var eventTimings = {};
++  var clicksAwaitingTiming = {};
++
++  if ('PerformanceObserver' in window &&
++      PerformanceObserver.supportedEntryTypes &&
++      PerformanceObserver.supportedEntryTypes.indexOf('event') !== -1) {
++    new PerformanceObserver(function (list) {
++      list.getEntries().forEach(function (entry) {
++        if (entry.name !== 'click') return;
++        var metric = clicksAwaitingTiming[entry.startTime];
++        if (metric) {
++          // Late arrival: enrich the metric that was already recorded.
++          metric.eventTimingDuration = entry.duration;
++          metric.processingTime = entry.processingEnd - entry.processingStart;
++          metric.inputDelay = entry.processingStart - entry.startTime;
++          delete clicksAwaitingTiming[entry.startTime];
++        } else {
++          eventTimings[entry.startTime] = entry;
++        }
++      });
++    }).observe({ type: 'event', durationThreshold: 16, buffered: true });
++  }
++
++  // Capture phase so we see the click before any handler can stop propagation.
++  document.addEventListener('click', function (event) {
++    var el = event.target instanceof Element && event.target.closest('[data-perf-target]');
++    if (!el) return;
++
++    var start = event.timeStamp;
++    var target = el.getAttribute('data-perf-target');
++    var link = event.target.closest('a[href]');
++
++    afterNextPaint(function (end) {
++      if (end === null) return;
++      var metric = {
++        type: 'click',
++        target: target,
++        href: link ? link.getAttribute('href') : undefined,
++        start: start,
++        end: end
++      };
++      var entry = eventTimings[start];
++      if (entry) {
++        metric.eventTimingDuration = entry.duration;
++        metric.processingTime = entry.processingEnd - entry.processingStart;
++        metric.inputDelay = entry.processingStart - entry.startTime;
++        delete eventTimings[start];
++      } else {
++        clicksAwaitingTiming[start] = metric;
++        setTimeout(function () { delete clicksAwaitingTiming[start]; }, 5000);
++      }
++      record(metric);
++    });
++  }, true);
++
++  // ---------------------------------------------------------------------------
++  // Client-side view switch -> paint
++  // ---------------------------------------------------------------------------
++
++  var lastPopstate = -Infinity;
++  var currentView = location.pathname + location.hash;
++
++  function measureViewSwitch(trigger, start) {
++    // location has already changed by the time we get here, so use the view
++    // remembered from the previous switch.
++    var from = currentView;
++    var to = (currentView = location.pathname + location.hash);
++    // Let the router render (it runs synchronously after pushState or in the
++    // popstate/hashchange handlers), then wait for that frame to paint.
++    afterNextPaint(function (end) {
++      if (end === null) return;
++      record({
++        type: 'view-switch',
++        target: to,
++        trigger: trigger,
++        from: from,
++        start: start,
++        end: end
++      });
++    });
++  }
++
++  var originalPushState = history.pushState;
++  history.pushState = function () {
++    var start = performance.now();
++    var result = originalPushState.apply(this, arguments);
++    measureViewSwitch('pushState', start);
++    return result;
++  };
++
++  window.addEventListener('popstate', function (event) {
++    lastPopstate = event.timeStamp;
++    measureViewSwitch('popstate', event.timeStamp);
++  });
++
++  window.addEventListener('hashchange', function (event) {
++    // Hash traversals fire popstate and then hashchange; count them once.
++    if (event.timeStamp - lastPopstate < 50) return;
++    measureViewSwitch('hashchange', event.timeStamp);
++  });
++})();

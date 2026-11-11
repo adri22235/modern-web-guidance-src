@@ -1,0 +1,105 @@
+diff --git a/index.html b/index.html
+index 66c9173..f9cc858 100644
+--- a/index.html
++++ b/index.html
+@@ -207,6 +207,100 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script>
++    // Client-side interaction performance monitoring.
++    // Measures input -> next paint latency for nav clicks, "Order Now", seasonal
++    // cards, and client-side view switches. Results are recorded as
++    // performance.measure() entries ("dg:<name>"), logged via console.debug, and
++    // emitted as a "dg:perf" CustomEvent on window. If <body data-perf-endpoint>
++    // is set, they're also beaconed there.
++    (function () {
++      var endpoint = document.body.getAttribute('data-perf-endpoint');
++      var results = [];
++
++      function report(name, start, end, detail) {
++        var entry = { name: name, start: start, duration: end - start, detail: detail || {} };
++        results.push(entry);
++        try {
++          performance.measure('dg:' + name, { start: start, end: end, detail: entry.detail });
++        } catch (e) { /* older browsers: no measure options */ }
++        console.debug('[perf] ' + name + ': ' + entry.duration.toFixed(1) + 'ms', entry.detail);
++        window.dispatchEvent(new CustomEvent('dg:perf', { detail: entry }));
++        if (endpoint && navigator.sendBeacon) {
++          navigator.sendBeacon(endpoint, JSON.stringify(entry));
++        }
++      }
++
++      // Calls cb after the browser has painted the frame following the current task.
++      function afterNextPaint(cb) {
++        requestAnimationFrame(function () {
++          var ch = new MessageChannel();
++          ch.port1.onmessage = function () { cb(performance.now()); };
++          ch.port2.postMessage(null);
++        });
++      }
++
++      function measure(name, start, detail) {
++        afterNextPaint(function (end) { report(name, start, end, detail); });
++      }
++
++      function classify(target) {
++        if (!target || !target.closest) return null;
++        var link = target.closest('a');
++        if (!link) return null;
++        if (link.closest('nav')) return 'nav-click';
++        if (link.closest('.hero') && link.classList.contains('btn')) return 'order-now-click';
++        if (target.closest('.card')) return 'seasonal-card-click';
++        return null;
++      }
++
++      // Capture phase so we run before any handler that does work for the click.
++      document.addEventListener('click', function (e) {
++        var name = classify(e.target);
++        if (!name) return;
++        var link = e.target.closest('a');
++        var label = (link.textContent || '').trim();
++        if (name === 'seasonal-card-click') {
++          var h = e.target.closest('.card').querySelector('h3');
++          if (h) label = h.textContent.trim();
++        }
++        // event.timeStamp is the input time, so queueing delay is included.
++        measure(name, e.timeStamp, { label: label, href: link.getAttribute('href') });
++      }, true);
++
++      // Client-side view switches (History API / hash changes).
++      var viewStart = null;
++      function beginView(kind, url) {
++        viewStart = { t: performance.now(), kind: kind, url: String(url || location.href) };
++        // Measure once the synchronous view update (and its paint) completes.
++        var s = viewStart;
++        measure('view-switch', s.t, { kind: s.kind, url: s.url });
++      }
++      ['pushState', 'replaceState'].forEach(function (fn) {
++        var orig = history[fn];
++        history[fn] = function (state, title, url) {
++          var start = performance.now();
++          var ret = orig.apply(this, arguments);
++          measure('view-switch', start, { kind: fn, url: String(url || location.href) });
++          return ret;
++        };
++      });
++      window.addEventListener('popstate', function () { beginView('popstate'); });
++      window.addEventListener('hashchange', function (e) { beginView('hashchange', e.newURL); });
++
++      // Manual hook for view switches driven by app code.
++      function trackViewSwitch(name, update) {
++        var start = performance.now();
++        var out = update();
++        var done = function () { measure('view-switch', start, { kind: 'manual', view: name }); };
++        if (out && typeof out.then === 'function') out.then(done, done); else done();
++        return out;
++      }
++
++      window.dailyGrindPerf = { results: results, trackViewSwitch: trackViewSwitch };
++    })();
++  </script>
++
+ </body>
+ 
+ </html>

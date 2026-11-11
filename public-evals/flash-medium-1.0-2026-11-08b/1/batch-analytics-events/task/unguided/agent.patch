@@ -1,0 +1,337 @@
+diff --git a/analytics.js b/analytics.js
+new file mode 100644
+--- a/analytics.js
++++ b/analytics.js
+@@ -0,0 +1,332 @@
++/**
++ * Daily Grind Client-Side Analytics Tracker
++ *
++ * Records page views and user click interactions, debouncing and batching
++ * multiple telemetry events into a single deferred background request so
++ * rapid interactions coalesce without overloading the server.
++ */
++(function (root, factory) {
++  if (typeof define === 'function' && define.amd) {
++    define([], factory);
++  } else if (typeof module === 'object' && module.exports) {
++    module.exports = factory();
++  } else {
++    root.DailyGrindAnalytics = factory();
++  }
++})(typeof self !== 'undefined' ? self : this, function () {
++  'use strict';
++
++  var DEFAULT_CONFIG = {
++    endpoint: '/api/analytics',
++    debounceDelay: 1000, // Debounce delay in ms to coalesce rapid interactions
++    maxWait: 5000,        // Max wait before batch is flushed even if events keep arriving
++    maxBatchSize: 20,     // Max events in a single batch before forcing immediate flush
++    debug: false          // Log telemetry events to console when true
++  };
++
++  var config = Object.assign({}, DEFAULT_CONFIG);
++  var queue = [];
++  var debounceTimer = null;
++  var maxWaitTimer = null;
++  var isInitialized = false;
++
++  /**
++   * Generates or retrieves a persistent session ID for the current browsing session.
++   */
++  function getSessionId() {
++    var KEY = 'dg_analytics_session_id';
++    try {
++      if (typeof sessionStorage !== 'undefined') {
++        var sid = sessionStorage.getItem(KEY);
++        if (!sid) {
++          sid = 'sess_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 9);
++          sessionStorage.setItem(KEY, sid);
++        }
++        return sid;
++      }
++    } catch (e) {
++      // sessionStorage unavailable or restricted
++    }
++    return 'sess_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 9);
++  }
++
++  var sessionId = getSessionId();
++
++  /**
++   * Helper to construct a CSS-like selector string for an element.
++   */
++  function getElementSelector(el) {
++    if (!el || el.nodeType !== 1) return '';
++    var parts = [];
++    var current = el;
++    while (current && current.nodeType === 1 && current !== document.body && current !== document.documentElement) {
++      var selector = current.tagName.toLowerCase();
++      if (current.id) {
++        selector += '#' + current.id;
++        parts.unshift(selector);
++        break;
++      } else if (current.className && typeof current.className === 'string') {
++        var classes = current.className.trim().split(/\s+/).filter(Boolean);
++        if (classes.length > 0) {
++          selector += '.' + classes.slice(0, 2).join('.');
++        }
++      }
++      parts.unshift(selector);
++      current = current.parentElement;
++      if (parts.length >= 4) break;
++    }
++    return parts.join(' > ');
++  }
++
++  /**
++   * Sends the batched payload using navigator.sendBeacon or deferred fetch with keepalive.
++   */
++  function sendBatch(eventsToSend) {
++    if (!eventsToSend || eventsToSend.length === 0) return;
++
++    var payload = {
++      sessionId: sessionId,
++      sentAt: new Date().toISOString(),
++      batchSize: eventsToSend.length,
++      events: eventsToSend
++    };
++
++    var payloadJson = JSON.stringify(payload);
++    var sent = false;
++
++    if (config.debug) {
++      console.log('[DailyGrindAnalytics] Dispatching batched payload (' + eventsToSend.length + ' events):', payload);
++    }
++
++    // Attempt 1: navigator.sendBeacon (ideal for background telemetry & deferred delivery)
++    if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
++      try {
++        var blob = new Blob([payloadJson], { type: 'application/json' });
++        sent = navigator.sendBeacon(config.endpoint, blob);
++      } catch (err) {
++        sent = false;
++      }
++    }
++
++    // Attempt 2: fetch with keepalive: true (persists across page unloads)
++    if (!sent && typeof fetch === 'function') {
++      try {
++        fetch(config.endpoint, {
++          method: 'POST',
++          headers: { 'Content-Type': 'application/json' },
++          body: payloadJson,
++          keepalive: true
++        }).catch(function (err) {
++          if (config.debug) {
++            console.warn('[DailyGrindAnalytics] Batch transmission failed:', err);
++          }
++        });
++      } catch (err) {
++        if (config.debug) {
++          console.warn('[DailyGrindAnalytics] Fetch error:', err);
++        }
++      }
++    }
++  }
++
++  /**
++   * Flushes all queued events immediately into a single deferred background request.
++   */
++  function flush() {
++    if (debounceTimer) {
++      clearTimeout(debounceTimer);
++      debounceTimer = null;
++    }
++    if (maxWaitTimer) {
++      clearTimeout(maxWaitTimer);
++      maxWaitTimer = null;
++    }
++
++    if (queue.length === 0) return;
++
++    var batch = queue.splice(0, queue.length);
++    sendBatch(batch);
++  }
++
++  /**
++   * Queues an event with debounced/batched delivery.
++   */
++  function enqueue(eventData) {
++    queue.push(eventData);
++
++    if (config.debug) {
++      console.log('[DailyGrindAnalytics] Event queued (total pending: ' + queue.length + '):', eventData);
++    }
++
++    // If batch size threshold reached, flush immediately
++    if (queue.length >= config.maxBatchSize) {
++      flush();
++      return;
++    }
++
++    // Reset debounce timer on every new event
++    if (debounceTimer) {
++      clearTimeout(debounceTimer);
++    }
++    debounceTimer = setTimeout(flush, config.debounceDelay);
++
++    // Ensure events are not held indefinitely if events arrive continuously
++    if (!maxWaitTimer) {
++      maxWaitTimer = setTimeout(flush, config.maxWait);
++    }
++  }
++
++  /**
++   * Records a page view event.
++   */
++  function trackPageView(customProps) {
++    var eventData = {
++      type: 'pageview',
++      timestamp: new Date().toISOString(),
++      url: (typeof window !== 'undefined' && window.location) ? window.location.href : '',
++      path: (typeof window !== 'undefined' && window.location) ? window.location.pathname : '',
++      title: typeof document !== 'undefined' ? document.title : '',
++      referrer: typeof document !== 'undefined' ? (document.referrer || null) : null,
++      viewport: typeof window !== 'undefined' ? {
++        width: window.innerWidth || (document.documentElement ? document.documentElement.clientWidth : 0),
++        height: window.innerHeight || (document.documentElement ? document.documentElement.clientHeight : 0)
++      } : null,
++      screen: typeof window !== 'undefined' && window.screen ? {
++        width: window.screen.width,
++        height: window.screen.height
++      } : null
++    };
++
++    if (customProps && typeof customProps === 'object') {
++      Object.assign(eventData, customProps);
++    }
++
++    enqueue(eventData);
++  }
++
++  /**
++   * Records a user click interaction.
++   */
++  function trackClick(e, customProps) {
++    var target = (e && e.target) ? e.target : null;
++    var interactive = target && target.closest ? target.closest('a, button, [role="button"], input, select, textarea, .card') : null;
++    var primaryEl = interactive || target;
++
++    var text = '';
++    var href = null;
++
++    if (primaryEl) {
++      text = (primaryEl.innerText || primaryEl.textContent || primaryEl.value || '').trim().replace(/\s+/g, ' ').slice(0, 100);
++      href = primaryEl.getAttribute ? primaryEl.getAttribute('href') : null;
++    }
++
++    var eventData = {
++      type: 'click',
++      timestamp: new Date().toISOString(),
++      target: target ? {
++        tagName: target.tagName,
++        id: target.id || null,
++        className: target.className && typeof target.className === 'string' ? target.className : null,
++        text: text || null,
++        href: href || null,
++        selector: getElementSelector(target)
++      } : null,
++      interactiveElement: interactive ? {
++        tagName: interactive.tagName,
++        id: interactive.id || null,
++        className: interactive.className && typeof interactive.className === 'string' ? interactive.className : null,
++        selector: getElementSelector(interactive)
++      } : null,
++      position: e ? {
++        clientX: e.clientX,
++        clientY: e.clientY,
++        pageX: e.pageX,
++        pageY: e.pageY
++      } : null
++    };
++
++    if (customProps && typeof customProps === 'object') {
++      Object.assign(eventData, customProps);
++    }
++
++    enqueue(eventData);
++  }
++
++  /**
++   * Generic track method for custom events.
++   */
++  function track(type, properties) {
++    var eventData = Object.assign({
++      type: type,
++      timestamp: new Date().toISOString()
++    }, properties || {});
++
++    enqueue(eventData);
++  }
++
++  /**
++   * Handles click events across the document using event delegation.
++   */
++  function handleClickEvent(e) {
++    trackClick(e);
++  }
++
++  /**
++   * Initializes analytics tracking and hooks page lifecycle listeners.
++   */
++  function init(options) {
++    if (options && typeof options === 'object') {
++      Object.assign(config, options);
++    }
++
++    if (isInitialized) return;
++    isInitialized = true;
++
++    // Record initial page view
++    trackPageView();
++
++    if (typeof document !== 'undefined') {
++      // Event delegation for click interactions
++      document.addEventListener('click', handleClickEvent, true);
++
++      // Flush batched events when page visibility changes to hidden (e.g. background tab or switching apps)
++      document.addEventListener('visibilitychange', function () {
++        if (document.visibilityState === 'hidden') {
++          flush();
++        }
++      });
++    }
++
++    if (typeof window !== 'undefined') {
++      // Flush before navigation or tab close
++      window.addEventListener('pagehide', flush);
++      window.addEventListener('beforeunload', flush);
++    }
++
++    if (config.debug) {
++      console.log('[DailyGrindAnalytics] Initialized with config:', config);
++    }
++  }
++
++  // Auto-initialize when running in a browser environment
++  if (typeof window !== 'undefined' && typeof document !== 'undefined') {
++    if (document.readyState === 'loading') {
++      document.addEventListener('DOMContentLoaded', function () {
++        init();
++      });
++    } else {
++      init();
++    }
++  }
++
++  return {
++    init: init,
++    track: track,
++    trackPageView: trackPageView,
++    trackClick: trackClick,
++    flush: flush,
++    getQueue: function () { return queue.slice(); },
++    getConfig: function () { return Object.assign({}, config); },
++    getSessionId: function () { return sessionId; }
++  };
++});

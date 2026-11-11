@@ -1,0 +1,222 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -151,8 +151,74 @@
+       color: var(--text);
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    /* Order Event Timeline */
++    .timeline-section {
++      margin-top: 60px;
++      text-align: center;
++    }
++
++    .timeline-section button.btn {
++      border: none;
++      font: inherit;
++      cursor: pointer;
++    }
++
++    .timeline-section button.btn:disabled {
++      opacity: 0.6;
++      cursor: progress;
++    }
++
++    .timeline-status {
++      margin-top: 15px;
++      min-height: 1.6em;
++    }
++
++    .timeline-wrap {
++      overflow-x: auto;
++      margin-top: 20px;
++    }
++
++    .timeline-table {
++      width: 100%;
++      border-collapse: collapse;
++      background: white;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++      border-radius: 8px;
++      overflow: hidden;
++      text-align: left;
++      font-size: 0.9rem;
++    }
++
++    .timeline-table caption {
++      caption-side: top;
++      padding: 10px;
++      font-weight: bold;
++      color: var(--primary);
++    }
++
++    .timeline-table th,
++    .timeline-table td {
++      padding: 8px 12px;
++      border-bottom: 1px solid var(--secondary);
++      white-space: nowrap;
++    }
++
++    .timeline-table th {
++      background: var(--primary);
++      color: white;
++    }
++
++    .timeline-table code {
++      font-family: ui-monospace, Consolas, monospace;
++    }
++
++    .timeline-table .tie {
++      color: #bf360c;
++      font-weight: bold;
++    }
+   </style>
+ </head>
+ 
+ <body>
+@@ -194,8 +260,16 @@
+           <a href="/menu/cold-brew" class="btn">View Details</a>
+         </div>
+       </div>
+     </section>
++
++    <section class="timeline-section" aria-labelledby="timeline-heading">
++      <h2 id="timeline-heading">Order Event Timeline</h2>
++      <p>Load the latest batch of order events from our backend services, sorted to the nanosecond.</p>
++      <button type="button" class="btn" id="load-events-btn">Load Order Events</button>
++      <p class="timeline-status" id="timeline-status" role="status" aria-live="polite"></p>
++      <div class="timeline-wrap" id="timeline-output"></div>
++    </section>
+   </main>
+ 
+   <footer>
+     <div class="footer-links">
+@@ -206,7 +280,126 @@
+     </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++
++  <script type="module">
++    // Batch of coffee order events as received from distributed backend
++    // services: out of order, with nanosecond-precision UTC timestamps.
++    const ORDER_EVENT_BATCH = [
++      { service: 'barista-queue', orderId: 'DG-1042', event: 'drink.started', ts: '2026-11-11T08:15:02.418000250Z' },
++      { service: 'pos-gateway', orderId: 'DG-1042', event: 'order.placed', ts: '2026-11-11T08:15:00.103456789Z' },
++      { service: 'payments', orderId: 'DG-1042', event: 'payment.authorized', ts: '2026-11-11T08:15:00.103457012Z' },
++      { service: 'inventory', orderId: 'DG-1042', event: 'oat-milk.reserved', ts: '2026-11-11T08:15:00.103457001Z' },
++      { service: 'notifications', orderId: 'DG-1042', event: 'customer.notified', ts: '2026-11-11T08:16:47.900000000Z' },
++      { service: 'barista-queue', orderId: 'DG-1042', event: 'order.queued', ts: '2026-11-11T08:15:00.104001999Z' },
++      { service: 'pos-gateway', orderId: 'DG-1043', event: 'order.placed', ts: '2026-11-11T08:15:00.104002000Z' },
++      { service: 'payments', orderId: 'DG-1043', event: 'payment.authorized', ts: '2026-11-11T08:15:00.611230400Z' },
++      { service: 'barista-queue', orderId: 'DG-1042', event: 'drink.completed', ts: '2026-11-11T08:16:47.899999999Z' },
++      { service: 'inventory', orderId: 'DG-1043', event: 'espresso.reserved', ts: '2026-11-11T08:15:00.611230400Z' },
++      { service: 'barista-queue', orderId: 'DG-1043', event: 'order.queued', ts: '2026-11-11T08:15:00.611987123Z' },
++    ];
++
++    // Simulates fetching the batch from the event collector.
++    async function fetchOrderEventBatch() {
++      await new Promise((resolve) => setTimeout(resolve, 300));
++      return ORDER_EVENT_BATCH.map((e) => ({ ...e }));
++    }
++
++    // Temporal.Instant keeps full nanosecond precision (Date truncates to ms).
++    // Load a polyfill only where Temporal isn't built in.
++    async function ensureTemporal() {
++      if (typeof globalThis.Temporal === 'undefined') {
++        const mod = await import('https://esm.sh/temporal-polyfill@1');
++        globalThis.Temporal = mod.Temporal;
++      }
++      return globalThis.Temporal;
++    }
++
++    function formatDuration(duration) {
++      try {
++        return duration.toLocaleString(undefined, { style: 'narrow' });
++      } catch {
++        return duration.toString();
++      }
++    }
++
++    const button = document.getElementById('load-events-btn');
++    const status = document.getElementById('timeline-status');
++    const output = document.getElementById('timeline-output');
++
++    function cell(row, content, { code = false, className } = {}) {
++      const td = document.createElement('td');
++      if (code) {
++        const c = document.createElement('code');
++        c.textContent = content;
++        td.append(c);
++      } else {
++        td.textContent = content;
++      }
++      if (className) td.className = className;
++      row.append(td);
++    }
++
++    function render(sorted, total) {
++      const table = document.createElement('table');
++      table.className = 'timeline-table';
++      table.createCaption().textContent =
++        `${sorted.length} events, total span ${formatDuration(total)}`;
++
++      const headRow = table.createTHead().insertRow();
++      for (const label of ['#', 'Timestamp (UTC)', 'Service', 'Order', 'Event', 'Since previous']) {
++        const th = document.createElement('th');
++        th.scope = 'col';
++        th.textContent = label;
++        headRow.append(th);
++      }
++
++      const body = table.createTBody();
++      sorted.forEach((evt, i) => {
++        const row = body.insertRow();
++        cell(row, String(i + 1));
++        cell(row, evt.instant.toString({ fractionalSecondDigits: 9 }), { code: true });
++        cell(row, evt.service);
++        cell(row, evt.orderId);
++        cell(row, evt.event);
++        if (i === 0) {
++          cell(row, '—');
++        } else if (evt.instant.equals(sorted[i - 1].instant)) {
++          cell(row, 'same instant', { className: 'tie' });
++        } else {
++          cell(row, formatDuration(evt.gap));
++        }
++      });
++
++      output.replaceChildren(table);
++    }
++
++    button.addEventListener('click', async () => {
++      button.disabled = true;
++      status.textContent = 'Loading order events…';
++      try {
++        const [Temporal, batch] = await Promise.all([ensureTemporal(), fetchOrderEventBatch()]);
++
++        const events = batch.map((e) => ({ ...e, instant: Temporal.Instant.from(e.ts) }));
++        const sorted = events.toSorted((a, b) => Temporal.Instant.compare(a.instant, b.instant));
++
++        for (let i = 1; i < sorted.length; i++) {
++          sorted[i].gap = sorted[i].instant.since(sorted[i - 1].instant, { largestUnit: 'hour' });
++        }
++        const total = sorted.length > 1
++          ? sorted.at(-1).instant.since(sorted[0].instant, { largestUnit: 'hour' })
++          : new Temporal.Duration();
++
++        render(sorted, total);
++        status.textContent = `Sorted ${sorted.length} events chronologically.`;
++      } catch (err) {
++        console.error(err);
++        status.textContent = 'Sorry, we couldn\u2019t load order events. Please try again.';
++      } finally {
++        button.disabled = false;
++      }
++    });
++  </script>
+ </body>
+ 
+ </html>

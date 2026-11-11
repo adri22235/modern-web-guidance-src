@@ -1,0 +1,296 @@
+diff --git a/index.html b/index.html
+index 66c9173..7ce15da 100644
+--- a/index.html
++++ b/index.html
+@@ -152,6 +152,91 @@
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    /* Delivery Notes */
++    .notes {
++      background: white;
++      border-radius: 8px;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++      padding: 24px;
++      margin-top: 20px;
++    }
++
++    .notes form {
++      display: grid;
++      gap: 12px;
++    }
++
++    .notes label {
++      font-weight: 600;
++    }
++
++    .notes textarea {
++      width: 100%;
++      min-height: 90px;
++      padding: 10px;
++      font: inherit;
++      border: 1px solid var(--secondary);
++      border-radius: 5px;
++      resize: vertical;
++    }
++
++    .notes button {
++      font: inherit;
++      cursor: pointer;
++      border: 0;
++      background: var(--primary);
++      color: white;
++      padding: 10px 20px;
++      border-radius: 5px;
++    }
++
++    .notes button:hover {
++      background: #3e2723;
++    }
++
++    .notes button.secondary {
++      background: transparent;
++      color: var(--primary);
++      border: 1px solid var(--primary);
++      padding: 5px 12px;
++    }
++
++    .notes-status {
++      font-size: 0.9rem;
++      min-height: 1.4em;
++    }
++
++    .notes-suite {
++      font-size: 0.85rem;
++      color: #6d4c41;
++    }
++
++    #notes-list {
++      list-style: none;
++      margin-top: 16px;
++      display: grid;
++      gap: 12px;
++    }
++
++    #notes-list li {
++      border: 1px solid var(--secondary);
++      border-radius: 5px;
++      padding: 12px;
++      display: grid;
++      gap: 6px;
++    }
++
++    #notes-list .note-actions {
++      display: flex;
++      gap: 8px;
++    }
++
++    #notes-list .note-meta {
++      font-size: 0.8rem;
++      color: #6d4c41;
++      overflow-wrap: anywhere;
++    }
+   </style>
+ </head>
+ 
+@@ -195,6 +280,20 @@
+         </div>
+       </div>
+     </section>
++
++    <section aria-labelledby="notes-heading" style="margin-top: 40px;">
++      <h2 id="notes-heading" style="text-align: center;">Encrypted Delivery Notes</h2>
++      <div class="notes">
++        <form id="note-form">
++          <label for="note-text">Delivery note (gate code, allergies, address details)</label>
++          <textarea id="note-text" required maxlength="1000" autocomplete="off"></textarea>
++          <button type="submit">Encrypt &amp; Save Note</button>
++        </form>
++        <p class="notes-suite" id="notes-suite"></p>
++        <p class="notes-status" id="notes-status" role="status"></p>
++        <ul id="notes-list"></ul>
++      </div>
++    </section>
+   </main>
+ 
+   <footer>
+@@ -207,6 +306,178 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++
++  <script type="module">
++    const INFO = new TextEncoder().encode('daily-grind-delivery-notes-v1');
++    const STORAGE_KEY = 'delivery-notes-v1';
++    const KEM_BY_PUBLIC_KEY_SIZE = { 1184: 'ML-KEM-768', 1216: 'MLKEM768-X25519', 1568: 'ML-KEM-1024' };
++
++    const form = document.getElementById('note-form');
++    const textEl = document.getElementById('note-text');
++    const statusEl = document.getElementById('notes-status');
++    const suiteEl = document.getElementById('notes-suite');
++    const listEl = document.getElementById('notes-list');
++
++    const toB64 = (bytes) => btoa(String.fromCharCode(...bytes));
++    const fromB64 = (str) => Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
++    const aadFor = (suite, id) => new TextEncoder().encode(`${suite}|${id}`);
++
++    const hasPostQuantum = () =>
++      typeof globalThis.SubtleCrypto?.supports === 'function' &&
++      SubtleCrypto.supports('encapsulateKey', 'MLKEM768-X25519', 'ChaCha20-Poly1305');
++
++    // --- Recipient key pair (non-extractable, persisted in IndexedDB) ---
++    function idb(mode, fn) {
++      return new Promise((resolve, reject) => {
++        const open = indexedDB.open('daily-grind-notes', 1);
++        open.onupgradeneeded = () => open.result.createObjectStore('keys');
++        open.onerror = () => reject(open.error);
++        open.onsuccess = () => {
++          const req = fn(open.result.transaction('keys', mode).objectStore('keys'));
++          req.onsuccess = () => resolve(req.result);
++          req.onerror = () => reject(req.error);
++        };
++      });
++    }
++
++    async function getRecipient() {
++      const stored = await idb('readonly', (s) => s.get('recipient'));
++      if (stored) return stored;
++      const pq = hasPostQuantum();
++      const keyPair = pq
++        ? await crypto.subtle.generateKey('MLKEM768-X25519', false, ['encapsulateKey', 'decapsulateKey'])
++        : await crypto.subtle.generateKey('X25519', false, ['deriveBits']);
++      const publicKeyBytes = new Uint8Array(
++        await crypto.subtle.exportKey(pq ? 'raw-public' : 'raw', keyPair.publicKey));
++      const recipient = {
++        suite: pq ? 'MLKEM768-X25519+ChaCha20-Poly1305' : 'X25519+HKDF+AES-GCM',
++        keyPair,
++        publicKeyBytes,
++      };
++      await idb('readwrite', (s) => s.put(recipient, 'recipient'));
++      return recipient;
++    }
++
++    // --- Key establishment ---
++    async function deriveAesKey(privateKey, peerPublicKey) {
++      const bits = await crypto.subtle.deriveBits({ name: 'X25519', public: peerPublicKey }, privateKey, 256);
++      const hkdfKey = await crypto.subtle.importKey('raw', bits, 'HKDF', false, ['deriveKey']);
++      return crypto.subtle.deriveKey(
++        { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: INFO },
++        hkdfKey, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
++    }
++
++    async function encapsulate(publicKeyBytes) {
++      const kem = KEM_BY_PUBLIC_KEY_SIZE[publicKeyBytes.byteLength];
++      if (kem) {
++        const pub = await crypto.subtle.importKey('raw-public', publicKeyBytes, kem, true, ['encapsulateKey']);
++        const { sharedKey, ciphertext } = await crypto.subtle.encapsulateKey(
++          kem, pub, 'ChaCha20-Poly1305', false, ['encrypt', 'decrypt']);
++        return { sharedKey, capsule: new Uint8Array(ciphertext) };
++      }
++      const pub = await crypto.subtle.importKey('raw', publicKeyBytes, 'X25519', true, []);
++      const eph = await crypto.subtle.generateKey('X25519', false, ['deriveBits']);
++      const capsule = new Uint8Array(await crypto.subtle.exportKey('raw', eph.publicKey));
++      return { sharedKey: await deriveAesKey(eph.privateKey, pub), capsule };
++    }
++
++    async function decapsulate(privateKey, capsule) {
++      if (privateKey.algorithm.name !== 'X25519') {
++        return crypto.subtle.decapsulateKey(
++          privateKey.algorithm.name, privateKey, capsule, 'ChaCha20-Poly1305', false, ['encrypt', 'decrypt']);
++      }
++      const eph = await crypto.subtle.importKey('raw', capsule, 'X25519', true, []);
++      return deriveAesKey(privateKey, eph);
++    }
++
++    // --- Note storage ---
++    const loadNotes = () => JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
++    const saveNotes = (notes) => localStorage.setItem(STORAGE_KEY, JSON.stringify(notes));
++
++    async function encryptNote(plaintext) {
++      const { suite, keyPair, publicKeyBytes } = await getRecipient();
++      const { sharedKey, capsule } = await encapsulate(publicKeyBytes);
++      const id = crypto.randomUUID();
++      const iv = crypto.getRandomValues(new Uint8Array(12));
++      const ct = await crypto.subtle.encrypt(
++        { name: sharedKey.algorithm.name, iv, additionalData: aadFor(suite, id) },
++        sharedKey, new TextEncoder().encode(plaintext));
++      return {
++        id, suite, created: new Date().toISOString(),
++        capsule: toB64(capsule), iv: toB64(iv), ciphertext: toB64(new Uint8Array(ct)),
++      };
++    }
++
++    async function decryptNote(note) {
++      const { keyPair } = await getRecipient();
++      const key = await decapsulate(keyPair.privateKey, fromB64(note.capsule));
++      const pt = await crypto.subtle.decrypt(
++        { name: key.algorithm.name, iv: fromB64(note.iv), additionalData: aadFor(note.suite, note.id) },
++        key, fromB64(note.ciphertext));
++      return new TextDecoder().decode(pt);
++    }
++
++    // --- UI ---
++    function render() {
++      listEl.replaceChildren(...loadNotes().map((note) => {
++        const li = document.createElement('li');
++        const body = document.createElement('p');
++        body.textContent = '🔒 Encrypted note';
++        const meta = document.createElement('p');
++        meta.className = 'note-meta';
++        meta.textContent = `${note.suite} · ${new Date(note.created).toLocaleString()} · ${note.ciphertext.slice(0, 24)}…`;
++        const actions = document.createElement('div');
++        actions.className = 'note-actions';
++
++        const reveal = document.createElement('button');
++        reveal.type = 'button';
++        reveal.className = 'secondary';
++        reveal.textContent = 'Decrypt';
++        reveal.addEventListener('click', async () => {
++          try {
++            body.textContent = await decryptNote(note);
++            reveal.disabled = true;
++          } catch {
++            statusEl.textContent = 'Could not decrypt: note is corrupted or the key is unavailable.';
++          }
++        });
++
++        const del = document.createElement('button');
++        del.type = 'button';
++        del.className = 'secondary';
++        del.textContent = 'Delete';
++        del.addEventListener('click', () => {
++          saveNotes(loadNotes().filter((n) => n.id !== note.id));
++          render();
++        });
++
++        actions.append(reveal, del);
++        li.append(body, meta, actions);
++        return li;
++      }));
++    }
++
++    form.addEventListener('submit', async (e) => {
++      e.preventDefault();
++      try {
++        const note = await encryptNote(textEl.value);
++        saveNotes([...loadNotes(), note]);
++        textEl.value = '';
++        statusEl.textContent = 'Note encrypted in your browser and saved.';
++        render();
++      } catch {
++        statusEl.textContent = 'Encryption is not available in this browser.';
++      }
++    });
++
++    suiteEl.textContent = !crypto?.subtle
++      ? 'Web Crypto requires a secure (HTTPS) context.'
++      : hasPostQuantum()
++        ? 'Protection: hybrid post-quantum ML-KEM-768 + X25519, ChaCha20-Poly1305.'
++        : 'Protection: X25519 + HKDF + AES-GCM (post-quantum KEM unsupported in this browser).';
++    render();
++  </script>
++
+ </body>
+ 
+ </html>

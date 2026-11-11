@@ -1,0 +1,398 @@
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..41dac64
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,17 @@
++# The Daily Grind
++
++Static homepage with browser-local digital signing for sample coffee receipts and gift vouchers. No server or build is required to compile the page; serve the files over HTTPS (or localhost) for Web Crypto access.
++
++The page prefers ML-DSA-65 when the browser advertises support, then falls back to Ed25519 and ECDSA P-256/SHA-256. It stores a non-exportable private CryptoKey and its public verification key in IndexedDB. If persistent key storage fails, signing stays disabled. Clearing site data removes the signing identity.
++
++Signed JSON includes a version, algorithm, public-key fingerprint, exact payload string, and base64 signature. The signature binds those fields and a document-specific domain. Verification checks the signature against the saved public key, rejects foreign keys, and never accepts a public key supplied by an uploaded document. Editing JSON clears the displayed verification result. Download always saves the last generated document.
++
++These are local samples, not merchant-issued receipts or redeemable vouchers. Browser-controlled signing cannot establish that Daily Grind authorized a purchase or gift balance. Production issuance must use a merchant-controlled signer (without shipping merchant private keys to customers) and distribute independently authenticated merchant public keys to verifiers. Redemption and replay prevention require authoritative order/voucher state.
++
++Run automated cryptographic checks with:
++
++```sh
++node --test tests/receipt-crypto.test.mjs
++```
++
++No dependencies are required. Tests cover receipt/voucher round trips, private-key export rejection, content/signature/metadata tampering, unknown keys, and invalid inputs. UI behavior and IndexedDB persistence were not manually tested in a browser.
+diff --git a/index.html b/index.html
+index 66c9173..ae02e3a 100644
+--- a/index.html
++++ b/index.html
+@@ -152,6 +152,32 @@
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    .signing-section { margin-top: 48px; padding-top: 32px; border-top: 1px solid var(--secondary); }
++    .signing-section h2 { font-size: 1.8rem; }
++    .signing-intro { max-width: 760px; margin: 8px 0 16px; }
++    .key-status { display: inline-block; font-size: .85rem; background: #eee8e5; padding: 6px 12px; border-radius: 4px; overflow-wrap: anywhere; }
++    .signing-grid { display: grid; grid-template-columns: 1fr 1.2fr; gap: 24px; margin-top: 24px; }
++    .signing-panel { background: white; border: 1px solid var(--secondary); padding: 24px; border-radius: 8px; min-width: 0; }
++    .signing-panel h3 { margin-bottom: 8px; }
++    .signing-panel label { display: block; margin-top: 16px; margin-bottom: 5px; font-weight: 600; }
++    .signing-panel input, .signing-panel select, .signing-panel textarea { width: 100%; padding: 10px; border: 1px solid #9b8983; border-radius: 4px; font: inherit; color: var(--text); background: white; }
++    .signing-panel textarea { font-family: monospace; font-size: .8rem; resize: vertical; }
++    .signing-panel input[type=file] { font-size: .85rem; }
++    button.btn { font: inherit; border: 0; cursor: pointer; }
++    button.btn:disabled { opacity: .5; cursor: not-allowed; }
++    .btn.secondary { background: #eee8e5; color: var(--primary); }
++    :focus-visible { outline: 3px solid #b16a00; outline-offset: 3px; }
++    .signing-note { font-size: .85rem; margin-top: 16px; }
++    #verification-status { margin-top: 16px; padding: 12px; background: #f5f1ee; border-radius: 4px; overflow-wrap: anywhere; }
++    #verification-status[data-state=success] { background: #edf5eb; color: #245329; }
++    #verification-status[data-state=error] { background: #fff0ee; color: #8a251d; }
++    @media (max-width: 700px) {
++      .signing-grid { grid-template-columns: 1fr; }
++      nav { flex-wrap: wrap; gap: 10px; }
++      nav ul { flex-wrap: wrap; gap: 10px 16px; }
++      nav ul li { margin-left: 0; }
++    }
+   </style>
+ </head>
+ 
+@@ -195,6 +221,40 @@
+         </div>
+       </div>
+     </section>
++    <section class="signing-section" aria-labelledby="signing-heading">
++      <h2 id="signing-heading">A little extra peace of mind.</h2>
++      <p class="signing-intro">Digitally sign a sample coffee receipt or gift voucher, then check that its contents haven’t changed. Your private signing key stays in this browser.</p>
++      <p id="signing-status" class="key-status" role="status">Preparing your browser’s signing key…</p>
++      <div class="signing-grid">
++        <form id="signing-form" class="signing-panel">
++          <h3>Create a signed sample</h3>
++          <p>A keepsake for your coffee break.</p>
++          <label for="document-type">Document type</label>
++          <select id="document-type" name="document-type">
++            <option value="receipt">Coffee order receipt</option>
++            <option value="voucher">Gift voucher</option>
++          </select>
++          <label for="document-description">Order description or gift recipient</label>
++          <input id="document-description" name="description" maxlength="200" value="Maple Oat Latte" required>
++          <label for="document-amount">Amount (USD)</label>
++          <input id="document-amount" name="amount" type="number" min="0.01" max="10000" step="0.01" value="5.50" required>
++          <button class="btn" id="sign-document" type="submit" disabled>Sign document</button>
++          <button class="btn secondary" id="download-document" type="button" disabled>Download signed JSON</button>
++        </form>
++        <form id="verify-form" class="signing-panel">
++          <h3>Check a signature</h3>
++          <p>Upload a saved document or paste its signed JSON.</p>
++          <label for="document-file">Upload signed document</label>
++          <input id="document-file" type="file" accept=".json,application/json">
++          <label for="signed-document">Signed document JSON</label>
++          <textarea id="signed-document" rows="8" maxlength="20000" spellcheck="false" placeholder="Your signed document will appear here…" required aria-describedby="verification-status"></textarea>
++          <button class="btn" id="verify-document" type="submit" disabled>Verify signature</button>
++          <p id="verification-status" role="status" aria-live="polite">No document checked yet.</p>
++        </form>
++      </div>
++      <p class="signing-note">Local samples only: these documents are not proof of purchase or redeemable vouchers. Verification trusts only this browser’s saved key; documents from another browser are untrusted. Clearing site data removes the key. Real merchant authenticity requires a merchant-controlled signer and a separately trusted public key.</p>
++      <noscript><p>Enable JavaScript to sign and verify documents.</p></noscript>
++    </section>
+   </main>
+ 
+   <footer>
+@@ -207,6 +267,7 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script type="module" src="./receipt-signing.js"></script>
+ </body>
+ 
+ </html>
+diff --git a/receipt-crypto.mjs b/receipt-crypto.mjs
+new file mode 100644
+index 0000000..455ddcf
+--- /dev/null
++++ b/receipt-crypto.mjs
+@@ -0,0 +1,89 @@
++const encoder = new TextEncoder();
++const DOMAIN = 'daily-grind/document/v1';
++const suites = {
++  'ML-DSA-65': { generation: 'ML-DSA-65', format: 'raw-public' },
++  Ed25519: { generation: 'Ed25519', format: 'raw' },
++  'ECDSA-P256-SHA256': { generation: { name: 'ECDSA', namedCurve: 'P-256' }, format: 'raw' },
++};
++
++function base64(bytes) {
++  return btoa(String.fromCharCode(...new Uint8Array(bytes)));
++}
++
++function decode(value) {
++  if (typeof value !== 'string' || value.length > 10000 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
++    throw new Error('Invalid signature encoding.');
++  }
++  return Uint8Array.from(atob(value), c => c.charCodeAt(0));
++}
++
++export async function generateSigner() {
++  if (!globalThis.crypto?.subtle) throw new Error('Signing requires HTTPS or localhost and Web Crypto support.');
++  const candidates = [];
++  if (globalThis.SubtleCrypto?.supports?.('sign', 'ML-DSA-65')) candidates.push('ML-DSA-65');
++  candidates.push('Ed25519', 'ECDSA-P256-SHA256');
++  for (const algorithm of candidates) {
++    try {
++      const keyPair = await crypto.subtle.generateKey(suites[algorithm].generation, false, ['sign', 'verify']);
++      const publicBytes = await crypto.subtle.exportKey(suites[algorithm].format, keyPair.publicKey);
++      const keyId = base64(await crypto.subtle.digest('SHA-256', publicBytes));
++      return { algorithm, keyId, ...keyPair };
++    } catch (error) {
++      if (error.name !== 'NotSupportedError') throw error;
++    }
++  }
++  throw new Error('This browser does not support a compatible signature algorithm.');
++}
++
++function parameters(algorithm, context) {
++  if (algorithm === 'ML-DSA-65') return { name: algorithm, context };
++  return algorithm === 'Ed25519' ? algorithm : { name: 'ECDSA', hash: 'SHA-256' };
++}
++
++function signingInput(envelope, type) {
++  // Bind the document purpose and all security metadata to the signed bytes.
++  const context = encoder.encode(`${DOMAIN}/${type}`);
++  const bytes = encoder.encode(JSON.stringify([envelope.version, envelope.algorithm, envelope.keyId, envelope.payload]));
++  if (envelope.algorithm === 'ML-DSA-65') return { context, bytes };
++  const framed = new Uint8Array(1 + context.length + bytes.length);
++  framed[0] = context.length;
++  framed.set(context, 1);
++  framed.set(bytes, context.length + 1);
++  return { context, bytes: framed };
++}
++
++function validatePayload(payload) {
++  if (!payload || !['receipt', 'voucher'].includes(payload.type) ||
++      typeof payload.id !== 'string' || payload.id.length > 100 ||
++      typeof payload.issuedAt !== 'string' || !Number.isFinite(Date.parse(payload.issuedAt)) ||
++      payload.issuer !== 'Daily Grind local sample' || payload.currency !== 'USD' ||
++      !Number.isSafeInteger(payload.amountCents) || payload.amountCents <= 0 ||
++      typeof payload.description !== 'string' || payload.description.length > 200) {
++    throw new Error('The document contents are invalid.');
++  }
++  return payload;
++}
++
++export async function signDocument(signer, payload) {
++  validatePayload(payload);
++  const envelope = { version: 1, algorithm: signer.algorithm, keyId: signer.keyId, payload: JSON.stringify(payload) };
++  const { context, bytes } = signingInput(envelope, payload.type);
++  envelope.signature = base64(await crypto.subtle.sign(parameters(signer.algorithm, context), signer.privateKey, bytes));
++  return envelope;
++}
++
++export async function verifyDocument(signer, text) {
++  if (typeof text !== 'string' || text.length > 20000) throw new Error('Choose a signed document smaller than 20 KB.');
++  const envelope = JSON.parse(text);
++  if (!envelope || envelope.version !== 1 || !Object.hasOwn(suites, envelope.algorithm) || typeof envelope.payload !== 'string') {
++    throw new Error('Unrecognized signed document format.');
++  }
++  if (envelope.keyId !== signer.keyId || envelope.algorithm !== signer.algorithm) {
++    throw new Error('Untrusted signing key. This document was not signed by this browser’s saved key.');
++  }
++  const payload = validatePayload(JSON.parse(envelope.payload));
++  const { context, bytes } = signingInput(envelope, payload.type);
++  const valid = await crypto.subtle.verify(parameters(envelope.algorithm, context), signer.publicKey, decode(envelope.signature), bytes);
++  if (!valid) throw new Error('Signature check failed. The document or signature has changed.');
++  return payload;
++}
+diff --git a/receipt-signing.js b/receipt-signing.js
+new file mode 100644
+index 0000000..7d9edb5
+--- /dev/null
++++ b/receipt-signing.js
+@@ -0,0 +1,135 @@
++import { generateSigner, signDocument, verifyDocument } from './receipt-crypto.mjs';
++
++const status = document.querySelector('#signing-status');
++const output = document.querySelector('#signed-document');
++const verification = document.querySelector('#verification-status');
++const signingForm = document.querySelector('#signing-form');
++const verifyForm = document.querySelector('#verify-form');
++const signButton = document.querySelector('#sign-document');
++const verifyButton = document.querySelector('#verify-document');
++const downloadButton = document.querySelector('#download-document');
++let signer;
++let signedText = '';
++let signedName = '';
++
++function openStore() {
++  return new Promise((resolve, reject) => {
++    const request = indexedDB.open('daily-grind-signing', 1);
++    request.onupgradeneeded = () => request.result.createObjectStore('keys');
++    request.onsuccess = () => resolve(request.result);
++    request.onerror = () => reject(request.error);
++    request.onblocked = () => reject(new Error('Key storage is blocked. Close other Daily Grind tabs and reload.'));
++  });
++}
++
++async function savedSigner() {
++  const db = await openStore();
++  try {
++    const existing = await new Promise((resolve, reject) => {
++      const request = db.transaction('keys').objectStore('keys').get('signer');
++      request.onsuccess = () => resolve(request.result);
++      request.onerror = () => reject(request.error);
++    });
++    if (existing) return existing;
++    const candidate = await generateSigner();
++    // Recheck inside one write transaction to avoid replacing another tab's key.
++    return await new Promise((resolve, reject) => {
++      const transaction = db.transaction('keys', 'readwrite');
++      const store = transaction.objectStore('keys');
++      const request = store.get('signer');
++      let selected;
++      request.onsuccess = () => {
++        selected = request.result || candidate;
++        if (!request.result) store.put(selected, 'signer');
++      };
++      transaction.oncomplete = () => resolve(selected);
++      transaction.onabort = () => reject(transaction.error || new Error('Could not save the signing key.'));
++    });
++  } finally {
++    db.close();
++  }
++}
++
++function showResult(message, state = '') {
++  verification.textContent = message;
++  verification.dataset.state = state;
++}
++
++signingForm.addEventListener('submit', async event => {
++  event.preventDefault();
++  if (!signer) return;
++  signButton.disabled = true;
++  downloadButton.disabled = true;
++  try {
++    const data = new FormData(signingForm);
++    const type = data.get('document-type');
++    const amountCents = Math.round(Number(data.get('amount')) * 100);
++    const payload = {
++      type, id: crypto.randomUUID(), issuedAt: new Date().toISOString(),
++      issuer: 'Daily Grind local sample', currency: 'USD', amountCents,
++      description: data.get('description').trim(),
++    };
++    if (!payload.description) throw new Error('Enter a description or recipient.');
++    const envelope = await signDocument(signer, payload);
++    signedText = JSON.stringify(envelope, null, 2);
++    signedName = `daily-grind-${type}-${payload.id}.json`;
++    output.value = signedText;
++    downloadButton.disabled = false;
++    showResult('Document signed. Select Verify signature to check its integrity.');
++  } catch (error) {
++    showResult(error.message, 'error');
++  } finally {
++    signButton.disabled = false;
++  }
++});
++
++verifyForm.addEventListener('submit', async event => {
++  event.preventDefault();
++  if (!signer) return;
++  verifyButton.disabled = true;
++  showResult('Checking signature…');
++  try {
++    const payload = await verifyDocument(signer, output.value);
++    const amount = new Intl.NumberFormat('en-US', { style: 'currency', currency: payload.currency }).format(payload.amountCents / 100);
++    showResult(`Signature valid · ${payload.type === 'receipt' ? 'Coffee receipt' : 'Gift voucher'} · ${amount} · ${payload.description}. Signed by this browser’s saved key. This is a local sample, not proof of purchase or redeemable value.`, 'success');
++  } catch (error) {
++    showResult(error instanceof SyntaxError ? 'Invalid JSON. Paste or upload a complete signed document.' : error.message, 'error');
++  } finally {
++    verifyButton.disabled = false;
++  }
++});
++
++output.addEventListener('input', () => showResult('Document changed. Verify again to check its signature.'));
++document.querySelector('#document-file').addEventListener('change', async event => {
++  const file = event.target.files[0];
++  if (!file) return;
++  try {
++    if (file.size > 20000) throw new Error('Choose a signed JSON document smaller than 20 KB.');
++    output.value = await file.text();
++    showResult('Document loaded. Select Verify signature to check it.');
++  } catch (error) { showResult(error.message, 'error'); }
++  event.target.value = '';
++});
++
++downloadButton.addEventListener('click', () => {
++  if (!signedText) return;
++  const url = URL.createObjectURL(new Blob([signedText], { type: 'application/json' }));
++  const link = document.createElement('a');
++  link.href = url;
++  link.download = signedName;
++  link.click();
++  setTimeout(() => URL.revokeObjectURL(url), 1000);
++});
++
++async function initialize() {
++  try {
++    if (!globalThis.isSecureContext || !globalThis.crypto?.subtle) throw new Error('Signing requires HTTPS or localhost and Web Crypto support.');
++    signer = await savedSigner();
++    status.textContent = `${signer.algorithm} · Saved browser key ${signer.keyId.slice(0, 12)}…`;
++    signButton.disabled = false;
++    verifyButton.disabled = false;
++  } catch (error) {
++    status.textContent = `Signing unavailable: ${error.message} Allow browser storage and use a supported browser over HTTPS.`;
++  }
++}
++initialize();
+diff --git a/tests/receipt-crypto.test.mjs b/tests/receipt-crypto.test.mjs
+new file mode 100644
+index 0000000..996a402
+--- /dev/null
++++ b/tests/receipt-crypto.test.mjs
+@@ -0,0 +1,47 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { generateSigner, signDocument, verifyDocument } from '../receipt-crypto.mjs';
++
++const signer = await generateSigner();
++const payload = {
++  type: 'receipt', id: 'test-order', issuedAt: new Date().toISOString(),
++  issuer: 'Daily Grind local sample', currency: 'USD', amountCents: 550,
++  description: 'Maple Oat Latte ☕',
++};
++const envelope = await signDocument(signer, payload);
++
++test('private key cannot be exported', async () => {
++  assert.equal(signer.privateKey.extractable, false);
++  await assert.rejects(crypto.subtle.exportKey('pkcs8', signer.privateKey));
++});
++
++test('receipts and vouchers survive JSON export and verify', async () => {
++  assert.deepEqual(await verifyDocument(signer, JSON.stringify(envelope)), payload);
++  const voucher = { ...payload, type: 'voucher', description: 'Gift for Alex', amountCents: 2500 };
++  assert.deepEqual(await verifyDocument(signer, JSON.stringify(await signDocument(signer, voucher))), voucher);
++});
++
++test('amount, type, description, signature, and metadata tampering are rejected', async () => {
++  for (const change of [{ amountCents: 1 }, { type: 'voucher' }, { description: 'Other order' }]) {
++    const altered = { ...envelope, payload: JSON.stringify({ ...payload, ...change }) };
++    await assert.rejects(verifyDocument(signer, JSON.stringify(altered)), /Signature check failed/);
++  }
++  const signature = (envelope.signature[0] === 'A' ? 'B' : 'A') + envelope.signature.slice(1);
++  await assert.rejects(verifyDocument(signer, JSON.stringify({ ...envelope, signature })));
++  await assert.rejects(verifyDocument(signer, JSON.stringify({ ...envelope, keyId: 'attacker' })), /Untrusted/);
++  await assert.rejects(verifyDocument(signer, JSON.stringify({ ...envelope, version: 2 })), /format/);
++  await assert.rejects(verifyDocument(signer, JSON.stringify({ ...envelope, algorithm: 'unknown' })), /format/);
++});
++
++test('an independently generated signer is not trusted', async () => {
++  const other = await generateSigner();
++  const foreign = await signDocument(other, payload);
++  await assert.rejects(verifyDocument(signer, JSON.stringify(foreign)), /Untrusted/);
++});
++
++test('malformed, oversized, and invalid payloads are rejected', async () => {
++  for (const invalid of ['not JSON', 'null', '{}', 'a'.repeat(20001)]) {
++    await assert.rejects(verifyDocument(signer, invalid));
++  }
++  await assert.rejects(signDocument(signer, { ...payload, amountCents: -1 }));
++});

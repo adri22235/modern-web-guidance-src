@@ -1,0 +1,278 @@
+diff --git a/index.html b/index.html
+index 66c9173..8b879c2 100644
+--- a/index.html
++++ b/index.html
+@@ -4,6 +4,8 @@
+ <head>
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https://images.unsplash.com; object-src 'none'; base-uri 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types daily-grind-html daily-grind-inert-parse">
++  <meta name="referrer" content="strict-origin-when-cross-origin">
+   <title>The Daily Grind | Artisanal Coffee</title>
+   <style>
+     :root {
+@@ -135,6 +137,10 @@
+       background: #3e2723;
+     }
+ 
++    .section-title {
++      text-align: center;
++    }
++
+     footer {
+       background: var(--secondary);
+       text-align: center;
+@@ -153,6 +159,7 @@
+       font-size: 0.85rem;
+     }
+   </style>
++  <script type="module" src="/js/seasonal-favorites.js"></script>
+ </head>
+ 
+ <body>
+@@ -176,24 +183,9 @@
+ 
+   <main class="container">
+     <section>
+-      <h2 style="text-align: center;">Seasonal Favorites</h2>
+-      <div class="grid">
+-        <div class="card">
+-          <h3>Maple Oat Latte</h3>
+-          <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+-          <a href="/menu/seasonal" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Dark Roast Espresso</h3>
+-          <p>Bold, smokey, and perfect for a morning boost.</p>
+-          <a href="/menu/espresso" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Cold Brew</h3>
+-          <p>Steeped for 18 hours for maximum smoothness.</p>
+-          <a href="/menu/cold-brew" class="btn">View Details</a>
+-        </div>
+-      </div>
++      <h2 class="section-title">Seasonal Favorites</h2>
++      <div class="grid" id="seasonal-favorites" aria-live="polite"></div>
++      <noscript><p class="section-title">Enable JavaScript to see our seasonal favorites, or browse the <a href="/menu">full menu</a>.</p></noscript>
+     </section>
+   </main>
+ 
+diff --git a/js/safe-html.js b/js/safe-html.js
+new file mode 100644
+index 0000000..4537ff0
+--- /dev/null
++++ b/js/safe-html.js
+@@ -0,0 +1,166 @@
++/**
++ * safe-html.js — Trusted Types policy + allowlist HTML sanitizer.
++ *
++ * The page CSP sets `require-trusted-types-for 'script'`, so the browser
++ * rejects any plain string written to an HTML sink (innerHTML, outerHTML,
++ * insertAdjacentHTML, DOMParser, document.write, ...). The only way to reach
++ * a sink is through the `daily-grind-html` policy exported below, whose
++ * createHTML() runs every string through a strict allowlist sanitizer.
++ *
++ * In browsers without Trusted Types, the same sanitizer is applied through a
++ * small shim, so callers get identical behaviour everywhere.
++ */
++
++const ALLOWED_TAGS = new Set([
++  'DIV', 'SPAN', 'P', 'H3', 'H4', 'A', 'STRONG', 'EM', 'B', 'I', 'BR', 'SMALL',
++  'UL', 'OL', 'LI', 'IMG',
++]);
++
++// Elements whose *content* must be dropped too (not just unwrapped).
++const DROP_WITH_CONTENT = new Set([
++  'SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT', 'NOEMBED', 'NOFRAMES', 'IFRAME',
++  'FRAME', 'FRAMESET', 'OBJECT', 'EMBED', 'APPLET', 'SVG', 'MATH', 'TEXTAREA',
++  'TITLE', 'XMP', 'PLAINTEXT', 'SELECT', 'OPTION', 'FORM', 'INPUT', 'BUTTON',
++  'BASE', 'LINK', 'META',
++]);
++
++const GLOBAL_ATTRS = new Set(['class', 'title']);
++const TAG_ATTRS = {
++  A: new Set(['href']),
++  IMG: new Set(['src', 'alt', 'width', 'height', 'loading']),
++};
++const URL_ATTRS = new Set(['href', 'src']);
++const SAFE_LINK_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
++const SAFE_IMG_PROTOCOLS = new Set(['https:']);
++const CLASS_TOKEN = /^[a-zA-Z][\w-]{0,63}$/;
++
++/** Returns a normalized safe URL string, or null if the URL is unsafe. */
++export function sanitizeUrl(value, { image = false } = {}) {
++  // Strip ASCII control chars/whitespace that browsers ignore inside schemes
++  // (e.g. "java\tscript:").
++  const cleaned = String(value).replace(/[\u0000- \u007f-\u009f]/g, '');
++  if (!cleaned) return null;
++  let url;
++  try {
++    url = new URL(cleaned, window.location.origin);
++  } catch {
++    return null;
++  }
++  const allowed = image ? SAFE_IMG_PROTOCOLS : SAFE_LINK_PROTOCOLS;
++  if (!allowed.has(url.protocol)) return null;
++  // Keep same-origin links relative; keep absolute URLs as normalized hrefs.
++  return url.origin === window.location.origin
++    ? url.pathname + url.search + url.hash
++    : url.href;
++}
++
++// --- Inert parsing -----------------------------------------------------------
++// DOMParser is itself a Trusted Types sink. This private, non-exported policy
++// is used *only* to parse untrusted markup into an inert document (scripts do
++// not run and resources do not load there); its output never touches the live
++// DOM. The CSP allowlists it by name and forbids re-creating it.
++const inertParsePolicy = window.trustedTypes
++  ? window.trustedTypes.createPolicy('daily-grind-inert-parse', {
++      createHTML: (s) => s,
++    })
++  : null;
++
++function parseInert(html) {
++  const input = inertParsePolicy ? inertParsePolicy.createHTML(html) : html;
++  return new DOMParser().parseFromString(input, 'text/html').body;
++}
++
++function sanitizeAttributes(el) {
++  const perTag = TAG_ATTRS[el.tagName];
++  for (const { name, value } of Array.from(el.attributes)) {
++    const lname = name.toLowerCase();
++    const allowed = GLOBAL_ATTRS.has(lname) || (perTag && perTag.has(lname));
++    if (!allowed) {
++      el.removeAttribute(name);
++      continue;
++    }
++    if (URL_ATTRS.has(lname)) {
++      const safe = sanitizeUrl(value, { image: el.tagName === 'IMG' });
++      if (safe === null) el.removeAttribute(name);
++      else el.setAttribute(lname, safe);
++    } else if (lname === 'class') {
++      const tokens = value.split(/\s+/).filter((t) => CLASS_TOKEN.test(t));
++      if (tokens.length) el.setAttribute('class', tokens.join(' '));
++      else el.removeAttribute('class');
++    } else if (lname === 'loading') {
++      if (value !== 'lazy' && value !== 'eager') el.removeAttribute(name);
++    } else if (lname === 'width' || lname === 'height') {
++      if (!/^\d{1,4}$/.test(value)) el.removeAttribute(name);
++    }
++  }
++  if (el.tagName === 'IMG' && !el.hasAttribute('src')) el.remove();
++}
++
++function sanitizeTree(root) {
++  // Snapshot children first: we mutate the tree while walking it.
++  for (const node of Array.from(root.childNodes)) {
++    if (node.nodeType === Node.TEXT_NODE) continue;
++    if (node.nodeType !== Node.ELEMENT_NODE) {
++      node.remove(); // comments, processing instructions, CDATA, ...
++      continue;
++    }
++    const tag = node.tagName.toUpperCase();
++    if (DROP_WITH_CONTENT.has(tag)) {
++      node.remove();
++      continue;
++    }
++    sanitizeTree(node);
++    if (!ALLOWED_TAGS.has(tag)) {
++      // Unknown but harmless element: keep its (already sanitized) children.
++      node.replaceWith(...Array.from(node.childNodes));
++      continue;
++    }
++    sanitizeAttributes(node);
++  }
++}
++
++function sanitizeOnce(html) {
++  const body = parseInert(String(html));
++  sanitizeTree(body);
++  return body.innerHTML;
++}
++
++/**
++ * Sanitizes an untrusted HTML string against the allowlist and returns a
++ * plain string. The result is re-parsed and re-sanitized; if serialization is
++ * not stable (a hallmark of mutation-XSS payloads) everything is dropped.
++ */
++export function sanitizeHtml(html) {
++  const first = sanitizeOnce(html);
++  const second = sanitizeOnce(first);
++  if (first !== second) {
++    console.warn('[safe-html] Unstable markup rejected.');
++    return '';
++  }
++  return first;
++}
++
++/** Escapes text for safe interpolation into HTML strings. */
++export function escapeHtml(value) {
++  return String(value)
++    .replace(/&/g, '&amp;')
++    .replace(/</g, '&lt;')
++    .replace(/>/g, '&gt;')
++    .replace(/"/g, '&quot;')
++    .replace(/'/g, '&#39;');
++}
++
++// --- Public Trusted Types policy --------------------------------------------
++export const htmlPolicy = window.trustedTypes
++  ? window.trustedTypes.createPolicy('daily-grind-html', {
++      createHTML: (input) => sanitizeHtml(input),
++      // This page never needs dynamic scripts or script URLs.
++      createScript: () => null,
++      createScriptURL: () => null,
++    })
++  : Object.freeze({ createHTML: (input) => sanitizeHtml(input) });
++
++/** Safely replaces the children of `el` with sanitized markup. */
++export function setSafeHTML(el, html) {
++  el.innerHTML = htmlPolicy.createHTML(html);
++}
+diff --git a/js/seasonal-favorites.js b/js/seasonal-favorites.js
+new file mode 100644
+index 0000000..2982ec9
+--- /dev/null
++++ b/js/seasonal-favorites.js
+@@ -0,0 +1,40 @@
++import { setSafeHTML, escapeHtml } from './safe-html.js';
++
++/*
++ * Seasonal Favorites card markup. These HTML strings are treated as
++ * untrusted (in production they may come from a CMS or API), so they are
++ * only ever inserted through the sanitizing Trusted Types policy.
++ */
++const seasonalFavorites = [
++  `<div class="card">
++     <h3>Maple Oat Latte</h3>
++     <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
++     <a href="/menu/seasonal" class="btn">View Details</a>
++   </div>`,
++  `<div class="card">
++     <h3>Dark Roast Espresso</h3>
++     <p>Bold, smokey, and perfect for a morning boost.</p>
++     <a href="/menu/espresso" class="btn">View Details</a>
++   </div>`,
++  `<div class="card">
++     <h3>Cold Brew</h3>
++     <p>Steeped for 18 hours for maximum smoothness.</p>
++     <a href="/menu/cold-brew" class="btn">View Details</a>
++   </div>`,
++];
++
++/** Helper for building a card from plain data; all fields are escaped. */
++export function cardHtml({ title, description, href }) {
++  return `<div class="card">
++    <h3>${escapeHtml(title)}</h3>
++    <p>${escapeHtml(description)}</p>
++    <a href="${escapeHtml(href)}" class="btn">View Details</a>
++  </div>`;
++}
++
++export function renderSeasonalFavorites(container, cards = seasonalFavorites) {
++  if (!container) return;
++  setSafeHTML(container, cards.join(''));
++}
++
++renderSeasonalFavorites(document.getElementById('seasonal-favorites'));

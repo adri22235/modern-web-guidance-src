@@ -1,0 +1,696 @@
+diff --git a/src/components/SignUpForm.tsx b/src/components/SignUpForm.tsx
+index 589fe62..f09c5a8 100644
+--- a/src/components/SignUpForm.tsx
++++ b/src/components/SignUpForm.tsx
+@@ -1,104 +1,370 @@
+-import React, { useState } from 'react';
++import React, { useCallback, useEffect, useRef, useState } from 'react';
++
++const CODE_LENGTH = 6;
++const API_BASE = `${import.meta.env.BASE_URL}api/phone`;
++
++type Step = 'details' | 'verify';
++
++// WebOTP API typings (not yet part of lib.dom.d.ts).
++interface OTPCredential extends Credential {
++  code: string;
++}
++type OTPCredentialRequestOptions = CredentialRequestOptions & {
++  otp: { transport: string[] };
++};
++
++async function postJson<T = any>(url: string, body: unknown): Promise<{ ok: boolean; data: T }> {
++  const response = await fetch(url, {
++    method: 'POST',
++    headers: { 'Content-Type': 'application/json' },
++    body: JSON.stringify(body),
++  });
++  let data: any = {};
++  try {
++    data = await response.json();
++  } catch {
++    /* non-JSON response */
++  }
++  return { ok: response.ok, data };
++}
++
++const inputClass =
++  'w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 aria-[invalid=true]:border-red-600';
++const buttonClass =
++  'w-full py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-gray-900 hover:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-900 disabled:opacity-75 disabled:cursor-not-allowed';
+ 
+ export default function SignUpForm() {
++  const [step, setStep] = useState<Step>('details');
+   const [username, setUsername] = useState('');
+   const [password, setPassword] = useState('');
++  const [phone, setPhone] = useState('');
++  const [verifiedPhone, setVerifiedPhone] = useState<string | null>(null);
++  const [maskedPhone, setMaskedPhone] = useState('');
++  const [code, setCode] = useState('');
++  const [resendIn, setResendIn] = useState(0);
++
+   const [error, setError] = useState<string | null>(null);
+   const [success, setSuccess] = useState<string | null>(null);
++  const [status, setStatus] = useState(''); // polite screen reader announcements
+   const [loading, setLoading] = useState(false);
+ 
+-  const handleSubmit = async (e: React.FormEvent) => {
+-    e.preventDefault();
++  const codeInputRef = useRef<HTMLInputElement>(null);
++  const phoneInputRef = useRef<HTMLInputElement>(null);
++  const webOtpAbort = useRef<AbortController | null>(null);
++  const submittingCode = useRef(false);
++
++  // Resend countdown.
++  useEffect(() => {
++    if (resendIn <= 0) return;
++    const id = window.setTimeout(() => setResendIn((s) => s - 1), 1000);
++    return () => window.clearTimeout(id);
++  }, [resendIn]);
++
++  // Abort any pending WebOTP request when unmounting.
++  useEffect(() => () => webOtpAbort.current?.abort(), []);
++
++  const stopWebOtp = () => {
++    webOtpAbort.current?.abort();
++    webOtpAbort.current = null;
++  };
++
++  const register = async (verified: string) => {
++    const { ok, data } = await postJson(
++      'https://us-central1-web-devrel-apps.cloudfunctions.net/times_cdn/api/register',
++      { username, password, phone: verified },
++    );
++    if (!ok) {
++      // TODO: Handle specific error codes (APP_ERR_1001, APP_ERR_1002, etc.) properly.
++      setError(`Registration failed: ${data.error || 'Unknown error'}`);
++      return false;
++    }
++    setSuccess('User registered successfully! You can now sign in.');
++    setUsername('');
++    setPassword('');
++    setPhone('');
++    setCode('');
++    setVerifiedPhone(null);
++    setStep('details');
++    return true;
++  };
++
++  const verifyCode = useCallback(
++    async (value: string) => {
++      if (submittingCode.current) return;
++      if (value.length !== CODE_LENGTH) {
++        setError(`Enter the ${CODE_LENGTH}-digit code we sent you.`);
++        codeInputRef.current?.focus();
++        return;
++      }
++      submittingCode.current = true;
++      setError(null);
++      setLoading(true);
++      setStatus('Verifying code…');
++      try {
++        const { ok, data } = await postJson(`${API_BASE}/verify-code`, { code: value });
++        if (!ok) {
++          setError(data.error || 'Verification failed. Please try again.');
++          setCode('');
++          if (data.expired) setResendIn(0);
++          codeInputRef.current?.focus();
++          return;
++        }
++        stopWebOtp();
++        setVerifiedPhone(data.phone);
++        setStatus('Phone number verified. Creating your account…');
++        await register(data.phone);
++      } catch {
++        setError('An unexpected error occurred. Please try again later.');
++      } finally {
++        submittingCode.current = false;
++        setLoading(false);
++      }
++    },
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++    [username, password],
++  );
++
++  // Ask the browser to read the incoming SMS (WebOTP API, Chrome on Android).
++  // iOS/macOS Safari surface the code via autocomplete="one-time-code" instead.
++  const listenForSms = useCallback(() => {
++    stopWebOtp();
++    if (typeof window === 'undefined' || !('OTPCredential' in window)) return;
++    const controller = new AbortController();
++    webOtpAbort.current = controller;
++    navigator.credentials
++      .get({ otp: { transport: ['sms'] }, signal: controller.signal } as OTPCredentialRequestOptions)
++      .then((credential) => {
++        const otp = (credential as OTPCredential | null)?.code;
++        if (!otp) return;
++        const digits = otp.replace(/\D/g, '').slice(0, CODE_LENGTH);
++        setCode(digits);
++        setStatus('Verification code filled in automatically from your text message.');
++        void verifyCode(digits);
++      })
++      .catch(() => {
++        /* aborted, denied, or timed out — the user can still type the code */
++      });
++  }, [verifyCode]);
++
++  const sendCode = async () => {
+     setError(null);
+     setSuccess(null);
+     setLoading(true);
+-
+     try {
+-      const response = await fetch('https://us-central1-web-devrel-apps.cloudfunctions.net/times_cdn/api/register', {
+-        method: 'POST',
+-        headers: {
+-          'Content-Type': 'application/json',
+-        },
+-        body: JSON.stringify({ username, password }),
+-      });
+-
+-      const data = await response.json();
+-
+-      if (!response.ok) {
+-        // TODO: Handle specific error codes (APP_ERR_1001, APP_ERR_1002, etc.) properly.
+-        // For now, we display a generic error message including the code.
+-        setError(`Registration failed: ${data.error || 'Unknown error'}`);
+-      } else {
+-        setSuccess('User registered successfully! You can now sign in.');
+-        setUsername('');
+-        setPassword('');
++      const { ok, data } = await postJson(`${API_BASE}/send-code`, { phone });
++      if (!ok) {
++        setError(data.error || 'We could not send a verification code.');
++        if (data.retryAfter) setResendIn(data.retryAfter);
++        if (step === 'details') phoneInputRef.current?.focus();
++        return;
+       }
+-    } catch (err) {
++      setMaskedPhone(data.maskedPhone);
++      setResendIn(data.resendAfter ?? 30);
++      setCode('');
++      setStep('verify');
++      setStatus(`We texted a ${CODE_LENGTH}-digit code to ${data.maskedPhone}.`);
++      listenForSms();
++    } catch {
+       setError('An unexpected error occurred. Please try again later.');
+     } finally {
+       setLoading(false);
+     }
+   };
+ 
++  // Move focus to the code field when the verify step appears.
++  useEffect(() => {
++    if (step === 'verify') codeInputRef.current?.focus();
++  }, [step]);
++
++  const handleDetailsSubmit = (e: React.FormEvent) => {
++    e.preventDefault();
++    if (verifiedPhone) {
++      setLoading(true);
++      setError(null);
++      register(verifiedPhone)
++        .catch(() => setError('An unexpected error occurred. Please try again later.'))
++        .finally(() => setLoading(false));
++      return;
++    }
++    void sendCode();
++  };
++
++  const handleCodeChange = (e: React.ChangeEvent<HTMLInputElement>) => {
++    // Accept pasted values like "123 456" or "123-456".
++    const digits = e.target.value.replace(/\D/g, '').slice(0, CODE_LENGTH);
++    setCode(digits);
++    if (error) setError(null);
++    // Auto-submit once complete (covers manual typing, paste and OS autofill).
++    if (digits.length === CODE_LENGTH) void verifyCode(digits);
++  };
++
++  const handleChangeNumber = () => {
++    stopWebOtp();
++    setStep('details');
++    setCode('');
++    setError(null);
++    setStatus('');
++    window.setTimeout(() => phoneInputRef.current?.focus(), 0);
++  };
++
++  const errorId = 'signup-error';
++
+   return (
+     <div className="max-w-md mx-auto mt-10 p-6 bg-white border border-gray-200 rounded-lg shadow-sm">
+-      <h2 className="text-2xl font-bold mb-6 text-center text-gray-800">Sign Up</h2>
+-      
++      <h2 className="text-2xl font-bold mb-2 text-center text-gray-800">Sign Up</h2>
++      <p className="text-sm text-center text-gray-500 mb-6" aria-hidden="true">
++        Step {step === 'details' ? 1 : 2} of 2
++      </p>
++
++      <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
++        {status}
++      </div>
++
+       {error && (
+-        <div className="mb-4 p-3 text-sm text-red-700 bg-red-100 rounded-lg" role="alert">
++        <div id={errorId} className="mb-4 p-3 text-sm text-red-700 bg-red-100 rounded-lg" role="alert">
+           {error}
+         </div>
+       )}
+-      
++
+       {success && (
+         <div className="mb-4 p-3 text-sm text-green-700 bg-green-100 rounded-lg" role="alert">
+           {success}
+         </div>
+       )}
+ 
+-      <form onSubmit={handleSubmit} className="space-y-4">
+-        <div>
+-          <label htmlFor="username" className="block text-sm font-medium text-gray-700 mb-1">
+-            Username
+-          </label>
+-          <input
+-            type="text"
+-            id="username"
+-            value={username}
+-            onChange={(e) => setUsername(e.target.value)}
+-            required
+-            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+-          />
+-        </div>
+-        
+-        <div>
+-          <label htmlFor="password" className="block text-sm font-medium text-gray-700 mb-1">
+-            Password
+-          </label>
+-          <input
+-            type="password"
+-            id="password"
+-            value={password}
+-            onChange={(e) => setPassword(e.target.value)}
+-            required
+-            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+-          />
+-          <p className="text-xs text-gray-500 mt-1">
+-             Must be at least 8 characters and contain a number.
+-          </p>
+-        </div>
++      {step === 'details' ? (
++        <form onSubmit={handleDetailsSubmit} className="space-y-4" aria-label="Account details, step 1 of 2">
++          <div>
++            <label htmlFor="username" className="block text-sm font-medium text-gray-700 mb-1">
++              Username
++            </label>
++            <input
++              type="text"
++              id="username"
++              name="username"
++              autoComplete="username"
++              value={username}
++              onChange={(e) => setUsername(e.target.value)}
++              required
++              className={inputClass}
++            />
++          </div>
++
++          <div>
++            <label htmlFor="password" className="block text-sm font-medium text-gray-700 mb-1">
++              Password
++            </label>
++            <input
++              type="password"
++              id="password"
++              name="password"
++              autoComplete="new-password"
++              value={password}
++              onChange={(e) => setPassword(e.target.value)}
++              required
++              aria-describedby="password-hint"
++              className={inputClass}
++            />
++            <p id="password-hint" className="text-xs text-gray-500 mt-1">
++              Must be at least 8 characters and contain a number.
++            </p>
++          </div>
+ 
+-        <button
+-          type="submit"
+-          disabled={loading}
+-          data-skip-tracking="true"
+-          className={`w-full py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-gray-900 hover:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-900 ${
+-            loading ? 'opacity-75 cursor-not-allowed' : ''
+-          }`}
++          <div>
++            <label htmlFor="phone" className="block text-sm font-medium text-gray-700 mb-1">
++              Mobile phone number
++            </label>
++            <input
++              ref={phoneInputRef}
++              type="tel"
++              id="phone"
++              name="phone"
++              autoComplete="tel"
++              inputMode="tel"
++              placeholder="+1 415 555 0123"
++              value={phone}
++              onChange={(e) => {
++                setPhone(e.target.value);
++                setVerifiedPhone(null);
++              }}
++              required
++              aria-describedby={`phone-hint${error ? ` ${errorId}` : ''}`}
++              aria-invalid={!!error && step === 'details' ? true : undefined}
++              className={inputClass}
++            />
++            <p id="phone-hint" className="text-xs text-gray-500 mt-1">
++              {verifiedPhone
++                ? 'Verified ✓'
++                : "Include your country code. We'll text you a code to confirm it's yours. Message and data rates may apply."}
++            </p>
++          </div>
++
++          <button type="submit" disabled={loading} data-skip-tracking="true" className={buttonClass}>
++            {loading ? (verifiedPhone ? 'Signing up…' : 'Sending code…') : verifiedPhone ? 'Sign Up' : 'Continue'}
++          </button>
++        </form>
++      ) : (
++        <form
++          onSubmit={(e) => {
++            e.preventDefault();
++            void verifyCode(code);
++          }}
++          className="space-y-4"
++          aria-label="Verify phone number, step 2 of 2"
+         >
+-          {loading ? 'Signing up...' : 'Sign Up'}
+-        </button>
+-      </form>
++          <p id="otp-instructions" className="text-sm text-gray-700">
++            Enter the {CODE_LENGTH}-digit code we sent to <span className="font-medium">{maskedPhone}</span>. It
++            expires in 5 minutes.
++          </p>
++
++          <div>
++            <label htmlFor="otp" className="block text-sm font-medium text-gray-700 mb-1">
++              Verification code
++            </label>
++            <input
++              ref={codeInputRef}
++              type="text"
++              id="otp"
++              name="otp"
++              inputMode="numeric"
++              autoComplete="one-time-code"
++              pattern={`\\d{${CODE_LENGTH}}`}
++              maxLength={CODE_LENGTH + 2 /* tolerate a separator while pasting */}
++              value={code}
++              onChange={handleCodeChange}
++              required
++              readOnly={loading}
++              aria-busy={loading}
++              aria-describedby={`otp-instructions${error ? ` ${errorId}` : ''}`}
++              aria-invalid={error ? true : undefined}
++              className={`${inputClass} text-center text-2xl tracking-[0.5em] font-mono`}
++            />
++          </div>
++
++          <button type="submit" disabled={loading || code.length !== CODE_LENGTH} data-skip-tracking="true" className={buttonClass}>
++            {loading ? 'Verifying…' : 'Verify and Sign Up'}
++          </button>
++
++          <div className="flex items-center justify-between text-sm">
++            <button
++              type="button"
++              onClick={handleChangeNumber}
++              className="text-blue-700 underline hover:text-blue-900 focus:outline-none focus:ring-2 focus:ring-blue-500 rounded"
++            >
++              Change number
++            </button>
++            <button
++              type="button"
++              onClick={() => void sendCode()}
++              disabled={loading || resendIn > 0}
++              aria-disabled={loading || resendIn > 0}
++              className="text-blue-700 underline hover:text-blue-900 disabled:text-gray-500 disabled:no-underline disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-blue-500 rounded"
++            >
++              {resendIn > 0 ? `Resend code in ${resendIn}s` : 'Resend code'}
++            </button>
++          </div>
++        </form>
++      )}
+     </div>
+   );
+ }
+diff --git a/src/lib/phoneVerification.ts b/src/lib/phoneVerification.ts
+new file mode 100644
+index 0000000..c426793
+--- /dev/null
++++ b/src/lib/phoneVerification.ts
+@@ -0,0 +1,112 @@
++import { createHash, randomInt, timingSafeEqual } from 'node:crypto';
++
++/** How long a one-time passcode stays valid. */
++export const CODE_TTL_MS = 5 * 60 * 1000;
++/** Minimum delay between two SMS sends to the same session. */
++export const RESEND_COOLDOWN_MS = 30 * 1000;
++/** Maximum wrong guesses before the code is invalidated. */
++export const MAX_ATTEMPTS = 5;
++export const CODE_LENGTH = 6;
++
++export interface PendingVerification {
++  phone: string;
++  codeHash: string;
++  expiresAt: number;
++  sentAt: number;
++  attempts: number;
++}
++
++export const SESSION_KEY_PENDING = 'phoneVerificationPending';
++export const SESSION_KEY_VERIFIED = 'phoneVerified';
++
++/**
++ * Normalise user input into E.164 format (e.g. "+14155550123").
++ * Accepts spaces, dashes, dots and parentheses. Numbers without a leading "+"
++ * are assumed to be North American (country code 1) when they have 10 digits.
++ * Returns null if the number cannot be interpreted.
++ */
++export function normalizePhone(input: unknown): string | null {
++  if (typeof input !== 'string') return null;
++  const trimmed = input.trim();
++  if (!/^\+?[\d\s().-]+$/.test(trimmed)) return null;
++  let digits = trimmed.replace(/\D/g, '');
++  if (trimmed.startsWith('+')) {
++    // already international
++  } else if (trimmed.startsWith('00')) {
++    digits = digits.slice(2);
++  } else if (digits.length === 10) {
++    digits = `1${digits}`;
++  } else if (!(digits.length === 11 && digits.startsWith('1'))) {
++    return null;
++  }
++  // E.164: max 15 digits, country code cannot start with 0.
++  if (digits.length < 8 || digits.length > 15 || digits.startsWith('0')) return null;
++  return `+${digits}`;
++}
++
++export function maskPhone(phone: string): string {
++  return phone.length <= 4 ? phone : `${phone.slice(0, 2)}${'•'.repeat(phone.length - 4)}${phone.slice(-2)}`;
++}
++
++export function generateCode(): string {
++  return randomInt(0, 10 ** CODE_LENGTH).toString().padStart(CODE_LENGTH, '0');
++}
++
++function secret(): string {
++  return import.meta.env.OTP_SECRET ?? process.env.OTP_SECRET ?? 'devtools-times-otp';
++}
++
++export function hashCode(phone: string, code: string): string {
++  return createHash('sha256').update(`${secret()}:${phone}:${code}`).digest('hex');
++}
++
++export function codeMatches(pending: PendingVerification, code: string): boolean {
++  const a = Buffer.from(hashCode(pending.phone, code), 'hex');
++  const b = Buffer.from(pending.codeHash, 'hex');
++  return a.length === b.length && timingSafeEqual(a, b);
++}
++
++/**
++ * Build the SMS body. The final line follows the WebOTP "origin-bound one-time
++ * code" format (`@domain #code`) so supporting browsers (Chrome on Android,
++ * Safari on iOS/macOS) can extract and autofill the code automatically.
++ */
++export function buildSmsBody(code: string, host: string): string {
++  return `${code} is your DevTools Times verification code. It expires in ${CODE_TTL_MS / 60000} minutes.\n\n@${host} #${code}`;
++}
++
++/**
++ * Deliver an SMS. Uses Twilio when TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN and
++ * TWILIO_FROM_NUMBER are configured; otherwise logs the message to the server
++ * console (development fallback).
++ */
++export async function sendSms(to: string, body: string): Promise<void> {
++  const env = (name: string) => import.meta.env[name] ?? process.env[name];
++  const sid = env('TWILIO_ACCOUNT_SID');
++  const token = env('TWILIO_AUTH_TOKEN');
++  const from = env('TWILIO_FROM_NUMBER');
++
++  if (!sid || !token || !from) {
++    console.info(`[sms:dev] to=${to}\n${body}`);
++    return;
++  }
++
++  const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`, {
++    method: 'POST',
++    headers: {
++      Authorization: `Basic ${Buffer.from(`${sid}:${token}`).toString('base64')}`,
++      'Content-Type': 'application/x-www-form-urlencoded',
++    },
++    body: new URLSearchParams({ To: to, From: from, Body: body }),
++  });
++  if (!res.ok) {
++    throw new Error(`SMS provider responded with ${res.status}`);
++  }
++}
++
++export function json(data: unknown, status = 200, headers: Record<string, string> = {}): Response {
++  return new Response(JSON.stringify(data), {
++    status,
++    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...headers },
++  });
++}
+diff --git a/src/pages/api/phone/send-code.ts b/src/pages/api/phone/send-code.ts
+new file mode 100644
+index 0000000..839bc75
+--- /dev/null
++++ b/src/pages/api/phone/send-code.ts
+@@ -0,0 +1,68 @@
++import type { APIRoute } from 'astro';
++import {
++  CODE_TTL_MS,
++  RESEND_COOLDOWN_MS,
++  SESSION_KEY_PENDING,
++  SESSION_KEY_VERIFIED,
++  buildSmsBody,
++  generateCode,
++  hashCode,
++  json,
++  maskPhone,
++  normalizePhone,
++  sendSms,
++  type PendingVerification,
++} from '../../../lib/phoneVerification';
++
++export const POST: APIRoute = async ({ request, session, url }) => {
++  if (!session) return json({ error: 'Sessions are unavailable.' }, 500);
++
++  let body: { phone?: unknown };
++  try {
++    body = await request.json();
++  } catch {
++    return json({ error: 'Invalid request body.' }, 400);
++  }
++
++  const phone = normalizePhone(body.phone);
++  if (!phone) {
++    return json({ error: 'Enter a valid phone number, including the country code (e.g. +1 415 555 0123).' }, 400);
++  }
++
++  const now = Date.now();
++  const existing = (await session.get(SESSION_KEY_PENDING)) as PendingVerification | undefined;
++  if (existing && now - existing.sentAt < RESEND_COOLDOWN_MS) {
++    const retryAfter = Math.ceil((RESEND_COOLDOWN_MS - (now - existing.sentAt)) / 1000);
++    return json(
++      { error: `Please wait ${retryAfter} seconds before requesting a new code.`, retryAfter },
++      429,
++      { 'Retry-After': String(retryAfter) },
++    );
++  }
++
++  const code = generateCode();
++  const pending: PendingVerification = {
++    phone,
++    codeHash: hashCode(phone, code),
++    expiresAt: now + CODE_TTL_MS,
++    sentAt: now,
++    attempts: 0,
++  };
++
++  try {
++    await sendSms(phone, buildSmsBody(code, url.host));
++  } catch (err) {
++    console.error('Failed to send verification SMS', err);
++    return json({ error: 'We could not send a text message to that number. Please try again.' }, 502);
++  }
++
++  await session.set(SESSION_KEY_PENDING, pending);
++  session.delete(SESSION_KEY_VERIFIED);
++
++  return json({
++    phone,
++    maskedPhone: maskPhone(phone),
++    expiresIn: CODE_TTL_MS / 1000,
++    resendAfter: RESEND_COOLDOWN_MS / 1000,
++  });
++};
+diff --git a/src/pages/api/phone/verify-code.ts b/src/pages/api/phone/verify-code.ts
+new file mode 100644
+index 0000000..7e3253c
+--- /dev/null
++++ b/src/pages/api/phone/verify-code.ts
+@@ -0,0 +1,55 @@
++import type { APIRoute } from 'astro';
++import {
++  CODE_LENGTH,
++  MAX_ATTEMPTS,
++  SESSION_KEY_PENDING,
++  SESSION_KEY_VERIFIED,
++  codeMatches,
++  json,
++  type PendingVerification,
++} from '../../../lib/phoneVerification';
++
++export const POST: APIRoute = async ({ request, session }) => {
++  if (!session) return json({ error: 'Sessions are unavailable.' }, 500);
++
++  let body: { code?: unknown };
++  try {
++    body = await request.json();
++  } catch {
++    return json({ error: 'Invalid request body.' }, 400);
++  }
++
++  const code = typeof body.code === 'string' ? body.code.replace(/\D/g, '') : '';
++  if (code.length !== CODE_LENGTH) {
++    return json({ error: `Enter the ${CODE_LENGTH}-digit code we sent you.` }, 400);
++  }
++
++  const pending = (await session.get(SESSION_KEY_PENDING)) as PendingVerification | undefined;
++  if (!pending) {
++    return json({ error: 'No verification in progress. Please request a new code.', expired: true }, 400);
++  }
++
++  if (Date.now() > pending.expiresAt) {
++    session.delete(SESSION_KEY_PENDING);
++    return json({ error: 'This code has expired. Please request a new one.', expired: true }, 400);
++  }
++
++  if (!codeMatches(pending, code)) {
++    pending.attempts += 1;
++    if (pending.attempts >= MAX_ATTEMPTS) {
++      session.delete(SESSION_KEY_PENDING);
++      return json({ error: 'Too many incorrect attempts. Please request a new code.', expired: true }, 429);
++    }
++    await session.set(SESSION_KEY_PENDING, pending);
++    const remaining = MAX_ATTEMPTS - pending.attempts;
++    return json(
++      { error: `That code is incorrect. ${remaining} attempt${remaining === 1 ? '' : 's'} remaining.`, attemptsRemaining: remaining },
++      400,
++    );
++  }
++
++  session.delete(SESSION_KEY_PENDING);
++  await session.set(SESSION_KEY_VERIFIED, { phone: pending.phone, verifiedAt: Date.now() });
++
++  return json({ verified: true, phone: pending.phone });
++};

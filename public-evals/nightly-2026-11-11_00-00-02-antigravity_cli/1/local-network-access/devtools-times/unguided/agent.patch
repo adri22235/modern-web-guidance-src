@@ -1,0 +1,808 @@
+diff --git a/global.d.ts b/global.d.ts
+index 22f7b64..9753a55 100644
+--- a/global.d.ts
++++ b/global.d.ts
+@@ -2,6 +2,16 @@ declare global {
+   interface Window {
+     adNetwork: any; // Replace 'any' with a more specific type if you know it
+   }
++
++  type TargetAddressSpace = 'local' | 'loopback' | 'public' | 'unknown';
++
++  interface RequestInit {
++    targetAddressSpace?: TargetAddressSpace;
++  }
++
++  interface Request {
++    readonly targetAddressSpace?: TargetAddressSpace;
++  }
+ }
+ 
+ export {};
+\ No newline at end of file
+diff --git a/src/components/DiagnosticsWidget.tsx b/src/components/DiagnosticsWidget.tsx
+new file mode 100644
+index 0000000..7adc2d2
+--- /dev/null
++++ b/src/components/DiagnosticsWidget.tsx
+@@ -0,0 +1,721 @@
++import React, { useState, useEffect, useCallback } from 'react';
++
++export type AddressSpaceType = 'local' | 'loopback';
++export type ConnectionState = 'idle' | 'connecting' | 'connected' | 'error';
++export type PermissionStateValue = PermissionState | 'unsupported' | 'checking';
++
++interface EndpointStatus {
++  state: ConnectionState;
++  latencyMs: number | null;
++  statusCode: number | null;
++  payload: string | null;
++  errorMessage: string | null;
++  lastChecked: string | null;
++  permissionName: string;
++  permissionState: PermissionStateValue;
++}
++
++interface LogEntry {
++  id: string;
++  timestamp: string;
++  target: 'Hardware Test Device (LAN)' | 'Local Companion CLI (Loopback)' | 'Permissions API';
++  url: string;
++  addressSpace: AddressSpaceType;
++  status: 'info' | 'success' | 'error';
++  message: string;
++}
++
++function normalizeEndpointUrl(input: string, defaultProtocol = 'http://'): string {
++  const trimmed = input.trim();
++  if (!trimmed) return '';
++  if (/^https?:\/\//i.test(trimmed)) {
++    return trimmed;
++  }
++  return `${defaultProtocol}${trimmed}`;
++}
++
++async function queryNetworkPermission(
++  candidates: string[]
++): Promise<{ name: string; state: PermissionStateValue; statusObj: PermissionStatus | null }> {
++  if (typeof navigator === 'undefined' || !navigator.permissions?.query) {
++    return { name: candidates[0], state: 'unsupported', statusObj: null };
++  }
++
++  for (const name of candidates) {
++    try {
++      const statusObj = await navigator.permissions.query({
++        name: name as PermissionName,
++      });
++      return { name, state: statusObj.state, statusObj };
++    } catch {
++      // Try next fallback permission name
++    }
++  }
++
++  return { name: candidates[0], state: 'unsupported', statusObj: null };
++}
++
++interface DiagnosticsWidgetProps {
++  compact?: boolean;
++}
++
++export default function DiagnosticsWidget({ compact = false }: DiagnosticsWidgetProps) {
++  const [lanUrl, setLanUrl] = useState('http://192.168.1.100:8080/diagnostics');
++  const [cliUrl, setCliUrl] = useState('http://127.0.0.1:9229/diagnostics');
++  const [showGuide, setShowGuide] = useState(false);
++
++  const [lanStatus, setLanStatus] = useState<EndpointStatus>({
++    state: 'idle',
++    latencyMs: null,
++    statusCode: null,
++    payload: null,
++    errorMessage: null,
++    lastChecked: null,
++    permissionName: 'local-network',
++    permissionState: 'checking',
++  });
++
++  const [cliStatus, setCliStatus] = useState<EndpointStatus>({
++    state: 'idle',
++    latencyMs: null,
++    statusCode: null,
++    payload: null,
++    errorMessage: null,
++    lastChecked: null,
++    permissionName: 'loopback-network',
++    permissionState: 'checking',
++  });
++
++  const [logs, setLogs] = useState<LogEntry[]>([]);
++
++  const appendLog = useCallback((entry: Omit<LogEntry, 'id' | 'timestamp'>) => {
++    const now = new Date().toLocaleTimeString();
++    setLogs((prev) => [
++      {
++        ...entry,
++        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
++        timestamp: now,
++      },
++      ...prev.slice(0, 19),
++    ]);
++  }, []);
++
++  const refreshPermissions = useCallback(async () => {
++    // Check LAN permission ('local-network' with fallback to 'local-network-access')
++    const lanPerm = await queryNetworkPermission(['local-network', 'local-network-access']);
++    setLanStatus((prev) => ({
++      ...prev,
++      permissionName: lanPerm.name,
++      permissionState: lanPerm.state,
++    }));
++    if (lanPerm.statusObj) {
++      lanPerm.statusObj.onchange = () => {
++        setLanStatus((prev) => ({
++          ...prev,
++          permissionState: lanPerm.statusObj ? lanPerm.statusObj.state : prev.permissionState,
++        }));
++      };
++    }
++
++    // Check Loopback CLI permission ('loopback-network' with fallback to 'local-network-access')
++    const cliPerm = await queryNetworkPermission(['loopback-network', 'local-network-access']);
++    setCliStatus((prev) => ({
++      ...prev,
++      permissionName: cliPerm.name,
++      permissionState: cliPerm.state,
++    }));
++    if (cliPerm.statusObj) {
++      cliPerm.statusObj.onchange = () => {
++        setCliStatus((prev) => ({
++          ...prev,
++          permissionState: cliPerm.statusObj ? cliPerm.statusObj.state : prev.permissionState,
++        }));
++      };
++    }
++
++    return { lanPerm, cliPerm };
++  }, []);
++
++  useEffect(() => {
++    refreshPermissions();
++  }, [refreshPermissions]);
++
++  const connectToEndpoint = useCallback(
++    async (addressSpace: AddressSpaceType, rawUrl: string) => {
++      const isLan = addressSpace === 'local';
++      const targetLabel = isLan
++        ? 'Hardware Test Device (LAN)'
++        : 'Local Companion CLI (Loopback)';
++      const setStatus = isLan ? setLanStatus : setCliStatus;
++      const url = normalizeEndpointUrl(rawUrl);
++
++      if (!url) {
++        setStatus((prev) => ({
++          ...prev,
++          state: 'error',
++          errorMessage: 'Please enter a valid endpoint URL or IP address.',
++        }));
++        return;
++      }
++
++      setStatus((prev) => ({
++        ...prev,
++        state: 'connecting',
++        errorMessage: null,
++        statusCode: null,
++      }));
++
++      appendLog({
++        target: targetLabel,
++        url,
++        addressSpace,
++        status: 'info',
++        message: `Initiating fetch("${url}", { targetAddressSpace: "${addressSpace}" })`,
++      });
++
++      const controller = new AbortController();
++      const timeoutId = window.setTimeout(() => controller.abort(), 5000);
++      const startTime = performance.now();
++
++      try {
++        const requestInit: RequestInit = {
++          method: 'GET',
++          mode: 'cors',
++          targetAddressSpace: addressSpace,
++          headers: {
++            Accept: 'application/json, text/plain, */*',
++          },
++          signal: controller.signal,
++        };
++
++        const response = await fetch(url, requestInit);
++        window.clearTimeout(timeoutId);
++
++        const latencyMs = Math.round(performance.now() - startTime);
++        const rawText = await response.text();
++        let formattedPayload = rawText;
++
++        try {
++          const parsed = JSON.parse(rawText);
++          formattedPayload = JSON.stringify(parsed, null, 2);
++        } catch {
++          // Keep plain text payload if not JSON
++        }
++
++        await refreshPermissions();
++
++        if (!response.ok) {
++          const errText = `HTTP ${response.status} ${response.statusText || ''}`.trim();
++          setStatus((prev) => ({
++            ...prev,
++            state: 'error',
++            latencyMs,
++            statusCode: response.status,
++            payload: formattedPayload || null,
++            errorMessage: `Endpoint responded with ${errText}`,
++            lastChecked: new Date().toLocaleTimeString(),
++          }));
++
++          appendLog({
++            target: targetLabel,
++            url,
++            addressSpace,
++            status: 'error',
++            message: `${errText} (${latencyMs}ms)`,
++          });
++          return;
++        }
++
++        setStatus((prev) => ({
++          ...prev,
++          state: 'connected',
++          latencyMs,
++          statusCode: response.status,
++          payload: formattedPayload || '{"status":"ok"}',
++          errorMessage: null,
++          lastChecked: new Date().toLocaleTimeString(),
++        }));
++
++        appendLog({
++          target: targetLabel,
++          url,
++          addressSpace,
++          status: 'success',
++          message: `Connected via targetAddressSpace: "${addressSpace}" (${latencyMs}ms)`,
++        });
++      } catch (err: unknown) {
++        window.clearTimeout(timeoutId);
++        const latencyMs = Math.round(performance.now() - startTime);
++        const perms = await refreshPermissions();
++        const currentPerm = isLan ? perms.lanPerm : perms.cliPerm;
++
++        const isAborted = err instanceof DOMException && err.name === 'AbortError';
++        let diagnosticHint = '';
++
++        if (currentPerm.state === 'denied') {
++          diagnosticHint = `Browser permission "${currentPerm.name}" was denied. Allow Local Network Access in your browser address bar settings.`;
++        } else if (isAborted) {
++          diagnosticHint = `Connection timed out after 5s. Verify that the ${
++            isLan ? 'LAN hardware device (192.168.1.x)' : 'local companion CLI (127.0.0.1)'
++          } is running and reachable.`;
++        } else {
++          diagnosticHint = `Failed to reach ${url} (targetAddressSpace: "${addressSpace}"). Ensure the service is running, Local Network Access permission is granted, and CORS headers are enabled.`;
++        }
++
++        setStatus((prev) => ({
++          ...prev,
++          state: 'error',
++          latencyMs,
++          statusCode: null,
++          errorMessage: diagnosticHint,
++          lastChecked: new Date().toLocaleTimeString(),
++        }));
++
++        appendLog({
++          target: targetLabel,
++          url,
++          addressSpace,
++          status: 'error',
++          message: diagnosticHint,
++        });
++      }
++    },
++    [appendLog, refreshPermissions]
++  );
++
++  const connectBoth = useCallback(async () => {
++    await Promise.allSettled([
++      connectToEndpoint('local', lanUrl),
++      connectToEndpoint('loopback', cliUrl),
++    ]);
++  }, [connectToEndpoint, lanUrl, cliUrl]);
++
++  const renderPermissionBadge = (name: string, state: PermissionStateValue) => {
++    const styles: Record<PermissionStateValue, string> = {
++      granted: 'bg-emerald-100 text-emerald-800 border-emerald-300',
++      prompt: 'bg-amber-100 text-amber-800 border-amber-300',
++      denied: 'bg-red-100 text-red-800 border-red-300',
++      unsupported: 'bg-gray-100 text-gray-700 border-gray-300',
++      checking: 'bg-blue-50 text-blue-700 border-blue-200',
++    };
++
++    return (
++      <span
++        className={`inline-flex items-center gap-1.5 text-xs font-mono px-2 py-0.5 rounded border ${styles[state]}`}
++        title={`Permissions API status for "${name}"`}
++      >
++        <span
++          className={`w-1.5 h-1.5 rounded-full ${
++            state === 'granted'
++              ? 'bg-emerald-600'
++              : state === 'prompt'
++              ? 'bg-amber-500'
++              : state === 'denied'
++              ? 'bg-red-600'
++              : 'bg-gray-400'
++          }`}
++        />
++        {name}: {state}
++      </span>
++    );
++  };
++
++  const renderConnectionBadge = (state: ConnectionState, latencyMs: number | null) => {
++    switch (state) {
++      case 'connected':
++        return (
++          <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-0.5 rounded-full">
++            <span className="w-2 h-2 rounded-full bg-emerald-500" />
++            Connected {latencyMs !== null ? `(${latencyMs}ms)` : ''}
++          </span>
++        );
++      case 'connecting':
++        return (
++          <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-2.5 py-0.5 rounded-full">
++            <span className="w-2 h-2 rounded-full bg-amber-500 animate-ping" />
++            Connecting...
++          </span>
++        );
++      case 'error':
++        return (
++          <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-red-700 bg-red-50 border border-red-200 px-2.5 py-0.5 rounded-full">
++            <span className="w-2 h-2 rounded-full bg-red-500" />
++            Unreachable / Blocked
++          </span>
++        );
++      default:
++        return (
++          <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-gray-600 bg-gray-100 border border-gray-200 px-2.5 py-0.5 rounded-full">
++            <span className="w-2 h-2 rounded-full bg-gray-400" />
++            Disconnected
++          </span>
++        );
++    }
++  };
++
++  return (
++    <section
++      id="developer-diagnostics-widget"
++      data-testid="developer-diagnostics-widget"
++      aria-label="Developer Diagnostics Connection Widget"
++      className={`bg-slate-900 text-slate-100 border-y border-slate-700 ${
++        compact ? 'p-4 rounded-lg shadow-xl' : 'py-5 px-4 sm:px-6 lg:px-8'
++      }`}
++    >
++      <div className="max-w-6xl mx-auto">
++        {/* Header Bar */}
++        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 pb-4 border-b border-slate-800">
++          <div>
++            <div className="flex items-center gap-2.5">
++              <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-bold uppercase tracking-wider bg-amber-400 text-slate-950">
++                DevTools Lab
++              </span>
++              <h2 className="text-base sm:text-lg font-bold tracking-tight text-white">
++                Developer Diagnostics Connection Hub
++              </h2>
++            </div>
++            <p className="text-xs sm:text-sm text-slate-400 mt-1">
++              Connect directly from your browser to a private Wi-Fi LAN hardware test device (
++              <code className="text-amber-300 font-mono">192.168.1.x</code>,{' '}
++              <code className="text-amber-300 font-mono">targetAddressSpace: &quot;local&quot;</code>) and your
++              local companion CLI (<code className="text-amber-300 font-mono">127.0.0.1</code>,{' '}
++              <code className="text-amber-300 font-mono">targetAddressSpace: &quot;loopback&quot;</code>).
++            </p>
++          </div>
++
++          <div className="flex flex-wrap items-center gap-2">
++            <button
++              type="button"
++              onClick={connectBoth}
++              data-testid="connect-both-button"
++              disabled={lanStatus.state === 'connecting' || cliStatus.state === 'connecting'}
++              className="bg-amber-400 hover:bg-amber-300 disabled:opacity-60 text-slate-950 font-semibold text-xs px-3.5 py-2 rounded transition cursor-pointer"
++            >
++              Connect Both Endpoints
++            </button>
++            <button
++              type="button"
++              onClick={() => refreshPermissions()}
++              data-testid="refresh-permissions-button"
++              className="bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-medium text-xs px-3 py-2 rounded transition cursor-pointer"
++            >
++              Check LNA Permissions
++            </button>
++            <button
++              type="button"
++              onClick={() => setShowGuide((prev) => !prev)}
++              className="bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 font-medium text-xs px-3 py-2 rounded transition cursor-pointer"
++            >
++              {showGuide ? 'Hide LNA Guide' : 'LNA & CORS Guide'}
++            </button>
++          </div>
++        </div>
++
++        {/* Dual Connection Cards */}
++        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 mt-4">
++          {/* Card 1: Hardware Test Device on Private Wi-Fi LAN (192.168.1.x) */}
++          <div
++            data-testid="lan-device-card"
++            className="bg-slate-800/90 border border-slate-700 rounded-lg p-4 flex flex-col justify-between"
++          >
++            <div>
++              <div className="flex flex-wrap items-start justify-between gap-2 mb-2">
++                <div>
++                  <span className="text-[11px] font-mono uppercase tracking-wider text-amber-400 block">
++                    Private Wi-Fi LAN • targetAddressSpace: &quot;local&quot;
++                  </span>
++                  <h3 className="text-sm sm:text-base font-bold text-white">
++                    Hardware Test Device (192.168.1.x)
++                  </h3>
++                </div>
++                {renderConnectionBadge(lanStatus.state, lanStatus.latencyMs)}
++              </div>
++
++              <div className="flex flex-wrap items-center gap-2 mb-3">
++                {renderPermissionBadge(lanStatus.permissionName, lanStatus.permissionState)}
++                <span className="text-xs text-slate-400">
++                  Private LAN / RFC1918 (<code className="font-mono text-slate-300">192.168.1.x</code>)
++                </span>
++              </div>
++
++              <label
++                htmlFor="lan-device-url-input"
++                className="block text-xs font-medium text-slate-300 mb-1"
++              >
++                LAN Hardware Endpoint URL or IP
++              </label>
++              <div className="flex gap-2">
++                <input
++                  id="lan-device-url-input"
++                  data-testid="lan-device-url-input"
++                  type="text"
++                  value={lanUrl}
++                  onChange={(e) => setLanUrl(e.target.value)}
++                  placeholder="http://192.168.1.100:8080/diagnostics"
++                  className="flex-1 bg-slate-950 border border-slate-700 rounded px-3 py-1.5 text-xs sm:text-sm font-mono text-slate-100 focus:outline-none focus:ring-2 focus:ring-amber-400"
++                />
++                <button
++                  type="button"
++                  data-testid="connect-lan-button"
++                  onClick={() => connectToEndpoint('local', lanUrl)}
++                  disabled={lanStatus.state === 'connecting'}
++                  className="bg-amber-400 hover:bg-amber-300 disabled:opacity-50 text-slate-950 font-semibold text-xs px-3.5 py-1.5 rounded whitespace-nowrap transition cursor-pointer"
++                >
++                  {lanStatus.state === 'connecting' ? 'Connecting...' : 'Connect LAN Device'}
++                </button>
++              </div>
++
++              {/* Presets for 192.168.1.x */}
++              <div className="flex flex-wrap items-center gap-1.5 mt-2">
++                <span className="text-[11px] text-slate-400">Presets:</span>
++                {[
++                  'http://192.168.1.100:8080/diagnostics',
++                  'http://192.168.1.50:8080/status',
++                  'http://192.168.1.1:8080/health',
++                ].map((preset) => (
++                  <button
++                    key={preset}
++                    type="button"
++                    onClick={() => setLanUrl(preset)}
++                    className="text-[11px] font-mono bg-slate-900 hover:bg-slate-700 text-slate-300 border border-slate-700 px-2 py-0.5 rounded transition cursor-pointer"
++                  >
++                    {preset.replace(/^http:\/\//, '')}
++                  </button>
++                ))}
++              </div>
++            </div>
++
++            {/* Status / Response Output */}
++            <div className="mt-3 pt-3 border-t border-slate-700/80 text-xs">
++              {lanStatus.errorMessage && (
++                <div
++                  data-testid="lan-error-message"
++                  className="bg-red-950/60 border border-red-800/80 text-red-200 rounded p-2.5 font-mono text-[11px] leading-relaxed"
++                >
++                  {lanStatus.errorMessage}
++                </div>
++              )}
++              {lanStatus.payload && (
++                <div className="mt-1">
++                  <span className="text-[11px] text-slate-400 block mb-1">
++                    Device Telemetry Payload:
++                  </span>
++                  <pre
++                    data-testid="lan-response-payload"
++                    className="bg-slate-950 border border-slate-800 rounded p-2 text-[11px] font-mono text-emerald-300 overflow-x-auto max-h-28"
++                  >
++                    {lanStatus.payload}
++                  </pre>
++                </div>
++              )}
++              {!lanStatus.errorMessage && !lanStatus.payload && (
++                <p className="text-slate-400 text-[11px]">
++                  Ready to probe hardware test rig on private Wi-Fi LAN using{' '}
++                  <code className="font-mono text-slate-300">
++                    fetch(url, &#123; targetAddressSpace: &apos;local&apos; &#125;)
++                  </code>
++                  .
++                </p>
++              )}
++            </div>
++          </div>
++
++          {/* Card 2: Local Companion CLI on Loopback (127.0.0.1) */}
++          <div
++            data-testid="loopback-cli-card"
++            className="bg-slate-800/90 border border-slate-700 rounded-lg p-4 flex flex-col justify-between"
++          >
++            <div>
++              <div className="flex flex-wrap items-start justify-between gap-2 mb-2">
++                <div>
++                  <span className="text-[11px] font-mono uppercase tracking-wider text-sky-400 block">
++                    Local Machine Loopback • targetAddressSpace: &quot;loopback&quot;
++                  </span>
++                  <h3 className="text-sm sm:text-base font-bold text-white">
++                    Local Companion CLI (127.0.0.1)
++                  </h3>
++                </div>
++                {renderConnectionBadge(cliStatus.state, cliStatus.latencyMs)}
++              </div>
++
++              <div className="flex flex-wrap items-center gap-2 mb-3">
++                {renderPermissionBadge(cliStatus.permissionName, cliStatus.permissionState)}
++                <span className="text-xs text-slate-400">
++                  Loopback Interface (<code className="font-mono text-slate-300">127.0.0.1</code> /{' '}
++                  <code className="font-mono text-slate-300">localhost</code>)
++                </span>
++              </div>
++
++              <label
++                htmlFor="loopback-cli-url-input"
++                className="block text-xs font-medium text-slate-300 mb-1"
++              >
++                Companion CLI Endpoint URL
++              </label>
++              <div className="flex gap-2">
++                <input
++                  id="loopback-cli-url-input"
++                  data-testid="loopback-cli-url-input"
++                  type="text"
++                  value={cliUrl}
++                  onChange={(e) => setCliUrl(e.target.value)}
++                  placeholder="http://127.0.0.1:9229/diagnostics"
++                  className="flex-1 bg-slate-950 border border-slate-700 rounded px-3 py-1.5 text-xs sm:text-sm font-mono text-slate-100 focus:outline-none focus:ring-2 focus:ring-amber-400"
++                />
++                <button
++                  type="button"
++                  data-testid="connect-cli-button"
++                  onClick={() => connectToEndpoint('loopback', cliUrl)}
++                  disabled={cliStatus.state === 'connecting'}
++                  className="bg-sky-400 hover:bg-sky-300 disabled:opacity-50 text-slate-950 font-semibold text-xs px-3.5 py-1.5 rounded whitespace-nowrap transition cursor-pointer"
++                >
++                  {cliStatus.state === 'connecting' ? 'Connecting...' : 'Connect Local CLI'}
++                </button>
++              </div>
++
++              {/* Presets for 127.0.0.1 */}
++              <div className="flex flex-wrap items-center gap-1.5 mt-2">
++                <span className="text-[11px] text-slate-400">Presets:</span>
++                {[
++                  'http://127.0.0.1:9229/diagnostics',
++                  'http://127.0.0.1:8787/status',
++                  'http://localhost:9229/diagnostics',
++                ].map((preset) => (
++                  <button
++                    key={preset}
++                    type="button"
++                    onClick={() => setCliUrl(preset)}
++                    className="text-[11px] font-mono bg-slate-900 hover:bg-slate-700 text-slate-300 border border-slate-700 px-2 py-0.5 rounded transition cursor-pointer"
++                  >
++                    {preset.replace(/^http:\/\//, '')}
++                  </button>
++                ))}
++              </div>
++            </div>
++
++            {/* Status / Response Output */}
++            <div className="mt-3 pt-3 border-t border-slate-700/80 text-xs">
++              {cliStatus.errorMessage && (
++                <div
++                  data-testid="cli-error-message"
++                  className="bg-red-950/60 border border-red-800/80 text-red-200 rounded p-2.5 font-mono text-[11px] leading-relaxed"
++                >
++                  {cliStatus.errorMessage}
++                </div>
++              )}
++              {cliStatus.payload && (
++                <div className="mt-1">
++                  <span className="text-[11px] text-slate-400 block mb-1">
++                    CLI Diagnostics Output:
++                  </span>
++                  <pre
++                    data-testid="cli-response-payload"
++                    className="bg-slate-950 border border-slate-800 rounded p-2 text-[11px] font-mono text-sky-300 overflow-x-auto max-h-28"
++                  >
++                    {cliStatus.payload}
++                  </pre>
++                </div>
++              )}
++              {!cliStatus.errorMessage && !cliStatus.payload && (
++                <p className="text-slate-400 text-[11px]">
++                  Ready to query local companion CLI on loopback using{' '}
++                  <code className="font-mono text-slate-300">
++                    fetch(url, &#123; targetAddressSpace: &apos;loopback&apos; &#125;)
++                  </code>
++                  .
++                </p>
++              )}
++            </div>
++          </div>
++        </div>
++
++        {/* Collapsible Setup & LNA Guide */}
++        {showGuide && (
++          <div
++            data-testid="lna-setup-guide"
++            className="mt-4 bg-slate-950 border border-slate-800 rounded-lg p-4 text-xs text-slate-300 space-y-2"
++          >
++            <h4 className="font-bold text-white text-sm">
++              Local Network Access (LNA) & Companion Endpoint Requirements
++            </h4>
++            <p>
++              Modern browsers gate requests from public websites to private LAN devices (
++              <code className="font-mono text-amber-300">local</code>) and local host services (
++              <code className="font-mono text-sky-300">loopback</code>) behind the{' '}
++              <strong>Local Network Access</strong> permission prompt and explicit{' '}
++              <code className="font-mono text-amber-300">targetAddressSpace</code> fetch options:
++            </p>
++            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">
++              <div className="bg-slate-900 p-3 rounded border border-slate-800">
++                <div className="font-semibold text-amber-300 mb-1">
++                  1. Browser Fetch Options (Client)
++                </div>
++                <pre className="font-mono text-[11px] text-slate-200 overflow-x-auto">{`// Private Wi-Fi LAN Hardware Device
++await fetch("http://192.168.1.100:8080/diagnostics", {
++  targetAddressSpace: "local"
++});
++
++// Local Machine Companion CLI
++await fetch("http://127.0.0.1:9229/diagnostics", {
++  targetAddressSpace: "loopback"
++});`}</pre>
++              </div>
++              <div className="bg-slate-900 p-3 rounded border border-slate-800">
++                <div className="font-semibold text-sky-300 mb-1">
++                  2. Device & CLI Response Headers (Server)
++                </div>
++                <pre className="font-mono text-[11px] text-slate-200 overflow-x-auto">{`Access-Control-Allow-Origin: https://astro-news-pytrpecapa-uc.a.run.app
++Access-Control-Allow-Methods: GET, POST, OPTIONS
++Access-Control-Allow-Headers: Content-Type, Accept
++Access-Control-Allow-Private-Network: true`}</pre>
++              </div>
++            </div>
++          </div>
++        )}
++
++        {/* Recent Connection Activity Log */}
++        {logs.length > 0 && (
++          <div className="mt-4 bg-slate-950 border border-slate-800 rounded-lg p-3">
++            <div className="flex items-center justify-between mb-2">
++              <span className="text-[11px] font-mono uppercase tracking-wider text-slate-400">
++                Diagnostics Activity Log
++              </span>
++              <button
++                type="button"
++                onClick={() => setLogs([])}
++                className="text-[11px] text-slate-400 hover:text-white cursor-pointer"
++              >
++                Clear
++              </button>
++            </div>
++            <ul className="space-y-1 max-h-28 overflow-y-auto font-mono text-[11px]">
++              {logs.map((entry) => (
++                <li key={entry.id} className="flex flex-wrap items-baseline gap-2">
++                  <span className="text-slate-500">[{entry.timestamp}]</span>
++                  <span
++                    className={
++                      entry.addressSpace === 'local' ? 'text-amber-400' : 'text-sky-400'
++                    }
++                  >
++                    [{entry.addressSpace}]
++                  </span>
++                  <span
++                    className={
++                      entry.status === 'success'
++                        ? 'text-emerald-300'
++                        : entry.status === 'error'
++                        ? 'text-red-300'
++                        : 'text-slate-300'
++                    }
++                  >
++                    {entry.message}
++                  </span>
++                </li>
++              ))}
++            </ul>
++          </div>
++        )}
++      </div>
++    </section>
++  );
++}
+diff --git a/src/components/Header.astro b/src/components/Header.astro
+index 980b279..b5b977e 100644
+--- a/src/components/Header.astro
++++ b/src/components/Header.astro
+@@ -58,8 +58,15 @@ const todaysDate = new Date().toLocaleDateString('en-US', { weekday: 'long', yea
+         </a>
+       </div>
+ 
+-      <!-- Right Section: Stock -->
++      <!-- Right Section: Diagnostics Quick Link -->
+       <div class="text-xs font-semibold text-right">
++        <a
++          href="#developer-diagnostics-widget"
++          class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-slate-900 text-amber-400 hover:bg-slate-800 transition"
++        >
++          <span class="w-2 h-2 rounded-full bg-amber-400"></span>
++          <span>LAN &amp; CLI Diagnostics</span>
++        </a>
+       </div>
+     </div>
+   </div>
+diff --git a/src/layouts/Layout.astro b/src/layouts/Layout.astro
+index dcf9696..16e6a1a 100644
+--- a/src/layouts/Layout.astro
++++ b/src/layouts/Layout.astro
+@@ -2,6 +2,7 @@
+ import Header from "../components/Header.astro";
+ import Footer from "../components/Footer.astro";
+ import AdSlotFireplace from "../components/AdSlotFireplace.tsx";
++import DiagnosticsWidget from "../components/DiagnosticsWidget.tsx";
+ import "../styles/global.css";
+ 
+ import { ClientRouter } from "astro:transitions";
+@@ -44,6 +45,7 @@ const baseUrl = import.meta.env.BASE_URL;
+       >
+         <div>
+           <Header />
++          <DiagnosticsWidget client:load />
+         </div>
+         <main class="bg-white relative">
+           <slot />
+diff --git a/src/middleware.ts b/src/middleware.ts
+index 1684cf6..0423fe3 100644
+--- a/src/middleware.ts
++++ b/src/middleware.ts
+@@ -9,5 +9,12 @@ export const onRequest = defineMiddleware(async (context, next) => {
+       await context.session.set('readingList', []);
+     }
+   }
+-  return next();
++  const response = await next();
++  if (!response.headers.has('Permissions-Policy')) {
++    response.headers.set(
++      'Permissions-Policy',
++      'local-network=(self), loopback-network=(self), local-network-access=(self)'
++    );
++  }
++  return response;
+ });

@@ -1,0 +1,328 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..c2658d7
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1 @@
++node_modules/
+diff --git a/index.html b/index.html
+index 66c9173..5b63800 100644
+--- a/index.html
++++ b/index.html
+@@ -152,6 +152,39 @@
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    /* Path tracer */
++    .tracer {
++      margin-top: 60px;
++      text-align: center;
++    }
++
++    .tracer canvas {
++      display: block;
++      width: min(100%, 512px);
++      height: auto;
++      aspect-ratio: 4 / 3;
++      margin: 20px auto 0;
++      border-radius: 8px;
++      background: #222;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
++    }
++
++    .tracer button.btn {
++      border: 0;
++      cursor: pointer;
++      font: inherit;
++    }
++
++    .tracer button.btn:disabled {
++      opacity: 0.6;
++      cursor: progress;
++    }
++
++    .tracer-status {
++      margin-top: 10px;
++      font-size: 0.9rem;
++    }
+   </style>
+ </head>
+ 
+@@ -195,6 +228,14 @@
+         </div>
+       </div>
+     </section>
++
++    <section class="tracer" aria-labelledby="tracer-title">
++      <h2 id="tracer-title">Steamed Milk, Rendered in WebAssembly</h2>
++      <p>A <a href="http://www.kevinbeason.com/smallpt/">smallpt</a> path tracer, compiled to WebAssembly and running right in your browser.</p>
++      <canvas id="tracer-canvas" width="256" height="192" role="img" aria-label="Path-traced Cornell box with a mirror ball and a glass ball"></canvas>
++      <p class="tracer-status" id="tracer-status" role="status">Loading renderer…</p>
++      <button class="btn" id="tracer-button" type="button" disabled>Render with random colors</button>
++    </section>
+   </main>
+ 
+   <footer>
+@@ -207,6 +248,54 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++
++  <script type="module">
++    const canvas = document.getElementById('tracer-canvas');
++    const ctx = canvas.getContext('2d');
++    const status = document.getElementById('tracer-status');
++    const button = document.getElementById('tracer-button');
++
++    const worker = new Worker(new URL('./smallpt/worker.js', import.meta.url), { type: 'module' });
++    let sphereCount = 0, job = 0, startTime = 0;
++
++    // Original smallpt palette: red left wall, blue right wall, grey back/floor/ceiling, black front, white balls.
++    const randomColors = () => Array.from({ length: sphereCount }, (_, i) => {
++      if (i === 3) return [0, 0, 0]; // front wall is behind the camera
++      const hue = Math.random() * 360;
++      // HSL -> RGB, kept fairly dark/saturated so the scene stays lit by bounce light
++      const s = 0.5 + Math.random() * 0.4, l = 0.3 + Math.random() * 0.25;
++      const a = s * Math.min(l, 1 - l);
++      const f = n => { const k = (n + hue / 30) % 12; return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)); };
++      return [f(0), f(8), f(4)];
++    });
++
++    function render(colors) {
++      job++;
++      startTime = performance.now();
++      button.disabled = true;
++      status.textContent = 'Rendering…';
++      worker.postMessage({ type: 'cancel', job: job - 1 });
++      worker.postMessage({ job, colors, seed: Math.floor(Math.random() * 2 ** 31) });
++    }
++
++    worker.onmessage = ({ data }) => {
++      if (data.type === 'ready') {
++        sphereCount = data.count;
++        // First render uses the original smallpt colors.
++        render([[.75, .25, .25], [.25, .25, .75], [.75, .75, .75], [0, 0, 0], [.75, .75, .75], [.75, .75, .75],
++                [.999, .999, .999], [.999, .999, .999]]);
++      } else if (data.type === 'rows' && data.job === job) {
++        ctx.putImageData(new ImageData(data.pixels, canvas.width), 0, data.y);
++        if (data.done) {
++          status.textContent = `Rendered in ${((performance.now() - startTime) / 1000).toFixed(1)}s`;
++          button.disabled = false;
++        }
++      }
++    };
++    worker.onerror = () => { status.textContent = 'Could not load the WebAssembly renderer.'; };
++
++    button.addEventListener('click', () => render(randomColors()));
++  </script>
+ </body>
+ 
+ </html>
+diff --git a/package.json b/package.json
+index 2bd4d77..d686a25 100644
+--- a/package.json
++++ b/package.json
+@@ -2,7 +2,11 @@
+   "name": "daily-grind",
+   "version": "1.0.0",
+   "scripts": {
+-    "start": "pnpm dlx statikk --port ${PORT:-11222}"
++    "start": "pnpm dlx statikk --port ${PORT:-11222}",
++    "build": "node smallpt/build.mjs"
++  },
++  "devDependencies": {
++    "@yowasp/clang": "^22.0.0-git20542-10"
+   },
+   "pnpm": {
+     "onlyBuiltDependencies": []
+diff --git a/smallpt/build.mjs b/smallpt/build.mjs
+new file mode 100644
+index 0000000..c3869cf
+--- /dev/null
++++ b/smallpt/build.mjs
+@@ -0,0 +1,14 @@
++// Compiles smallpt.cpp to smallpt.wasm using the Clang/LLD WebAssembly build from @yowasp/clang
++// (no Emscripten needed). Run with: node smallpt/build.mjs
++import { runClang } from '@yowasp/clang';
++import { readFileSync, writeFileSync } from 'node:fs';
++import { dirname, join } from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++const dir = dirname(fileURLToPath(import.meta.url));
++const out = await runClang(
++  ['clang++', '--target=wasm32-wasip1', '-O3', '-Wall', '-Werror', '-fno-exceptions', '-fno-rtti',
++   '-mexec-model=reactor', '-Wl,--allow-undefined', 'smallpt.cpp', '-o', 'smallpt.wasm'],
++  { 'smallpt.cpp': readFileSync(join(dir, 'smallpt.cpp'), 'utf8') });
++writeFileSync(join(dir, 'smallpt.wasm'), out['smallpt.wasm']);
++console.log('wrote smallpt.wasm', out['smallpt.wasm'].length, 'bytes');
+diff --git a/smallpt/smallpt.cpp b/smallpt/smallpt.cpp
+new file mode 100644
+index 0000000..22edc79
+--- /dev/null
++++ b/smallpt/smallpt.cpp
+@@ -0,0 +1,129 @@
++// smallpt: Global Illumination in 99 lines of C++ (c) Kevin Beason, MIT license.
++// Adapted for WebAssembly: exported entry points, settable colors, and a
++// portable RNG in place of erand48. The path tracing core is unchanged.
++#include <math.h>
++#include <stdint.h>
++
++#define EXPORT(name) __attribute__((export_name(name)))
++
++struct Vec {
++  double x, y, z;
++  Vec(double x_ = 0, double y_ = 0, double z_ = 0) { x = x_; y = y_; z = z_; }
++  Vec operator+(const Vec &b) const { return Vec(x + b.x, y + b.y, z + b.z); }
++  Vec operator-(const Vec &b) const { return Vec(x - b.x, y - b.y, z - b.z); }
++  Vec operator*(double b) const { return Vec(x * b, y * b, z * b); }
++  Vec mult(const Vec &b) const { return Vec(x * b.x, y * b.y, z * b.z); }
++  Vec &norm() { return *this = *this * (1 / sqrt(x * x + y * y + z * z)); }
++  double dot(const Vec &b) const { return x * b.x + y * b.y + z * b.z; }
++  Vec operator%(Vec &b) { return Vec(y * b.z - z * b.y, z * b.x - x * b.z, x * b.y - y * b.x); }
++};
++struct Ray { Vec o, d; Ray(Vec o_, Vec d_) : o(o_), d(d_) {} };
++enum Refl_t { DIFF, SPEC, REFR };
++struct Sphere {
++  double rad; Vec p, e, c; Refl_t refl;
++  Sphere(double rad_, Vec p_, Vec e_, Vec c_, Refl_t refl_)
++      : rad(rad_), p(p_), e(e_), c(c_), refl(refl_) {}
++  double intersect(const Ray &r) const {
++    Vec op = p - r.o;
++    double t, eps = 1e-4, b = op.dot(r.d), det = b * b - op.dot(op) + rad * rad;
++    if (det < 0) return 0; else det = sqrt(det);
++    return (t = b - det) > eps ? t : ((t = b + det) > eps ? t : 0);
++  }
++};
++
++static Sphere spheres[] = {
++  Sphere(1e5,  Vec( 1e5 + 1, 40.8, 81.6),   Vec(), Vec(.75, .25, .25),    DIFF), // Left
++  Sphere(1e5,  Vec(-1e5 + 99, 40.8, 81.6),  Vec(), Vec(.25, .25, .75),    DIFF), // Right
++  Sphere(1e5,  Vec(50, 40.8, 1e5),          Vec(), Vec(.75, .75, .75),    DIFF), // Back
++  Sphere(1e5,  Vec(50, 40.8, -1e5 + 170),   Vec(), Vec(),                 DIFF), // Front
++  Sphere(1e5,  Vec(50, 1e5, 81.6),          Vec(), Vec(.75, .75, .75),    DIFF), // Bottom
++  Sphere(1e5,  Vec(50, -1e5 + 81.6, 81.6),  Vec(), Vec(.75, .75, .75),    DIFF), // Top
++  Sphere(16.5, Vec(27, 16.5, 47),           Vec(), Vec(1, 1, 1) * .999,   SPEC), // Mirror
++  Sphere(16.5, Vec(73, 16.5, 78),           Vec(), Vec(1, 1, 1) * .999,   REFR), // Glass
++  Sphere(600,  Vec(50, 681.6 - .27, 81.6),  Vec(12, 12, 12), Vec(),       DIFF)  // Light
++};
++static const int numSpheres = sizeof(spheres) / sizeof(Sphere);
++
++static inline double clamp(double x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
++static inline int toInt(double x) { return int(pow(clamp(x), 1 / 2.2) * 255 + .5); }
++static inline bool intersect(const Ray &r, double &t, int &id) {
++  double n = numSpheres, d, inf = t = 1e20;
++  for (int i = int(n); i--;) if ((d = spheres[i].intersect(r)) && d < t) { t = d; id = i; }
++  return t < inf;
++}
++
++// 48-bit LCG matching erand48's algorithm, with state kept in one place.
++static uint64_t rngState;
++static inline double erand() {
++  rngState = (rngState * 0x5DEECE66DULL + 0xB) & ((1ULL << 48) - 1);
++  return double(rngState) / double(1ULL << 48);
++}
++
++static Vec radiance(const Ray &r, int depth) {
++  double t; int id = 0;
++  if (!intersect(r, t, id)) return Vec();
++  const Sphere &obj = spheres[id];
++  Vec x = r.o + r.d * t, n = (x - obj.p).norm(), nl = n.dot(r.d) < 0 ? n : n * -1, f = obj.c;
++  double p = f.x > f.y && f.x > f.z ? f.x : f.y > f.z ? f.y : f.z;
++  if (++depth > 5) { if (erand() < p) f = f * (1 / p); else return obj.e; }
++  if (obj.refl == DIFF) {
++    double r1 = 2 * M_PI * erand(), r2 = erand(), r2s = sqrt(r2);
++    Vec w = nl, u = ((fabs(w.x) > .1 ? Vec(0, 1) : Vec(1)) % w).norm(), v = w % u;
++    Vec d = (u * cos(r1) * r2s + v * sin(r1) * r2s + w * sqrt(1 - r2)).norm();
++    return obj.e + f.mult(radiance(Ray(x, d), depth));
++  } else if (obj.refl == SPEC) {
++    return obj.e + f.mult(radiance(Ray(x, r.d - n * 2 * n.dot(r.d)), depth));
++  }
++  Ray reflRay(x, r.d - n * 2 * n.dot(r.d));
++  bool into = n.dot(nl) > 0;
++  double nc = 1, nt = 1.5, nnt = into ? nc / nt : nt / nc, ddn = r.d.dot(nl), cos2t;
++  if ((cos2t = 1 - nnt * nnt * (1 - ddn * ddn)) < 0) return obj.e + f.mult(radiance(reflRay, depth));
++  Vec tdir = (r.d * nnt - n * ((into ? 1 : -1) * (ddn * nnt + sqrt(cos2t)))).norm();
++  double a = nt - nc, b = nt + nc, R0 = a * a / (b * b), c = 1 - (into ? -ddn : tdir.dot(n));
++  double Re = R0 + (1 - R0) * c * c * c * c * c, Tr = 1 - Re, P = .25 + .5 * Re, RP = Re / P, TP = Tr / (1 - P);
++  return obj.e + f.mult(depth > 2 ? (erand() < P
++      ? radiance(reflRay, depth) * RP : radiance(Ray(x, tdir), depth) * TP)
++      : radiance(reflRay, depth) * Re + radiance(Ray(x, tdir), depth) * Tr);
++}
++
++enum { MAX_W = 1024, MAX_H = 768 };
++static uint8_t framebuffer[MAX_W * MAX_H * 4];
++
++extern "C" {
++// Number of spheres whose color can be changed (walls and balls; not the light).
++EXPORT("sphere_count") int sphere_count() { return numSpheres - 1; }
++
++EXPORT("set_sphere_color") void set_sphere_color(int i, double r, double g, double b) {
++  if (i >= 0 && i < numSpheres - 1) spheres[i].c = Vec(r, g, b);
++}
++
++EXPORT("framebuffer") uint8_t *get_framebuffer() { return framebuffer; }
++
++// Renders rows [y0, y1) of a w*h image into the RGBA framebuffer (row 0 at top).
++// samps is the sample count per 2x2 subpixel, as in the original smallpt.
++EXPORT("render_rows") void render_rows(int w, int h, int samps, int y0, int y1, int seed) {
++  if (w > MAX_W || h > MAX_H) return;
++  Ray cam(Vec(50, 52, 295.6), Vec(0, -0.042612, -1).norm());
++  Vec cx = Vec(w * .5135 / h), cy = (cx % cam.d).norm() * .5135;
++  for (int y = y0; y < y1; y++) {
++    rngState = (uint64_t(y) * y * y + uint64_t(seed)) & ((1ULL << 48) - 1);
++    for (int x = 0; x < w; x++) {
++      Vec c;
++      for (int sy = 0; sy < 2; sy++)
++        for (int sx = 0; sx < 2; sx++) {
++          Vec r;
++          for (int s = 0; s < samps; s++) {
++            double r1 = 2 * erand(), dx = r1 < 1 ? sqrt(r1) - 1 : 1 - sqrt(2 - r1);
++            double r2 = 2 * erand(), dy = r2 < 1 ? sqrt(r2) - 1 : 1 - sqrt(2 - r2);
++            Vec d = cx * (((sx + .5 + dx) / 2 + x) / w - .5) +
++                    cy * (((sy + .5 + dy) / 2 + (h - y - 1)) / h - .5) + cam.d;
++            r = r + radiance(Ray(cam.o + d * 140, d.norm()), 0) * (1.0 / samps);
++          }
++          c = c + Vec(clamp(r.x), clamp(r.y), clamp(r.z)) * .25;
++        }
++      uint8_t *px = &framebuffer[(y * w + x) * 4];
++      px[0] = toInt(c.x); px[1] = toInt(c.y); px[2] = toInt(c.z); px[3] = 255;
++    }
++  }
++}
++}
+diff --git a/smallpt/smallpt.wasm b/smallpt/smallpt.wasm
+new file mode 100644
+index 0000000..c433c54
+Binary files /dev/null and b/smallpt/smallpt.wasm differ
+diff --git a/smallpt/worker.js b/smallpt/worker.js
+new file mode 100644
+index 0000000..0ac5c31
+--- /dev/null
++++ b/smallpt/worker.js
+@@ -0,0 +1,25 @@
++// Runs the smallpt WebAssembly module off the main thread, streaming finished rows back.
++const WIDTH = 256, HEIGHT = 192, SAMPLES = 8, BAND = 8;
++
++const { instance } = await WebAssembly.instantiateStreaming(fetch(new URL('./smallpt.wasm', import.meta.url)));
++const wasm = instance.exports;
++wasm._initialize();
++
++let cancelled = 0;
++self.onmessage = async ({ data }) => {
++  if (data.type === 'cancel') { cancelled = data.job; return; }
++  const { job, colors, seed } = data;
++  colors.forEach(([r, g, b], i) => wasm.set_sphere_color(i, r, g, b));
++  for (let y = 0; y < HEIGHT; y += BAND) {
++    // Let any pending 'cancel' message be delivered between bands.
++    await new Promise(resolve => setTimeout(resolve));
++    if (cancelled >= job) return;
++    const y1 = Math.min(y + BAND, HEIGHT);
++    wasm.render_rows(WIDTH, HEIGHT, SAMPLES, y, y1, seed);
++    // Read memory fresh: the buffer may be replaced if the heap grows.
++    const start = wasm.framebuffer() + y * WIDTH * 4;
++    const pixels = new Uint8ClampedArray(wasm.memory.buffer, start, (y1 - y) * WIDTH * 4).slice();
++    self.postMessage({ type: 'rows', job, y, pixels, done: y1 === HEIGHT }, [pixels.buffer]);
++  }
++};
++self.postMessage({ type: 'ready', count: wasm.sphere_count(), width: WIDTH, height: HEIGHT });

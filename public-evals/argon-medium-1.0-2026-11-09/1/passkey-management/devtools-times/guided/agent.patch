@@ -1,0 +1,1679 @@
+diff --git a/global.d.ts b/global.d.ts
+index 22f7b64..3fc75dd 100644
+--- a/global.d.ts
++++ b/global.d.ts
+@@ -1,7 +1,36 @@
+ declare global {
+   interface Window {
+-    adNetwork: any; // Replace 'any' with a more specific type if you know it
++    adNetwork: any;
++  }
++
++  interface PublicKeyCredential {
++    toJSON(): Record<string, any>;
++  }
++
++  namespace PublicKeyCredential {
++    function getClientCapabilities(): Promise<Record<string, boolean>>;
++    function parseCreationOptionsFromJSON(
++      options: Record<string, any>
++    ): PublicKeyCredentialCreationOptions;
++    function parseRequestOptionsFromJSON(
++      options: Record<string, any>
++    ): PublicKeyCredentialRequestOptions;
++    function signalAllAcceptedCredentials(options: {
++      rpId: string;
++      userId: string;
++      allAcceptedCredentialIds: string[];
++    }): Promise<void>;
++    function signalCurrentUserDetails(options: {
++      rpId: string;
++      userId: string;
++      name: string;
++      displayName: string;
++    }): Promise<void>;
++    function signalUnknownCredential(options: {
++      rpId: string;
++      credentialId: string;
++    }): Promise<void>;
+   }
+ }
+ 
+-export {};
+\ No newline at end of file
++export {};
+diff --git a/package.json b/package.json
+index bfffcf0..9112e5e 100644
+--- a/package.json
++++ b/package.json
+@@ -13,6 +13,7 @@
+     "@astrojs/node": "^11.1.9",
+     "@astrojs/react": "^5.0.7",
+     "@heroicons/react": "^2.2.0",
++    "@simplewebauthn/server": "^14.1.0",
+     "@tailwindcss/vite": "^4.3.3",
+     "@types/react": "^19.3.0",
+     "@types/react-dom": "^19.3.0",
+@@ -20,7 +21,8 @@
+     "react": "^19.3.1",
+     "react-dom": "^19.3.1",
+     "sharp": "^0.35.5",
+-    "tailwindcss": "^4.3.3"
++    "tailwindcss": "^4.3.3",
++    "webauthn-polyfills": "^0.1.7"
+   },
+   "devDependencies": {
+     "@tailwindcss/typography": "^0.5.20"
+diff --git a/src/components/AccountSettings.tsx b/src/components/AccountSettings.tsx
+new file mode 100644
+index 0000000..1cca414
+--- /dev/null
++++ b/src/components/AccountSettings.tsx
+@@ -0,0 +1,897 @@
++import React, { useState, useEffect, useCallback } from 'react';
++import 'webauthn-polyfills';
++import aaguidsData from '../data/aaguids.json';
++import type {
++  StoredPasskeyCredential,
++  UserProfile,
++  AaguidEntry,
++} from '../utils/passkeyStore';
++
++const aaguids: Record<string, AaguidEntry> = aaguidsData as Record<string, AaguidEntry>;
++
++// Valid unpadded Base64URL: non-empty, [A-Za-z0-9_-] only, no '=' padding, length % 4 !== 1
++function isValidBase64Url(value: unknown): value is string {
++  return (
++    typeof value === 'string' &&
++    value.length > 0 &&
++    value.length % 4 !== 1 &&
++    /^[A-Za-z0-9_-]+$/.test(value)
++  );
++}
++
++function getProviderDetails(cred: StoredPasskeyCredential): {
++  providerName: string;
++  providerIcon?: string;
++} {
++  if (!cred.aaguid || cred.aaguid === '00000000-0000-0000-0000-000000000000') {
++    return {
++      providerName: 'Unknown passkey provider',
++      providerIcon: undefined,
++    };
++  }
++  const entry = aaguids[cred.aaguid];
++  return {
++    providerName: entry?.name || 'Unknown passkey provider',
++    providerIcon: entry?.icon_light || cred.providerIcon,
++  };
++}
++
++function formatEpochDate(epochMs?: number): string {
++  if (!epochMs) return 'Never';
++  return new Date(epochMs).toLocaleDateString('en-US', {
++    year: 'numeric',
++    month: 'short',
++    day: 'numeric',
++  });
++}
++
++async function isPasskeySupported(): Promise<boolean> {
++  if (
++    typeof window === 'undefined' ||
++    !window.PublicKeyCredential ||
++    !PublicKeyCredential.getClientCapabilities
++  ) {
++    return false;
++  }
++  try {
++    const capabilities = await PublicKeyCredential.getClientCapabilities();
++    return Boolean(capabilities.passkeyPlatformAuthenticator);
++  } catch {
++    return false;
++  }
++}
++
++async function syncAcceptedCredentials(
++  rpId: string,
++  userId: string,
++  currentCredentialsList: StoredPasskeyCredential[]
++): Promise<boolean> {
++  if (
++    typeof window === 'undefined' ||
++    !window.PublicKeyCredential ||
++    !PublicKeyCredential.signalAllAcceptedCredentials
++  ) {
++    return false;
++  }
++
++  const credentialIds = currentCredentialsList.map((c) => c.id);
++  if (
++    !rpId ||
++    !isValidBase64Url(userId) ||
++    !credentialIds.every(isValidBase64Url)
++  ) {
++    console.warn(
++      'SignalAllAcceptedCredentials skipped: server rpId and valid unpadded Base64URL userId and credential IDs are required.'
++    );
++    return false;
++  }
++
++  try {
++    await PublicKeyCredential.signalAllAcceptedCredentials({
++      rpId, // Always use the server-provided rpId; DO NOT use window.location.hostname
++      userId, // Base64URL-encoded user ID from the server
++      allAcceptedCredentialIds: credentialIds,
++    });
++    return true;
++  } catch (e) {
++    console.warn('SignalAllAcceptedCredentials sync warning:', e);
++    return false;
++  }
++}
++
++interface AccountSettingsProps {
++  initialUser?: UserProfile;
++  initialCredentials?: StoredPasskeyCredential[];
++  initialRpId?: string;
++}
++
++export default function AccountSettings({
++  initialUser,
++  initialCredentials = [],
++  initialRpId = 'localhost',
++}: AccountSettingsProps) {
++  const baseUrl = import.meta.env.BASE_URL || '/';
++
++  const [rpId, setRpId] = useState<string>(initialRpId);
++  const [userId, setUserId] = useState<string>(
++    initialUser?.passkeyUserId || ''
++  );
++  const [user, setUser] = useState<UserProfile>(
++    initialUser || {
++      id: '',
++      passkeyUserId: '',
++      name: 'alex.morgan@devtoolstimes.com',
++      displayName: 'Alex Morgan',
++      subscriptionTier: 'All-Access Digital & Print Edition',
++    }
++  );
++  const [credentials, setCredentials] =
++    useState<StoredPasskeyCredential[]>(initialCredentials);
++  const [loading, setLoading] = useState<boolean>(
++    initialCredentials.length === 0
++  );
++
++  // User account profile form state
++  const [accountName, setAccountName] = useState<string>(user.name);
++  const [accountDisplayName, setAccountDisplayName] = useState<string>(
++    user.displayName
++  );
++  const [savingProfile, setSavingProfile] = useState<boolean>(false);
++
++  // Credential rename state
++  const [editingCredentialId, setEditingCredentialId] = useState<string | null>(
++    null
++  );
++  const [editingNameValue, setEditingNameValue] = useState<string>('');
++  const [renamingId, setRenamingId] = useState<string | null>(null);
++  const [deletingId, setDeletingId] = useState<string | null>(null);
++
++  // Passkey creation & feature support state
++  const [passkeySupported, setPasskeySupported] = useState<boolean>(true);
++  const [creatingPasskey, setCreatingPasskey] = useState<boolean>(false);
++
++  // Feedback banner
++  const [statusMessage, setStatusMessage] = useState<{
++    type: 'success' | 'error' | 'info';
++    text: string;
++  } | null>(null);
++
++  const loadManagementPanel = useCallback(async () => {
++    try {
++      const response = await fetch(`${baseUrl}api/credentials`);
++      if (!response.ok) return;
++      const data = await response.json();
++      if (data.rpId) setRpId(data.rpId);
++      if (data.userId) setUserId(data.userId);
++      if (data.user) {
++        setUser(data.user);
++        setAccountName(data.user.name);
++        setAccountDisplayName(data.user.displayName);
++      }
++      const creds: StoredPasskeyCredential[] = Array.isArray(data.credentials)
++        ? data.credentials
++        : [];
++      setCredentials(creds);
++      setLoading(false);
++
++      // Sync accepted credentials on initial load using server-provided rpId and userId
++      await syncAcceptedCredentials(data.rpId, data.userId, creds);
++    } catch (err) {
++      console.warn('Failed to load passkey credentials:', err);
++      setLoading(false);
++    }
++  }, [baseUrl]);
++
++  useEffect(() => {
++    loadManagementPanel();
++    isPasskeySupported().then((supported) => {
++      setPasskeySupported(supported);
++    });
++  }, [loadManagementPanel]);
++
++  const handleStartRename = (cred: StoredPasskeyCredential) => {
++    setEditingCredentialId(cred.id);
++    setEditingNameValue(cred.name);
++    setStatusMessage(null);
++  };
++
++  const handleCancelRename = () => {
++    setEditingCredentialId(null);
++    setEditingNameValue('');
++  };
++
++  // Renaming a passkey's nickname updates the server record only (does NOT invoke signalCurrentUserDetails)
++  const handleConfirmCredentialRename = async (credentialId: string) => {
++    const trimmed = editingNameValue.trim();
++    if (!trimmed) {
++      setStatusMessage({
++        type: 'error',
++        text: 'Please enter a non-empty display name for the passkey.',
++      });
++      return;
++    }
++
++    setRenamingId(credentialId);
++    setStatusMessage(null);
++
++    try {
++      const response = await fetch(
++        `${baseUrl}api/credential/${encodeURIComponent(credentialId)}`,
++        {
++          method: 'PUT',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify({ name: trimmed }),
++        }
++      );
++
++      if (response.ok) {
++        const updatedResponse = await fetch(`${baseUrl}api/credentials`);
++        if (updatedResponse.ok) {
++          const { credentials: updatedCredentials } =
++            await updatedResponse.json();
++          setCredentials(updatedCredentials);
++        }
++        setEditingCredentialId(null);
++        setEditingNameValue('');
++        setStatusMessage({
++          type: 'success',
++          text: `Passkey display name updated to "${trimmed}".`,
++        });
++      } else {
++        const errData = await response.json().catch(() => ({}));
++        setStatusMessage({
++          type: 'error',
++          text: errData.error || 'Could not update passkey name.',
++        });
++      }
++    } catch {
++      setStatusMessage({
++        type: 'error',
++        text: 'Network error while updating passkey display name.',
++      });
++    } finally {
++      setRenamingId(null);
++    }
++  };
++
++  // Deleting a passkey removes it on the server and synchronizes remaining credentials via signalAllAcceptedCredentials
++  const handleDeleteCredential = async (cred: StoredPasskeyCredential) => {
++    setDeletingId(cred.id);
++    setStatusMessage(null);
++
++    try {
++      const response = await fetch(
++        `${baseUrl}api/credential/${encodeURIComponent(cred.id)}`,
++        {
++          method: 'DELETE',
++        }
++      );
++
++      if (response.ok) {
++        const updatedResponse = await fetch(`${baseUrl}api/credentials`);
++        if (updatedResponse.ok) {
++          const {
++            rpId: serverRpId,
++            userId: serverUserId,
++            credentials: updatedCredentials,
++          } = await updatedResponse.json();
++          setRpId(serverRpId);
++          setUserId(serverUserId);
++          setCredentials(updatedCredentials);
++
++          // Sync remaining accepted credentials with the browser authenticator
++          await syncAcceptedCredentials(
++            serverRpId,
++            serverUserId,
++            updatedCredentials
++          );
++        }
++        setStatusMessage({
++          type: 'info',
++          text: `Removed passkey "${cred.name}" and synchronized your browser authenticator.`,
++        });
++      } else {
++        const errData = await response.json().catch(() => ({}));
++        setStatusMessage({
++          type: 'error',
++          text: errData.error || 'Failed to delete passkey.',
++        });
++      }
++    } catch {
++      setStatusMessage({
++        type: 'error',
++        text: 'Network error while removing passkey.',
++      });
++    } finally {
++      setDeletingId(null);
++    }
++  };
++
++  // Updating user's account username or displayName triggers signalCurrentUserDetails
++  const handleUserProfileUpdate = async (e: React.FormEvent) => {
++    e.preventDefault();
++    const updatedName = accountName.trim();
++    const updatedDisplayName = accountDisplayName.trim();
++    if (!updatedName || !updatedDisplayName) {
++      setStatusMessage({
++        type: 'error',
++        text: 'Both username and display name are required.',
++      });
++      return;
++    }
++
++    setSavingProfile(true);
++    setStatusMessage(null);
++
++    try {
++      const response = await fetch(`${baseUrl}api/user`, {
++        method: 'PUT',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({
++          name: updatedName,
++          displayName: updatedDisplayName,
++        }),
++      });
++
++      if (response.ok) {
++        const data = await response.json();
++        setUser((prev) => ({
++          ...prev,
++          name: data.name || updatedName,
++          displayName: data.displayName || updatedDisplayName,
++        }));
++        if (data.rpId) setRpId(data.rpId);
++        if (data.userId) setUserId(data.userId);
++
++        if (
++          typeof window !== 'undefined' &&
++          window.PublicKeyCredential &&
++          PublicKeyCredential.signalCurrentUserDetails
++        ) {
++          if (!data.rpId || !isValidBase64Url(data.userId)) {
++            console.warn(
++              'SignalCurrentUserDetails skipped: server rpId and valid unpadded Base64URL userId are required.'
++            );
++          } else {
++            try {
++              await PublicKeyCredential.signalCurrentUserDetails({
++                rpId: data.rpId, // Always use the server-provided rpId; DO NOT use window.location.hostname
++                userId: data.userId, // Base64URL-encoded user ID from the server
++                name: updatedName,
++                displayName: updatedDisplayName,
++              });
++            } catch (syncErr) {
++              console.warn('SignalCurrentUserDetails sync warning:', syncErr);
++            }
++          }
++        }
++
++        setStatusMessage({
++          type: 'success',
++          text: 'Account display name and username updated and synchronized with your passkey authenticator.',
++        });
++      } else {
++        const errData = await response.json().catch(() => ({}));
++        setStatusMessage({
++          type: 'error',
++          text: errData.error || 'Failed to update reader profile.',
++        });
++      }
++    } catch {
++      setStatusMessage({
++        type: 'error',
++        text: 'Network error while updating reader profile.',
++      });
++    } finally {
++      setSavingProfile(false);
++    }
++  };
++
++  // Registering a new passkey from the management panel (omits authenticatorAttachment so security keys work too)
++  const handleCreatePasskey = async () => {
++    setStatusMessage(null);
++    setCreatingPasskey(true);
++
++    try {
++      const supported = await isPasskeySupported();
++      if (!supported) {
++        setPasskeySupported(false);
++        return;
++      }
++
++      const optionsRes = await fetch(`${baseUrl}api/passkey/register-options`, {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ promotion: false }),
++      });
++
++      if (!optionsRes.ok) {
++        setStatusMessage({
++          type: 'error',
++          text: 'Unable to start passkey registration.',
++        });
++        return;
++      }
++
++      const creationOptionsJSON = await optionsRes.json();
++      const publicKey =
++        PublicKeyCredential.parseCreationOptionsFromJSON(creationOptionsJSON);
++
++      let credential: PublicKeyCredential | null = null;
++      try {
++        credential = (await navigator.credentials.create({
++          publicKey,
++        })) as PublicKeyCredential | null;
++      } catch (err: any) {
++        if (err?.name === 'InvalidStateError') {
++          setStatusMessage({
++            type: 'info',
++            text: 'A passkey already exists on this authenticator for your account.',
++          });
++        } else if (err?.name === 'SecurityError') {
++          setStatusMessage({
++            type: 'error',
++            text: 'Configuration RP ID or Secure Context error.',
++          });
++        } else if (err?.name === 'NotAllowedError') {
++          setStatusMessage({
++            type: 'info',
++            text: 'Passkey registration was cancelled.',
++          });
++        } else if (err?.name === 'AbortError') {
++          setStatusMessage({
++            type: 'info',
++            text: 'The passkey registration operation was aborted.',
++          });
++        }
++        return;
++      }
++
++      if (!credential) return;
++
++      const serverRpId =
++        (publicKey.rp && publicKey.rp.id) || creationOptionsJSON?.rp?.id || rpId;
++      const encodedResponse = credential.toJSON();
++
++      try {
++        const verifyRes = await fetch(`${baseUrl}api/passkey/register-verify`, {
++          method: 'POST',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify(encodedResponse),
++        });
++
++        if (!verifyRes.ok) {
++          if (
++            window.PublicKeyCredential &&
++            PublicKeyCredential.signalUnknownCredential &&
++            serverRpId &&
++            isValidBase64Url(encodedResponse.id)
++          ) {
++            try {
++              await PublicKeyCredential.signalUnknownCredential({
++                rpId: serverRpId,
++                credentialId: encodedResponse.id,
++              });
++            } catch (sigErr) {
++              console.warn('SignalUnknownCredential sync warning:', sigErr);
++            }
++          }
++          const errData = await verifyRes.json().catch(() => ({}));
++          setStatusMessage({
++            type: 'error',
++            text: errData.error || 'Server verification of the passkey failed.',
++          });
++          return;
++        }
++
++        const verifyData = await verifyRes.json();
++        if (Array.isArray(verifyData.credentials)) {
++          setCredentials(verifyData.credentials);
++          await syncAcceptedCredentials(
++            verifyData.rpId || serverRpId,
++            verifyData.userId || userId,
++            verifyData.credentials
++          );
++        } else {
++          await loadManagementPanel();
++        }
++
++        setStatusMessage({
++          type: 'success',
++          text: 'New passkey registered and synced with your account.',
++        });
++      } catch (serverErr) {
++        console.warn('Server verification network failure:', serverErr);
++        if (
++          window.PublicKeyCredential &&
++          PublicKeyCredential.signalUnknownCredential &&
++          serverRpId &&
++          isValidBase64Url(encodedResponse.id)
++        ) {
++          try {
++            await PublicKeyCredential.signalUnknownCredential({
++              rpId: serverRpId,
++              credentialId: encodedResponse.id,
++            });
++          } catch (sigErr) {
++            console.warn('SignalUnknownCredential sync warning:', sigErr);
++          }
++        }
++        setStatusMessage({
++          type: 'error',
++          text: 'Network error while verifying new passkey.',
++        });
++      }
++    } finally {
++      setCreatingPasskey(false);
++    }
++  };
++
++  return (
++    <div className="max-w-4xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-8">
++      {/* Page Header */}
++      <div className="border-b border-gray-300 pb-5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
++        <div>
++          <p className="text-xs font-bold uppercase tracking-widest text-gray-500">
++            Reader Account Settings
++          </p>
++          <h1 className="text-3xl font-bold text-gray-900 mt-1">
++            Account &amp; Security
++          </h1>
++          <p className="text-sm text-gray-600 mt-1">
++            Signed in as{' '}
++            <span className="font-semibold text-gray-900">
++              {user.displayName}
++            </span>{' '}
++            ({user.name}) &middot;{' '}
++            <span className="text-amber-700 font-medium">
++              {user.subscriptionTier}
++            </span>
++          </p>
++        </div>
++        <div className="flex items-center gap-2 text-xs text-gray-600 bg-gray-50 border border-gray-200 px-3 py-2 rounded-md">
++          <span className="inline-block w-2 h-2 rounded-full bg-green-600"></span>
++          <span>Authenticator Sync Active ({rpId})</span>
++        </div>
++      </div>
++
++      {/* Status Alert */}
++      {statusMessage && (
++        <div
++          role="status"
++          aria-live="polite"
++          className={`p-4 rounded-lg border text-sm flex items-start justify-between gap-3 ${
++            statusMessage.type === 'success'
++              ? 'bg-green-50 border-green-200 text-green-800'
++              : statusMessage.type === 'error'
++              ? 'bg-red-50 border-red-200 text-red-800'
++              : 'bg-amber-50 border-amber-200 text-amber-900'
++          }`}
++        >
++          <span>{statusMessage.text}</span>
++          <button
++            type="button"
++            onClick={() => setStatusMessage(null)}
++            className="text-xs font-semibold underline hover:opacity-80"
++          >
++            Dismiss
++          </button>
++        </div>
++      )}
++
++      {/* Passkey Management Section */}
++      <section
++        aria-labelledby="passkey-management-heading"
++        className="bg-white border border-gray-200 rounded-lg shadow-xs overflow-hidden"
++      >
++        <div className="p-6 border-b border-gray-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
++          <div>
++            <h2
++              id="passkey-management-heading"
++              className="text-xl font-bold text-gray-900"
++            >
++              Registered Passkeys
++            </h2>
++            <p className="text-sm text-gray-600 mt-1">
++              View your registered passkeys, update their display names, or
++              remove keys you no longer use. Changes automatically stay in sync
++              with your browser authenticator and password manager.
++            </p>
++          </div>
++
++          <div>
++            <button
++              id="create-passkey"
++              type="button"
++              hidden={!passkeySupported}
++              disabled={creatingPasskey || !passkeySupported}
++              onClick={handleCreatePasskey}
++              className="inline-flex items-center gap-2 px-4 py-2.5 bg-gray-900 text-white text-sm font-semibold rounded-md hover:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-900 disabled:opacity-60 cursor-pointer whitespace-nowrap"
++            >
++              <svg
++                className="w-4 h-4 text-amber-400"
++                fill="none"
++                stroke="currentColor"
++                viewBox="0 0 24 24"
++                aria-hidden="true"
++              >
++                <path
++                  strokeLinecap="round"
++                  strokeLinejoin="round"
++                  strokeWidth={2}
++                  d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"
++                />
++              </svg>
++              {creatingPasskey ? 'Registering...' : 'Create passkey'}
++            </button>
++            {!passkeySupported && (
++              <p className="text-xs text-gray-600 bg-gray-100 px-3 py-2 rounded">
++                Passkeys are not supported on this device. Please configure
++                standard multi-factor authentication (MFA) instead.
++              </p>
++            )}
++          </div>
++        </div>
++
++        {/* Passkey List */}
++        <div className="divide-y divide-gray-200">
++          {loading ? (
++            <div className="p-8 text-center text-sm text-gray-500">
++              Loading registered passkeys...
++            </div>
++          ) : credentials.length === 0 ? (
++            <div
++              data-testid="empty-passkeys-state"
++              className="p-10 text-center space-y-2"
++            >
++              <p className="text-base font-semibold text-gray-800">
++                No passkeys found
++              </p>
++              <p className="text-sm text-gray-600 max-w-md mx-auto">
++                You don&apos;t have any active passkeys registered to your
++                DevTools Times account. Create a passkey for faster,
++                phishing-resistant sign-in.
++              </p>
++            </div>
++          ) : (
++            <ul
++              aria-label="Registered passkeys"
++              className="divide-y divide-gray-200"
++            >
++              {credentials.map((cred) => {
++                const { providerName, providerIcon } = getProviderDetails(cred);
++                const isEditing = editingCredentialId === cred.id;
++                const isDeleting = deletingId === cred.id;
++                const isRenaming = renamingId === cred.id;
++
++                return (
++                  <li
++                    key={cred.id}
++                    data-credential-id={cred.id}
++                    className="p-6 flex flex-col md:flex-row md:items-center md:justify-between gap-4 hover:bg-gray-50/60 transition-colors"
++                  >
++                    <div className="flex items-start gap-4 min-w-0 flex-1">
++                      {/* Provider Icon */}
++                      <div className="w-11 h-11 rounded-lg border border-gray-200 bg-gray-50 flex items-center justify-center flex-shrink-0 overflow-hidden">
++                        {providerIcon ? (
++                          <img
++                            src={providerIcon}
++                            alt={`${providerName} icon`}
++                            className="w-8 h-8 object-contain"
++                          />
++                        ) : (
++                          <svg
++                            className="w-6 h-6 text-gray-500"
++                            fill="none"
++                            stroke="currentColor"
++                            viewBox="0 0 24 24"
++                            aria-hidden="true"
++                          >
++                            <path
++                              strokeLinecap="round"
++                              strokeLinejoin="round"
++                              strokeWidth={2}
++                              d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"
++                            />
++                          </svg>
++                        )}
++                      </div>
++
++                      {/* Passkey Name & Metadata */}
++                      <div className="min-w-0 flex-1">
++                        {isEditing ? (
++                          <div className="flex flex-wrap items-center gap-2">
++                            <label
++                              htmlFor={`rename-input-${cred.id}`}
++                              className="sr-only"
++                            >
++                              Passkey display name
++                            </label>
++                            <input
++                              id={`rename-input-${cred.id}`}
++                              type="text"
++                              value={editingNameValue}
++                              onChange={(e) =>
++                                setEditingNameValue(e.target.value)
++                              }
++                              onKeyDown={(e) => {
++                                if (e.key === 'Enter') {
++                                  e.preventDefault();
++                                  handleConfirmCredentialRename(cred.id);
++                                } else if (e.key === 'Escape') {
++                                  handleCancelRename();
++                                }
++                              }}
++                              className="px-3 py-1.5 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-gray-900 bg-white text-gray-900"
++                              autoFocus
++                            />
++                            <button
++                              type="button"
++                              disabled={isRenaming}
++                              onClick={() =>
++                                handleConfirmCredentialRename(cred.id)
++                              }
++                              className="px-3 py-1.5 text-xs font-semibold bg-gray-900 text-white rounded-md hover:bg-gray-800 disabled:opacity-60 cursor-pointer"
++                            >
++                              {isRenaming ? 'Saving...' : 'Save'}
++                            </button>
++                            <button
++                              type="button"
++                              onClick={handleCancelRename}
++                              className="px-3 py-1.5 text-xs font-semibold border border-gray-300 text-gray-700 rounded-md hover:bg-gray-100 cursor-pointer"
++                            >
++                              Cancel
++                            </button>
++                          </div>
++                        ) : (
++                          <div className="flex flex-wrap items-center gap-2">
++                            <h3 className="text-base font-bold text-gray-900 truncate">
++                              {cred.name}
++                            </h3>
++                            <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-700">
++                              {providerName}
++                            </span>
++                            {cred.credentialBackedUp && (
++                              <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-amber-100 text-amber-900">
++                                Synced
++                              </span>
++                            )}
++                          </div>
++                        )}
++
++                        <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-500">
++                          <span>
++                            Created:{' '}
++                            <time
++                              dateTime={new Date(
++                                cred.registeredAt
++                              ).toISOString()}
++                              className="font-medium text-gray-700"
++                            >
++                              {formatEpochDate(cred.registeredAt)}
++                            </time>
++                          </span>
++                          <span>
++                            Last used:{' '}
++                            {cred.lastUsedAt ? (
++                              <time
++                                dateTime={new Date(
++                                  cred.lastUsedAt
++                                ).toISOString()}
++                                className="font-medium text-gray-700"
++                              >
++                                {formatEpochDate(cred.lastUsedAt)}
++                              </time>
++                            ) : (
++                              <span className="font-medium text-gray-700">
++                                Never
++                              </span>
++                            )}
++                          </span>
++                        </div>
++                      </div>
++                    </div>
++
++                    {/* Row Actions: Rename & Delete */}
++                    <div className="flex items-center gap-2 self-end md:self-center">
++                      {!isEditing && (
++                        <button
++                          type="button"
++                          onClick={() => handleStartRename(cred)}
++                          aria-label={`Rename ${cred.name}`}
++                          className="px-3 py-1.5 text-xs font-semibold text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-gray-900 cursor-pointer"
++                        >
++                          Rename
++                        </button>
++                      )}
++                      <button
++                        type="button"
++                        disabled={isDeleting}
++                        onClick={() => handleDeleteCredential(cred)}
++                        aria-label={`Delete ${cred.name}`}
++                        className="px-3 py-1.5 text-xs font-semibold text-red-700 bg-white border border-red-200 rounded-md hover:bg-red-50 focus:outline-none focus:ring-2 focus:ring-red-600 disabled:opacity-60 cursor-pointer"
++                      >
++                        {isDeleting ? 'Removing...' : 'Delete'}
++                      </button>
++                    </div>
++                  </li>
++                );
++              })}
++            </ul>
++          )}
++        </div>
++      </section>
++
++      {/* Reader Profile & Account Display Name Section */}
++      <section
++        aria-labelledby="account-profile-heading"
++        className="bg-white border border-gray-200 rounded-lg shadow-xs overflow-hidden"
++      >
++        <div className="p-6 border-b border-gray-200">
++          <h2
++            id="account-profile-heading"
++            className="text-xl font-bold text-gray-900"
++          >
++            Reader Profile &amp; Authenticator Identity
++          </h2>
++          <p className="text-sm text-gray-600 mt-1">
++            Update your reader display name or username. Saving updates your
++            profile on The DevTools Times and signals your browser&apos;s
++            passkey manager so your saved passkeys display your latest account
++            details.
++          </p>
++        </div>
++
++        <form onSubmit={handleUserProfileUpdate} className="p-6 space-y-4">
++          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
++            <div>
++              <label
++                htmlFor="account-display-name"
++                className="block text-sm font-medium text-gray-700 mb-1"
++              >
++                Display Name
++              </label>
++              <input
++                id="account-display-name"
++                name="displayName"
++                type="text"
++                required
++                value={accountDisplayName}
++                onChange={(e) => setAccountDisplayName(e.target.value)}
++                className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-gray-900"
++              />
++            </div>
++
++            <div>
++              <label
++                htmlFor="account-username"
++                className="block text-sm font-medium text-gray-700 mb-1"
++              >
++                Username / Email
++              </label>
++              <input
++                id="account-username"
++                name="name"
++                type="text"
++                required
++                value={accountName}
++                onChange={(e) => setAccountName(e.target.value)}
++                className="w-full px-3 py-2 border border-gray-300 rounded-md text-sm text-gray-900 focus:outline-none focus:ring-2 focus:ring-gray-900"
++              />
++            </div>
++          </div>
++
++          <div className="flex items-center justify-end pt-2">
++            <button
++              type="submit"
++              disabled={savingProfile}
++              className="px-4 py-2 bg-gray-900 text-white text-sm font-semibold rounded-md hover:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-900 disabled:opacity-60 cursor-pointer"
++            >
++              {savingProfile ? 'Updating...' : 'Save Profile & Sync Passkeys'}
++            </button>
++          </div>
++        </form>
++      </section>
++    </div>
++  );
++}
+diff --git a/src/components/Footer.astro b/src/components/Footer.astro
+index 5f2d281..3b766d1 100644
+--- a/src/components/Footer.astro
++++ b/src/components/Footer.astro
+@@ -69,7 +69,7 @@ const baseUrl = import.meta.env.BASE_URL;
+                     </a>
+                 </li>
+                 <li>
+-                    <a href="#" class="flex items-center text-sm font-semibold hover:underline">
++                    <a href={`${baseUrl}account`} class="flex items-center text-sm font-semibold hover:underline">
+                         <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                         Manage My Account
+                     </a>
+diff --git a/src/components/Header.astro b/src/components/Header.astro
+index 980b279..0a6eea6 100644
+--- a/src/components/Header.astro
++++ b/src/components/Header.astro
+@@ -25,6 +25,13 @@ const todaysDate = new Date().toLocaleDateString('en-US', { weekday: 'long', yea
+ 
+       <!-- Right: Buttons -->
+       <div class="flex items-center space-x-3">
++        <a
++          href={`${baseUrl}account`}
++          data-skip-tracking="true"
++          class="text-gray-800 border border-gray-300 text-xs font-semibold py-2 px-3 rounded whitespace-nowrap hover:bg-gray-100"
++        >
++          Account Settings
++        </a>
+         <a
+           href={`${baseUrl}signup`}
+           data-skip-tracking="true"
+diff --git a/src/data/aaguids.json b/src/data/aaguids.json
+new file mode 100644
+index 0000000..91376ea
+--- /dev/null
++++ b/src/data/aaguids.json
+@@ -0,0 +1,47 @@
++{
++  "ea9b8d66-4d01-1d21-3ce4-b6b48cb575d4": {
++    "name": "Google Password Manager",
++    "icon_light": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAFbUlEQVR4nOVb628UVRSf/hs+CLUoiRopiEYEQ1ofH/ziAyMfKn4wfjTGBGotaB+Ulkq1vj+4NmKIGrXBEJFHJAhUhIiGqJB2S7FAbffemX3c6e7Suu3eHnPudnY7s9vd7nLZu7M7yS/ZnfvIOb8559xz78zRtBwXAFT5TLifML6TmvwEZdxLTR6l5hyUFniUMj6EMhLG2ycYrMmlW07FiQnPE8aH1StXIBj3+hg8h7po+Vy6CTWU8d+UKyAJhPGzhEH10pQPwQbKuK5a6JtgDQHCoD6r8oRBHWF8RrmwN4+EmC8EGxdTvpoybigXsgiWoJuwwqY8AFSVk8/nAmH8jC0wEhM2qxaq2NAZbEo+fVcvdYWC8SFBgM+EtcqFUQSDwWqNMN6hWhBVIIy3aSK9LQFh1IAfRwu4pF4QRWDcqxGTR5QLogjE5BFNtRCqoakWQDU01QKUFQEjNA6eU9ehwcNgXVcAat7QBR7eHRD3sA37lB0B1wIcOn+MwF3bdbhlK80K7NN1KAJjAV4eBFwYj8Pj7wZzKu5E3Z4A/Dk2624C/v43DrVt/ryVt4BjcQ5XEnAtwOHRd9Kf/L0tBnQejMCp4Rm44ucC+HvXwYhoc/ZH61HpDlqhA9Hnncps6TPhH2NxZbAN+zjHdR+OuIuASySeFvBQMcJyj8U+L/Yx29iVO3Rlq4NWyCBczpxmn+3JO3FZ53CPwx36Bq67h4AGj/0Jos/nO0fHD3YX2vIZcw8B67rskX9geCbvOTAwLpwDkyXXELCi2e7/o3mYvwUcs3COO5v1yiLgsm4nAINqRbnASa+LXaDBEQQxycl3jp1uDoKeG1wG952Zhlu3FZY+O7Gq1YD+c9PFJWCEpidCmNwsNRGqbpKjfGpPYRSXAGrOiS2tUxAkAYPbYmOwDU1dpvIWlGyGHsuwDcYMD5Ock96YWB0Q+Bvv3f1W+mbItQTQImyHsylZEgRQ60CkN/8Dkfqe3AciriCAmnNiP7/7UETs6nIpjn3ePry0IzHXEEDnMUK52NW94GGwvjsgMkYE/sbgh23YZ6nzuY4AKhkVT0Btm7HoWl8RFtB/blpkepmyvYoggBZoHRVBQH8W66gIAqgkaKoFUA1NtQCqoakWoCwJGA/Owe+js/DX2CyMB3nlEDBqcHjtmzDc0ZTaEyxv0uHlL8xkn2Wvp9pub6SwtsMPe46kjtSs94f3tRpJ8vAQZUN3IDnOxyQSQEweljXZpk9CQsAHOvzQczQKfQNT0Lw/AvU9wTQCWg5EYPv+1DcF+36dshGA+PyXxL0D5/+zJT2yCCAmn9RkfSZ75EJMCIebn4uOPf5CgS0CBicSfRq/C4v/W78N2wjAU+InehPEbf6UCUtBa5JqAYwP4YeSP8uYrPenqBDuqY9CSaXxra+Fi+NxGwFfnZ0SeKgzcaDywbGojYAPjyXm23t6Cm7bRoWbWK4lzwW4+FCyXcZk780T8PTHoWQgXLnDgGWNCbM9MRSzEWABT4fxLNHyd4sAfAONR2j41FFx/C+fAGjRsLpKxmRH510AX3FZTxvx5PvBjASgX+PLEa/P7i4WAVcDHN78PnHw+sqXk6JNNgF6CFZZxRJemUHwwV2pILim3Z+RACsGOLGQAIwl6D5/XJmVTwDjg8mCCSwtk0EAvhx59etJ2zKIn8m9tNdMKpwPAc42uQTAM7aSGSwtk0GC5f/nr87aXKGUQBg/nVZLSBgsr6CiqZqMlWO+EGzE0rIyVj42EYJHstYO6mFYX8aFk3VZlV9YQ4ilZcqFlujz6OJaPhcAVGFpWaIi27VPfVBn8Kx2o5fBYDUWGGHqiISUYpWJkClRPn+cmvFWnUHtUnT7HwRsv7g/CE4sAAAAAElFTkSuQmCC",
++    "icon_dark": "data:image/png;base64,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"
++  },
++  "fbfc3007-154e-4ecc-8c0b-6e020557d7bd": {
++    "name": "iCloud Keychain",
++    "icon_light": "data:image/png;base64,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",
++    "icon_dark": "data:image/png;base64,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"
++  },
++  "dd4ec289-e01d-41c9-bb89-70fa845d4bf2": {
++    "name": "iCloud Keychain (Managed)",
++    "icon_light": "data:image/png;base64,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",
++    "icon_dark": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAFoUlEQVR4nOVbW2wUVRievrK7sLbb3c6cy+xuaaGtvWGpaMGm1FpvFC0VjVEMBU0kEUq3tlCxFyEqii8ao776pomXF2tfii8E4pOXKK0I8S5qMAZaVEz0mP/szrYzO3ubne7Z6U7ypTNzLv3/7/z/fy47vySlv0oopTcgRJ7BmHyEMZnDmC5gTFmBYQFjMgsyIkQmZZluyEC3lFeJopCdGNOvCkA5iyBzCNE+0EXK5iKEVCJEPxavgG1EnKGUhjJVfjPG5FfxQtuOSwjRrSmVR0jtQIj8UwDCLgsQItcwxu2mylNKQxjT30QLmQ9LwBivNepfsrJ8Ph3IaV1gJITcL16o/AIhuiM++s6e6ixbwaw2+i3ihREDRVGbJYTIUdGCiAJCZEKKLm/FCyMGZEbCmJ4rYgLmgIB58YIIw7xUAEIIhSRaANGQRAuwoghAlfWsvHOIefdOM/fQBeYav8rhjpzn76AM6qw4AlCwmvl6XmCusSts1TGWElDH13OcIbVqZRCgVG9kqw98mlZxIzwDXzKlZpOzCVDWtTL34Z+zVl4DtIU+HEkAClaz1QOfJ5r4U5dYWc+LTG66naHQeg64h3dQZqwP1iPSHSSrDcHnjcp4+z9gOFyTvF24htcxtvNte85ZBKDKhoSAx5Unavr2RGXe/ilDYLwsbHaQrDSC6cxo9ilH3khgqDbBHfydg84hwLt3Wic8+He2fZRtP6G3oD0fOocAz9AFnfByY3fWfUBg1M0IkfPOIcA1vqATHoUyN38N0EYXDMcWio2AWn0cGZ8vNhe4w7ku4LUlCL7k3CBYnuM06G/fx1Yd+9fyElpnOaO/sEDb7vwSgCrrTRZCUxkvhFwTf9mi/OKe4mJ+CcB8KXzcZCk8xVC4Ljlx4Tpu6nYqr0HMZujAZ+aboe0nmNx8J58dAHAP71xHfl8W5YUQgPOwHU6lZEEQgLUDkf2fZK28Z+CLtAcijiAAgzuoVcy37Xm+q0unONTx3f1sRmcAjiEAa0SEr+e7Ou+eaeaOfM1XjAC4h+AHZVAn0/4cRwC2GUVPgPvwxaRzfVFYQKBtN1/pma32ioIAbNE6ioKAQArrKAoCsE2QRAsgGpJoAURDEi2AIwmQG7qYv/1xJtduSSiD9b1c08YQrYy/q2i5h9dHVc22KyDX3RKVpaErfwSU9b7Mp5/y7lHdKZH70E+La/6JP/kWGMq0n8MqWnfaToCv+wjvG2SySAC5YmUHWNF0V3xEtSMy1+TfrHTHq8zfeZCV9r3GvLveTUkAtIef2awIrlS3MEyCORGAELksWflM1mgB7pEfo89dw/q6JGhKAPz1PPnN4tZ4cJYfmnAyu0f5OyASngM37eLPGplAPnxboB2+eB95PwcLILNgASdzIQBGUVMkmY8vJYD/sPr0H9xa/B1PRBU++h/zjHzPEA0vEtD7iikB1z38Vuz5HRbY3M/b5UDADHwqO2kXAUrVhrQEBDY9xO/XPDoTL4fDEXgn198aJ0BTyEiAZ/jb6P9aHz1MgSP5HGLAmATZVfa5wEhaF4gT8NhJcwJuOxS1gL7XeZl/68CyEYBQsDH2uTxPhbNMQHlnJBYEr7HS+97gQREUMAuCehfYn+ACgZujIw6HKOAinsg5gwu8bYsLIETOLskVon25EMBHqnOQeUZ+WJwGx68mnQYrbnyAeYa/WxIE5/iswvuiYbZm35lYH/Os9ME39UFwXSvzHDy7JAi+Z9EC1Ht1KTOQWmbBh0ynJ26eNJx+FGAaXNuYpJ+NKfvQpkFrcpJTCbmEqqoGiyVpCvIiTTPHMMbt0dQy4UIuC0A3QsiWlLmDskzbVm7ipNohZXJRnkNITheA0DaBnAIXl7K8SiC1LJqRLVoBa4CpDiG1V8r1UhS1GRKMYOkYI6QQs0zmY+nzMxjTcUVRmzLR7X97H83loi0UWwAAAABJRU5ErkJggg=="
++  },
++  "bada5566-a7aa-401f-bd96-45619a55120d": {
++    "name": "1Password",
++    "icon_light": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAEeklEQVR4nOVbW28TRxQeXhFSEeoFBEWEVH2g3EJBvRfBPwiJyj/gDfHCAw/cElQKARWilqCWXlT1xTz1oVILanMBRUQBJJCCwiUhCQIp7MzasT1jnMSNv+psHLA3vq3x7ni9K33Sendm9pxvzpw9c7yHsRIHgCUigQ+FRDtX6OUKD4SEEgqoKUgornCfZBQSbVxhWyndSirOJb4SCg+1K1chaLKMOFpJF+bkMKJo5BKDuhWoGhESA5NJNJSnfByfCwVDt9AuWIMpJHYXVV5I7OISs7qFddESZngcO/MqP5lEg1DguoX0whKMKN7L5/AGdQvnoSXcyHGMXGKvbqG8hhFHy8vZ9/OrrmIrULg/7/gS2K5bGI0kNJHnP6FbEG2QOM6s0DG4FtDNhMKjABPwgAiQugXRCMlqQAitYLoF0A2mW4C6ImA0nEbXzSSaQzFs7ArjzQ5hYVNX2LpG96hN3RHwNJrG8d4E3jkjsPRrXhTUhto+i6brg4B7xhw++SlSUnE7tv8Ywd3JOX8TMPR8Do2dpmPlF0B9aQxfEvA0msZHlxbP/LvnTBzrSeDaeApPptIW6PxoT8K6Z29P1qNzObBKO9I6tivTejmGianCytA9amPv196X8BcBI2Z6kcMjxXgZfalNi42ElWeFtrcDq6QTvc7sZl9s5u0Yj6Sx5tvc5XDxVtI/BDSHcmeQ1rzTMY505y6hllDMPwRsvBDOEf76RMrxGOQYs8egYMk3BLzVkbv+nZj/AqhP9hg0ZqAIGI/kEvD2GRGsJdDn5yXQbHOCFOQ4HeOwn51g12u+Bn+9M41lFYbPdjScNxEamvGWgNHw4kCoxUEgtOJ06V2jE6zvNL0lQBQIhYmEsUhhS6B7ZOrVVH4BWjZDH+fZBlOER0FO71jKWhYEOqdrq23Rn68JEB5sh4spWRMEiExC5NOfnSdEdpSREPEFAULB2s+39SWsXV0pxanNiWvlpcR8Q4DI4HE4be3q9lyOYfPFsBUxEuicnB/dozbljuc7AkSVEXgC1mc5WPu7PhAWEBqasSK9fNFeIAgQFVpHIAgIFbGOQBAgqgSmWwDdYLoF0A2mWwDdYLoFCAQBHf0vsOH7V3nEqyOzBdPjy09xNP0Qwe93p70hgCvE3X7IyesvcOBviQ8yydR8BKw6K6z/CPf9KbHsJMcb33AMPvvPVbm4Qox5+Zns7t+mChLw/nevssJf/jLf7tLtafc/l+UKPbVAwNpzJv4YnsGFwaT1WQ1d+2c05TYB3fSpbFstEJDrBwQO/atcl4crHCUL2FYLBKw7b6JnLIX+iflcohfyGApb5oslqBTOxQddGZlF50Dy5T9KB68q6/dzmd8HeAGuMJxdKNXq5sP2/yXzpscoLaaLADOBZnvJzICXAmhG/6Jawskk1gWoaKoxb+UYj2MnlZbVedncF0VrB404PqvjwsldRZXPriGk0jLdQlcR/bTEmZMDwBIqLaNw0cezPmzGsYe97sEVmqjAiELHDCG1WGUiM+XzJOMxQ2FrObr9Dw8AibQRW+AOAAAAAElFTkSuQmCC",
++    "icon_dark": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAEsklEQVR4nOVbbWwURRiehp0rYkNMjCL8MNDezLUp9uiHHwFJbQMX7MyW1utdS1soHxppz6DGGGNCRCWAmphoVDiqlqgFDIga/aMS9A+CBDUmyqcQjB8EDP7Q8gf/jHlHeunu3m3vrrc7t7ebPMne7s7s8z77zjvvzu2L0ORbGa5mjZjw5zHhX2mEncaEX8WUi6IC4Vc1wk4BR0zYc7iKN2Rhm+1Whqke1wg/o9y4PAEPKxBiXWALymUrDy6rwpQfU21A4cCOllN9XlbGa5Tfiym7rJ50gUHYlWlUb7U1flqorQUT/q9yss6JcE0L8ub0bk/1eZjyP5WTdMETyqv0oNn+stIa85OBHTEERkx5t3pS7iIQ5NHU0/fyVJcvIGdAMuqH7m9STUYZgu31CFO2WTkRVSDsWSRTR/8KcAhphJ9VTkRhqowwYWM+9oAxVBREFAKpJqAaSDWBkhKgItwtavpfFJFtB0Vs5IQYOHBRouvtn+QxOAfXlJwA02s7RcPQTrFy329i3ad/2QKuaRhMyjYlIcDMpn6xfPu3kxpuRmfye3HT3QPeFmDmnSvFivd+ztn4cUBb6MOTAkyv7RQdO76zGNW79xfROLRTzGpJiBvmRyVgvzExLM+ZrwfvUTkcUL4NYcybjVmy5TMx446ujG3gHFxjble/PuktASoW9FgCHhiGQ/rk7UO6WLrlc0tgVDU7oHwawXRmdnu7J2/xhLqY6Nt7wdBHdd8L3hEgsu2ggTyM+Vz7aEq8aegDvMIzAsRGThjI33rfUM59QGCc2AckS54RYNWBiwbyM+ZHc+4D2kzsY9UHf/hMgLqYUYD9v3tHgJjfh0DEHAQTw/4KgjVTnAZpfLNY+8mVvFNow713nxeVHRvdFaAi3G1JhOQTzDIRWv3hpYIYnxJh9Jy7AmBIhQeTFiIgwo3heMY2cM6cBRYKal6GtltfgyHDg/E9qzUhZwcA7MOxvvetL0OeFQC78DpsZ2RRCIDHF0TeOO7IgognBMDjS2Lrk1kvidU/vCOrNQDPCIAnBDl4q4ts/UJ0vfWjzBgBsA/BD87ZBUnPC4ALDN8L0Dt6LuNc7wsPqOzYKDO9dNmeLwTAeXqHLwSotPEOXwiACwSkmoBqINUEVAOpJqAaSDUBXwhQt+5VEd91KjVtzVn6aMa1wTUfXxbR4R9EZXSTSwIQ9o/TNwk/9Lq454lREd91MqMA/ft+lf8RLn56v1wuAyFuXvSg0wL8jdz8TJa98nVGAXrePZM6pr/2jTxGe7Y6/7ksJvzLYhCgd88FcTt/StT0vyQ/q4Fjs5dscP5DSQwFRkUgwESs/uiSaNow4jgfjfJnEFRXFYMAK3afF7e1PiJuaR7MaYl9ih4Qvv65PDvt5I3mRB4TtQMvp/5Ruuvxd+TvQHV72hjgBjTKT6YKJqC0zMmbLXxyT9rlMVgWUyVAgLBOU8kMO+omAaUg7LCllrA8tHyub4qmgsuq0tcMBnkzlJaVsPHXNMIW29YOalRfVLKFk6G2FlvjjTWE7EgJGX8YhjjKcSuD0jJZka3agClMdQHS9gCa6oaD7fVQYASp4/8l6kVYZULY2HVuhzTKN2HStiAb2/4Dzcjp6NejM1UAAAAASUVORK5CYII="
++  },
++  "d548826e-79b4-db40-a3d8-11116f7e8349": {
++    "name": "Bitwarden",
++    "icon_light": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAFM0lEQVR4nOVb6W8bRRTf/hVQQGpDgoAPFAJI5apCChLwBakHRQqBFloqFSkFQUBQIG3akjYQCt/4EARClSpoHQJFAgkUjhARKgQSRw5Q7Din2R0fzc6GQPDkod/4wHYcX/F6sl5LP3l3Znb93m/em33z1k/T8nyIaB2bp5sYF0cNU3xlcDHKuLAYX6K1BWEZXIxARsZFu2HRjfl0y6u4wWkX4+J39cqVBkyWbtJO6KIV89EvUq3BxQXVCpSRiMFAhGoKU96kO5gpdNVC20BCkHHamlN5xqnRMMWiamFtI8EU/xgmNWRVPhChGsaFoVrISliCfpHqsix4omp8vgASvktbGA1OD6oWqtLQTdqRnH0nP+pWYQUjsYVvnm5WLYwyEiyq1xgXx1QLog7iiBYLHV1qAabogwX84VoCuBgFAVy1IOoguKZeCLXQVAugGppqAaqKAK8epe7P56ipK0CbWydo416fxC2tE7INfRhTdQRMhwR1nAtR3X4fXfLwWE5gTIcnRDNhUR0EDE0t0l0vT+VVPBMNL0zRLxOLzibgt6lF2nTQX7TyCeBa3MORBEyHBDW+uHzmr31inF45F6JvRxZoMhSVwPHxsyHZlzke1qPSHbRSL4TPZyrTfOpP8gdXXuTQhzGZ153sCTuLgDE9umzBg2KGmf9ajGk+FUi79qr9PmVPB62Ui/A4yzT7XDOfiXEWpWsOpLvD21/MOYeApq70GYTPF3uPY2fTXaj59YBzCNj8zESa8AMjfxd9DyyMqfdAsOQYAmr2pfv/RBHmnwCuSb3Hlft87iJgnKUTUPu4z10u0D/sYBdoylgEEeQUe4+jHzh4Eexe5WPw9Nec1u/2lhxCp+K6Fj95Bq3KEuDNGggFCg6ENjxWHuWTe4oWf2UJYAiFPdlC4QD5jJUtAX0w9XIqn4CSzdDWl5ZvhhDhIcjpH1qQTwcAx2i7OiP6czQBrALb4VxKrgkCWDwhcncWS8iHOw/lT4g4ggDGl+R+/kRPWO7q8imOMZ0fhgvKATiGABaH14jKXd1DXQG69dlJGTECOMbihz6MKfR+jiOAlRmuJ2BTi3/FZ70rLMAzaMlIL1u05woCWInW4QoCPDmswxUEsDJBUy2AamiqBVANTbUAqqGpFqCqCahL2RtcscdL9U/5ZR4BfdtPzMr2T36Yl+d9v/4VG/eoV2610YZXZmhrfz9oHwEGF6bdBEBpAKlvnH8ztCBfpqQq91pvmC59JEbWZz/FSHmgM0bS+ThJ5YbBxZxm599kEwT87F+k2Yig256blOef/jgvlcTx/cdnkonW+45My80Tkqy6uSR3jpfv8ZaUdi+QgBH8UfJLuwnAN0wbx7s6Z6VyMHO0bdjrleQgk9R2JkTbOmZox8lZmWrHeGSd7P6jZLvdBDzZbdDz7wVlyHrZ7jHq/T4Wud17eFr2Y5uM748uWDJ1hpckb56PyLbWd5mNBFCbhuqqSrgAzl/tjS1qB94y5Pmh08HkSxEQg7dFcI9EG77P9HPbCNAtuj5RLDFqJwFYAN/4OJJ8o4TsEfp7Bq20FBnapuKugTYsiqMz/9oz+1wMpxZK7bSTAAAzDBeAOyTSYcgOrY+v/E+/87+p39MWcw0QZtfsB03allkyM2jXj609iIFltYSBCG10UdFUbdbKMcOkBpSWVXnZ3JactYO6SbdXceFkY07lU2sIUVqmWujyQQzAxbViPkS0DqVlCBcdPOvDQZO2a6v9GBbVo8AIoWOMkLVYZSJ4vHy+zzCjh3WLbihEt/8Aso300p+1ZpAAAAAASUVORK5CYII=",
++    "icon_dark": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAFWElEQVR4nOVbbW9URRS+/QOd21ioTSRC8AMYEwHp3G23tF1jRLSK0iKaEI2RQIOaGi3MbNvdbltrgQKtmvgSWoIaIdFQqdCaiC0Sa7HShmgMLagJmmgDkWJbvuCXMc90d90Xum/d29m7e5OTvXfecp7nzpk5c+4eTYt+ZRGDP0Aoa9IpP6MbfJwY/KZucJFKAp0IZWPQkRi8kdhq18SALeKVlW3b/bRusEuqwc1Dxgl1VgKLFs+VXVSzXKd8OAUAJGt2nCO0bllM4HMMVqxTflW10skX9jeh7MGI4Al1OnSD/6teWdNIuKXbnKVzgK9bplN2Tb2S5s+EbBu/JxR/VjrZfDQhBhsKWhizDb5FtVIKSKj4/+1be6tLjADKxmbffsGutaqVUUZCIVutEcqbM5YAg3k0r3srMlT6QcDlFFBElYxrhLKZFFBEiRDKZjTVSqgWTbUCqkVTrUBaEZDv8AjHq8dE1eFRUd/3u2gbmpSCe5ShDm3SjoDcYpd4vOGU2Dt4XXSM3owoaFPuPily7fXpQcCSh1vEruOXowIPFX7iN3H3hlZrE7BkfYto+vqvuMH7BH0xhiUJyC12id2f/xIGquWbq9IcVlS2i0Ulbim4f8LTK+tC22P2qDQHLdGOABkKZvuhEbG4xD1nH9ShTWi/ctcX1iIg39EYtuABWI7NGbUv2mzvDCZhz7fXle0OWiKdsJ2FTvtIbz5U8krdouXstaAxyqqPWoeAqsOjQcrDHOIdY6OnN2iMHV2j1iHA1fdHkPIrKtrjHgMLY+AYcJYsQ8C+oRtByi8uccU9BvoEjrFvaDKzCMgrdQd7iN9NZpYJrKzosK4JVIUsgnBy4h1jY2OfdRdBxzy3QfvOj0T7yEzCLnSgNA9MCLqta2EJyHd4wh2hztgdof3f/5MU8H4S+icWlgDd4PJIG+YKd46IvLKGOfugDlM9meB9ouYw1B1+DIaHBydnZWWH3B0guEfZmyHen6UJ0BfgOBwJZEoQoPsCIt2X4gbPen6NGhCxBAE6zMFeL8pdJ+WpLhpwtCl39cQUA7AMAbpX7nQ0yFPdjq4RUd97RXqMENxj8UMd2sQ6nuUI0JMsGU9Ac//EnHt9RswAuq1Lenq38/YyggA9wdmREQTQCLMjIwjQkySaagVUi6ZaAdWiqVZAtWiqFUhrAvYGBE0O/DAlPKf/lHEE1L388Y+yfM3z78vn+7a8M9tueEoetVGGT2Yoe7KpzzwCCOXTZhMA0BCEvvF87+a3/N8WfeAerT3hD5Ot2vquLHvpwwtekj4wRT9isCnNzL/J+ghYuqFVnv7qTl3xAnxPgsR99dGf/YHW1z4dk4cnBFlzCp3y5Hjw/HRCYfeY/y6rG2zAbALwu394Ng6488gFCQ7THGVt526IO+x1MpK06Y0vxSuf/CTNA6F2tEfUydQ/ShKDN5pNwNaOs2LzntPSZT04Mi3WvnBI1r/+2bisL6uejTKjHKEzfCRZz47LsmfaBswjgDK3huyqhTABPD9W3yOfn3t7UD5Xtn7l/ygCYvC1CObhK8NvUdURMwm43/t3eT5uJgFYAB/h3f4vSogeob7gxa6gEBnKFq1zyZ0AZVgU73qo2RTwhPKLgblClWYSAMEbhgnAHHzhMESH2s/PrvzPHjjj71fjNQ0QZtbbJwXsqaCUGaSWmTbVUkwIZYNhuYTEYEszJmmqqGb5bTPHdJuzVKaWpS/4Wzp1rouYO5hjc9rTN3HS6YgIPjCHEKll6pVOns3DxLU4ryyklsmMbMsC5xeJ4dykzfcihWw1EozgOoKQVMwygU7el9WvU95ACmpXxYLtPzTUhjPS4nl2AAAAAElFTkSuQmCC"
++  },
++  "08987058-cadc-4b81-b6e1-30de50dcbe96": {
++    "name": "Windows Hello",
++    "icon_light": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAFTklEQVR4nOVbW2wbRRSdQD94FRAgKAIEacsHAtEW+EGAolZ8BPiiKY8vkCrUz37xaFKIm7ShQNq0gBBFULWRgAqp4vGBmqYvIoVGtAFUtfErT8c7Th0SO0486zY71kV3Nna8G8drOxtPNl7pyLuzM6N7j+/M3LmzlxCLCwAqQgyepizZSBk/Rxn3KozHqZqEpQSUSWHco8uYbKBxeMpKN0vFFZW/Thn3yVauaDDuDTJtC+pCCrkCCVhDVf6XdAVsA+8aSUBlXspTFZ5XVB6WL7TtJIwFE9qmnMoHE9pGyvi0fGEXCYxfD6lQlVX5kQRUKioflS5kCSxhOAFrDcoDQMXyGvOWlnDeMDEqKn9DulAlRohpNbP/vpOXuiKBPgPBK8TgGdnCSCMhDhsIZcndsgWRBpbcRYTrWL4EnEEC/OVLAPcShfEp6YJIgsL4FJEthGwQ2QLIBpEtwLIiwB2ZhpbzEag+MgRr9vXCLfVugbX7ekUZvsM6y46A/pgGH5wMw0qXB8iOKzmBdXa0j8LAJF8eBPwTvg7rv+i3VNyMxw/0wYWRa84m4O/wNbj/Y1/ByqeAbbEPRxLQH9Pgyc/n/vP37PaK4dA+yKB3QhPA+/fbwuKduT5aj8zhQIptiEqalXmlNQC+qDZvG3yHdczt6k6NOouAnvHpORMeKqYw67ZYx0zC7S6PtNWBFNMIlzOz2ef6583wRjW4u9E4HA52RZxDQPWRIYPwOBwK7eO9NuMQevlowDkErG72G4Q/NcgK7gMnxsw+0FlyDAG31rsNwvsn8jf/FLBNZh+3udzlRYA3aiRgpZMIWG3DEDg54OAhUG2aBNHJKbSPd084eBJsWeAyeKg7AjfUFuc+m3FfkxdaL8VKS4A7sjBH6KYPjXPIQrGqyVdaAqiaFFvabK6wNzq/R4fv0NTtVD4FKZuhdVm2wejhoZPTNsDE6oDAeyy7q9E6XuAYAmgJtsO5lFwSBNBUQOTLwgMiTxy0Dog4ggCqJsV+vrZ9VOzqrBTHOjtP5xcScwwBdAae6LTY1b10NACP7u8VHiMC73Hyw3dYJ2/hnEYAtRllT8CqJt+8a31ZWEDrpZjw9LJ5e2VBAC3SOsqCgNYc1lEWBFCbQGQLIBtEtgCyQWQLIBtEtgCIY5cn4ZvuCbHDdDwBTR1jYml655dQuuzePfohyOF/9dn6XEBNb4jwGU+K8bn7aukPSonC+KSdHZ4eYgblOoMJ8VxRewW2/aqT8mnnuCjb+jMVz38EVDjRH4ehKZ41+oQR5MVQXmE8Ruz+TDbIknDHLg/cWNcjIkD7/xwX8b+qbwfFthnr1PwYFAQcuhidYwF9MT1cjlaz+YdhQdyKuh7RzyIQ4MEvRc/a3fGLh/Wo8feXJ+HNnxR4rKUP9nSMwYqdPeK4/MG9uheHsYT5CEC8dZyC6+x/4v6BvcV7exYfSiYb7O4Yj7tR6O2/X4XKZj+8fZyKswMsOzATUX74M3+6fjYC8KRoOK4PCdxSoyXkE3QtyAJUXk8wu8puAn7zTaUPO/D3qwtRMTQwGJIqe+1YMCcBmf/4nQ16oAX7sFPOYBzWpT6X99rZMU5mN380G/q+ODO7b/puMF3WnDGmZRCgMO6ezRVi2ha7reDZr3VlH/rElzWU3jGsyrUApr1qTpnpspuEpQqF8c45uYQjCXikXJKmMC8ya+ZYSIUqTC2TL+QiQegGL+TMHaQqPLeMEyc35lQ+M4cQU8vkC23fmMchTgq5QGSNazUiI9u5irtDTNtMFnopcdiACUboOiIhSzHLBGXS0+eTZxSVu5Q4rM9Ht/8BKeS3DfxVUOoAAAAASUVORK5CYII=",
++    "icon_dark": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAFSUlEQVR4nOVbXUxcRRQ+G7HlgSam2pr4YqGmTUTT1v5gUrXS3rsLZcVC/wRtWgJFqCDU1M69LC7gamwRiDVRW1oBoUXKz9YXjYmhhrba6IN/bWG7/lAtPmh8UXypL8ecWXbh7i771wuzd3eSL3vv3JmTc757ZubM3D0A4YsJzMpakNirICufg6S4QFL+BVnBuALpJLExrqOsNIGl7pEIbAtZTCAd3gUyuy7cuNhJcYGs7uC2RFWyDy0HSflKuAH64TLItvTIjJfYYyApf8SB0jqD/QUy2xzaeLOaDbLyn3hl5wgSuwWSuim48bItHST2p3Al58MTzMoD/uabEmzMhyPhS+3EaFZ2i1dqnrGFbZ9++0Ze6mIFxQy8SC+vE66MOC9YAyApDuGKCANrhKnQEZMSkjJMBLiTmAAXgMwmhSsiDGwS4kMRgQDRCogGiFZANEBHYanWBsx88QPMb7uI+zqvYlX/DY69nVd5HT2jNglHQEpuPW5QhvDA2XE8eO73kKA2G9ggpuTYEoOAtG0OLD7xTVjD/fHcye9xUeHrxiYgrcCB+09fj9p4L6gvyTAkASm59Vjc/m2AUc/3/ohZyiAuKWrBO7e+wkHXWcoQf+bfnrxH6HCAGDvSmPc3xtpyARdstc/ah55RG/9+69mAsQhItTYGTHhkGJjV8P3NKlpbRrQTY9+4uNUBYuhEy5m/24d68wGekGfHig9/0sh4sKrLOATkt13UKE9jPloZWap2CD3VesE4BOzrvKZRfskzLVHLoIlxpgwKlgxDQFX/DY3yNNNHK4P6zJTxQv94chGwIM+uJeDseHINgaXFrcYdAvkBk+BQ1DIeVZ3GnQQzb3MZXFl5CmudEzGH0Npw2o0ZZcfnl4BUa0OQQGgk4kCoeuA3XYz3kdDjnl8CgEJhNhgkFB7BhXmzewI9I1fX03gvxGyGTgRugynCoyBnaVGrbzNE11RX0auN/gxNAMzDdjiUkXFBAEwdiBTFcCDybPt3YQ9EDEEA0HDIseF6Nsh3deEMpzbrDvdHdAZgGAJgCgutdr6ro4lub8eV6UPRjiu8jp5Rm0jlGY4A0BlJT8D+Hvesa31SeEBG2XEe6QWL9pKCAIjRO5KCgIwQ3pEUBIBeANEKiAaIVkA0QLQCogGiFZAVvL/kXVxRcYrvMA1PwKqDvXxperLpY19d+RnPN8Hl5e38/u7dzb4NEd3Tl2K6T9v2mgACJOUfPQXeU/Smxri7dhzxrNfOCXyi0UPKwzWneV120yf8fvGuZry3uA3vsNQFPX2iE+Q5MV5if4Pef5M1ySpW9v2Ctc6b/AQos7oba89NYOHbl/m2mdrkHB3mBKyofD/AA2gY0HX5GTfmNp/nxNUM3eRy5oCAMUqQOK+34Kff+oIbsaz0PTS/8RnuOfkDrn6plxtCJ0Sl3a4pgx2zEkDY7PgU1x7q49dl3a45+6Nkk96C6XM3Kb2x/iMs6brGDaFvB1SXWe05US7pGvW1D0YAfSkymeumP8Q4JyI7dI3OA+zAs6t0JuC+Pcd8Hzvod+WBDj406DDEW2c5MhySgJlvvLLvZ15HMnTV1cxWeZMlXHoKpsmseuBXnysvKvDM7gXHPEOD8FBNj2gCRsFXKLVMZy/Y+c7XXOnS7rGgR+mLdx4VTAArmCaAJ01Qapm+JMQtJHYpMJfQwpYlTdIU5UUGLZK6iaeWJe6bvwUW9fHgxnuLrG5M2MRJyouMqMi2dJ5aljhv/hIf4lEWE08t82Rko0ExCpJaCLddtrA1PMGIQkdOSDxmmbBJrhvXUWkAuW51JKb9D4Iu55NDTaFvAAAAAElFTkSuQmCC"
++  },
++  "9ddd1817-af5a-4672-a2b9-3e3dd95000a9": {
++    "name": "Windows Hello",
++    "icon_light": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAFTklEQVR4nOVbW2wbRRSdQD94FRAgKAIEacsHAtEW+EGAolZ8BPiiKY8vkCrUz37xaFKIm7ShQNq0gBBFULWRgAqp4vGBmqYvIoVGtAFUtfErT8c7Th0SO0486zY71kV3Nna8G8drOxtPNl7pyLuzM6N7j+/M3LmzlxCLCwAqQgyepizZSBk/Rxn3KozHqZqEpQSUSWHco8uYbKBxeMpKN0vFFZW/Thn3yVauaDDuDTJtC+pCCrkCCVhDVf6XdAVsA+8aSUBlXspTFZ5XVB6WL7TtJIwFE9qmnMoHE9pGyvi0fGEXCYxfD6lQlVX5kQRUKioflS5kCSxhOAFrDcoDQMXyGvOWlnDeMDEqKn9DulAlRohpNbP/vpOXuiKBPgPBK8TgGdnCSCMhDhsIZcndsgWRBpbcRYTrWL4EnEEC/OVLAPcShfEp6YJIgsL4FJEthGwQ2QLIBpEtwLIiwB2ZhpbzEag+MgRr9vXCLfVugbX7ekUZvsM6y46A/pgGH5wMw0qXB8iOKzmBdXa0j8LAJF8eBPwTvg7rv+i3VNyMxw/0wYWRa84m4O/wNbj/Y1/ByqeAbbEPRxLQH9Pgyc/n/vP37PaK4dA+yKB3QhPA+/fbwuKduT5aj8zhQIptiEqalXmlNQC+qDZvG3yHdczt6k6NOouAnvHpORMeKqYw67ZYx0zC7S6PtNWBFNMIlzOz2ef6583wRjW4u9E4HA52RZxDQPWRIYPwOBwK7eO9NuMQevlowDkErG72G4Q/NcgK7gMnxsw+0FlyDAG31rsNwvsn8jf/FLBNZh+3udzlRYA3aiRgpZMIWG3DEDg54OAhUG2aBNHJKbSPd084eBJsWeAyeKg7AjfUFuc+m3FfkxdaL8VKS4A7sjBH6KYPjXPIQrGqyVdaAqiaFFvabK6wNzq/R4fv0NTtVD4FKZuhdVm2wejhoZPTNsDE6oDAeyy7q9E6XuAYAmgJtsO5lFwSBNBUQOTLwgMiTxy0Dog4ggCqJsV+vrZ9VOzqrBTHOjtP5xcScwwBdAae6LTY1b10NACP7u8VHiMC73Hyw3dYJ2/hnEYAtRllT8CqJt+8a31ZWEDrpZjw9LJ5e2VBAC3SOsqCgNYc1lEWBFCbQGQLIBtEtgCyQWQLIBtEtgCIY5cn4ZvuCbHDdDwBTR1jYml655dQuuzePfohyOF/9dn6XEBNb4jwGU+K8bn7aukPSonC+KSdHZ4eYgblOoMJ8VxRewW2/aqT8mnnuCjb+jMVz38EVDjRH4ehKZ41+oQR5MVQXmE8Ruz+TDbIknDHLg/cWNcjIkD7/xwX8b+qbwfFthnr1PwYFAQcuhidYwF9MT1cjlaz+YdhQdyKuh7RzyIQ4MEvRc/a3fGLh/Wo8feXJ+HNnxR4rKUP9nSMwYqdPeK4/MG9uheHsYT5CEC8dZyC6+x/4v6BvcV7exYfSiYb7O4Yj7tR6O2/X4XKZj+8fZyKswMsOzATUX74M3+6fjYC8KRoOK4PCdxSoyXkE3QtyAJUXk8wu8puAn7zTaUPO/D3qwtRMTQwGJIqe+1YMCcBmf/4nQ16oAX7sFPOYBzWpT6X99rZMU5mN380G/q+ODO7b/puMF3WnDGmZRCgMO6ezRVi2ha7reDZr3VlH/rElzWU3jGsyrUApr1qTpnpspuEpQqF8c45uYQjCXikXJKmMC8ya+ZYSIUqTC2TL+QiQegGL+TMHaQqPLeMEyc35lQ+M4cQU8vkC23fmMchTgq5QGSNazUiI9u5irtDTNtMFnopcdiACUboOiIhSzHLBGXS0+eTZxSVu5Q4rM9Ht/8BKeS3DfxVUOoAAAAASUVORK5CYII=",
++    "icon_dark": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAFSUlEQVR4nOVbXUxcRRQ+G7HlgSam2pr4YqGmTUTT1v5gUrXS3rsLZcVC/wRtWgJFqCDU1M69LC7gamwRiDVRW1oBoUXKz9YXjYmhhrba6IN/bWG7/lAtPmh8UXypL8ecWXbh7i771wuzd3eSL3vv3JmTc757ZubM3D0A4YsJzMpakNirICufg6S4QFL+BVnBuALpJLExrqOsNIGl7pEIbAtZTCAd3gUyuy7cuNhJcYGs7uC2RFWyDy0HSflKuAH64TLItvTIjJfYYyApf8SB0jqD/QUy2xzaeLOaDbLyn3hl5wgSuwWSuim48bItHST2p3Al58MTzMoD/uabEmzMhyPhS+3EaFZ2i1dqnrGFbZ9++0Ze6mIFxQy8SC+vE66MOC9YAyApDuGKCANrhKnQEZMSkjJMBLiTmAAXgMwmhSsiDGwS4kMRgQDRCogGiFZANEBHYanWBsx88QPMb7uI+zqvYlX/DY69nVd5HT2jNglHQEpuPW5QhvDA2XE8eO73kKA2G9ggpuTYEoOAtG0OLD7xTVjD/fHcye9xUeHrxiYgrcCB+09fj9p4L6gvyTAkASm59Vjc/m2AUc/3/ohZyiAuKWrBO7e+wkHXWcoQf+bfnrxH6HCAGDvSmPc3xtpyARdstc/ah55RG/9+69mAsQhItTYGTHhkGJjV8P3NKlpbRrQTY9+4uNUBYuhEy5m/24d68wGekGfHig9/0sh4sKrLOATkt13UKE9jPloZWap2CD3VesE4BOzrvKZRfskzLVHLoIlxpgwKlgxDQFX/DY3yNNNHK4P6zJTxQv94chGwIM+uJeDseHINgaXFrcYdAvkBk+BQ1DIeVZ3GnQQzb3MZXFl5CmudEzGH0Npw2o0ZZcfnl4BUa0OQQGgk4kCoeuA3XYz3kdDjnl8CgEJhNhgkFB7BhXmzewI9I1fX03gvxGyGTgRugynCoyBnaVGrbzNE11RX0auN/gxNAMzDdjiUkXFBAEwdiBTFcCDybPt3YQ9EDEEA0HDIseF6Nsh3deEMpzbrDvdHdAZgGAJgCgutdr6ro4lub8eV6UPRjiu8jp5Rm0jlGY4A0BlJT8D+Hvesa31SeEBG2XEe6QWL9pKCAIjRO5KCgIwQ3pEUBIBeANEKiAaIVkA0QLQCogGiFZAVvL/kXVxRcYrvMA1PwKqDvXxperLpY19d+RnPN8Hl5e38/u7dzb4NEd3Tl2K6T9v2mgACJOUfPQXeU/Smxri7dhzxrNfOCXyi0UPKwzWneV120yf8fvGuZry3uA3vsNQFPX2iE+Q5MV5if4Pef5M1ySpW9v2Ctc6b/AQos7oba89NYOHbl/m2mdrkHB3mBKyofD/AA2gY0HX5GTfmNp/nxNUM3eRy5oCAMUqQOK+34Kff+oIbsaz0PTS/8RnuOfkDrn6plxtCJ0Sl3a4pgx2zEkDY7PgU1x7q49dl3a45+6Nkk96C6XM3Kb2x/iMs6brGDaFvB1SXWe05US7pGvW1D0YAfSkymeumP8Q4JyI7dI3OA+zAs6t0JuC+Pcd8Hzvod+WBDj406DDEW2c5MhySgJlvvLLvZ15HMnTV1cxWeZMlXHoKpsmseuBXnysvKvDM7gXHPEOD8FBNj2gCRsFXKLVMZy/Y+c7XXOnS7rGgR+mLdx4VTAArmCaAJ01Qapm+JMQtJHYpMJfQwpYlTdIU5UUGLZK6iaeWJe6bvwUW9fHgxnuLrG5M2MRJyouMqMi2dJ5aljhv/hIf4lEWE08t82Rko0ExCpJaCLddtrA1PMGIQkdOSDxmmbBJrhvXUWkAuW51JKb9D4Iu55NDTaFvAAAAAElFTkSuQmCC"
++  },
++  "2fc0579f-8113-47ea-b116-bb5a8db9202a": {
++    "name": "YubiKey 5 Series",
++    "icon_light": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAFV0lEQVR4nOVbjW8URRRf/ghjNKDUGjUBoxXjR7TWAhUMGKkgUtRIhKjRxBijaY3B0tIPKFQhNGCpbSUR26JemqhYo2f5qK2CUj7aci2KVErLXa83w+5ca7m5PPMmd83t9b7Z63TvNvnldufj5b3fvpl5M7dPUaJcADCHgnsR8WqllLN2wpmNco1RL4NZBa4xwtl5oaNXKyHAHohmW3TDubaWcNYv3bgEgS+LeNQ1aIsSz0WBZhKu/S7bAOOI0LoITGTEZLwL1McJZ3bZSifBG5zEoy2OaDzxaLmEa9dlK5tET5h0gZoT2niYyCCcOWQrOROeQIHeqTMeAOak0piPwRM6dRMj5doLspWacRI86uqAt2/epS5xL2DnfUue+0HZykgjAViWQrza1rQlwKttUTB0lK2IRFgVwtlA2noAZzb0AE22ItLAmaZIV0IyFNkKyIYiW4GUImDQfRXqT1mgoKkQHt5TALeV5wk8UlMgyrAO26QcAfbJMag8+hncUbkMbtqSHRHYZtuxerBPulKDgAE6CEv2b4xqeDCe+HQD9LkumpuAfnoJ7v04P27j/cC+KMOUBNgnxyC39tVpRt2z4xmoOFoHXVfOwMh/TgG8Lz9SJ+qC26P3yBwOSqIdccwHG/NyywdwZWI0bB+swzbB/aqON5iLgEtsZNqEh4YRrkXti21eai7S9c3ctlza6qAk0gmXs2C3j/TmgzE07oC7q1bqZDR2t5qHgIKmQp3yOObjlVF2ZL9OxovNheYh4KE963TK/zZ8Nm4ZODEGysBgyTQE3F6Rp1N+eMIZtwzsEyhjfsVT6UXA0LhDJyOjcll6DYFOMw+BgqBJEIOceGVsba817yRYf4PL4MFzh+HmkpyEQ+hALKheBRabdWYJGHRfnRYIYXATayA0r2ypIcb7sbA6f2YJoF4mtrTBiiAJl8cdYftgHbq6kcb7IWUztDjENhgjPAxyfh06LVYHBN5j2V1VK5JivBQC6AxshyMZOSsIoL4DkaV1m+I2PieGAxFTEEDFcHDB9mMNYlcXzXBss+N4Y0xnAKYhgPrwr9sudnXrm4rg0Zr1ImJE4D1OfliHbWKVZzoCqMFIewIWVueHXevTwgMsNquI9EJFe2lBAE3QO9KCAEsE70gLAqhBUGQrIBuKbAVkQ5GtgGwoshXw45zzAjT1/AAnR3pD1p8Y6RH12G5WEtA79rcIe28pfVKc92GZ03NNbHpwqdp7oiVi/30nD4l2xT/vDVm/+acaUV/7x1cGE8CZapSw3V0Hp/7wHOPq1P+HKxrfBBdX4yIAd5mBJ0y4be4Y6oZ/tGHjCODsmmLkZ7Jo5NMNbwhD3v2+CuaWLYF55Xlw1nlBrNVYvumbYtEWXR2fVza+pSMAD1yzdj0v7hftXgunHLakeQDBz2Wpl/1ipEudHh2AuQFnfrs6vxDlfgJes5REJABPjVp6f4Sitk/E86oDbydzCFjxU9kSIwkIPPLO3vfKlOvHSsA7320Xz6MeCreW5govQhlJIYCzjxTMrjKagM+7W4Wy6758f6qstb9dlG38erN4brvYKZ0AF7D7/J/L25JNAC5jWLZg57Nw4My3sLz+9bBDoLmnDQqTPAQIZ30BuULqmmQTgNhw6ENRjm/1vcM7QxKAp0n+SRB//7QnZxIkHnd+cMpMl9FDIRT+Ui+D4zqJ2i54GTQShLOOabmEBCbmp1HSVGa4nMEcTC1L8bS57Ii5gyqoj6Vw4mRuROP1OYRaZwoZ34FDXInnApwYPepqkZFtXsP7iEd9TrnRiwDLwgQjDB19KeqzL8uEM833sqyUs2IC7P5YbPsfK2FTTp1biVgAAAAASUVORK5CYII=",
++    "icon_dark": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAFT0lEQVR4nOVb228UVRif/gvMWZZLNYWi0e6ZrQvtJhTKWghNbIllz3R2K22pbSW0XUKhWFGwtNstoIY2AYyCKawXKhXUN6PGUl6IiCbeHrpFE/ESL20ajeKLvhzzHbrrzu529sLMnp3uJL/szLnl9/3mO9edTxCSXwVIkdaJRBpERLqKCJ4WCf4byRLNJcxzCgFHUZb8yC2tTcE2zasAydgjyvgmb+MyBsHTFrdUD7YI6VyW7bZiRPAN7gboBnzdqthXpWa8Yt8oyniGP2ndMSe67Zs1jReJrQoR/G8OkDUGRPoHKdiV0HirYl8lEjzLnWQWPMGilKyJtb9gcfX5pJ7wsWpgRMTm5U4qy7AQuxx5+6ae6jJH6M7AJ+OyHCDDCXYHCBDgT4QPRFkaENjyNgfI8AG+Ah7wDX8inEDwtCAS6TZ3IpwgEum2wJsEbwi8CfCGwJvAohKgsLmcukaaadvkEO0NnaX+mYsMT4bOsDTIgzKLToBlDQ5ac66T9v8yRo/98bYmoEztuS5q9ToWhwBF7RV07+cnkxoei/1fv0hX79pobgGK2ivoM9+dT9v4MKAutGFKAZY1OGj3l6fjjHr2h9do7fku+uC+rXT5Y2sZ4L426GN5seXBe3h2ByHTitDnY41p/WiQrmgsW7AO5EGZ2Ho1ox3mEqBwpzNuwAPDLPX2pHWhTOtEQD0w/nyB2+wgZFIJprNYt9d684k8oe/H11VtuIabzCNA2+SQijz0+XTb2Bb0qT3oSsA8AvSGzqrIwyCXbhtQJ7oNWCyZRgD/b2+qyC/fsS7tNqBOdBsDv47llwArGsvMK0CvDl2gZL+Ju0Bb7CAY9KXdxrZX95h3EHTd5TS44TkvPfr75YyX0NE4dCtInX45uwIUNpfHL4QmAikvhAZnx3UxPlqErAqAZIltaeOWwhMBurJpYU+APHB1PY0Pg89m6ItTcURghQeLnJKeajY7AOAe0vp+esMQ47kIgLKwHdYyMicEQJEDkXhPSIZ9XyU/EDGFAEiW2H6+ZrST7eqSGQ5lHhntSOkMwDQCoHmshEPR4SY20B2YepmtGAFwD2mQB2VSbc90AiCdkfcCHLoVXHCuzwsPcPplZnii1V5eCIAy9I68EMCp4R15IQDSCQJvArwh8CbAGwJvArwh8CYQRnHHJlpx3Esf2LslYT6kQz6Uy0kBVu+uZMveoblL7LwP0pZ6StmmB6aqLadbNetvPvU4K1d3oTthft1YN8uvOtmiuwB/6dXY1peeiPzhuVSxR/4/7LoxnPS0KFYA2GVG14FnW081vafFqZ8ARPpT0PMzWSDs+3SEGaK88xQNzI7TwZmLtLjTxeZqSG9+/0jEpeG585MTKgHgwPXpb0fZ/cGbr9D7fA8b6QEh8IBJPV1qTZdLdeZXfWYXSw8L0Phen6YAcGq0/piHyuM97Hn3tecNFADDh5KSX08Boo+84SuQsBunKoDn3YPs2eoppYG5S8yLoA1DBCD4iADRVXoLsOlEIyPbfvVoJK18gLC0nR/0s2fH4Ue5C2Bx20rDwRLTRgsQfuOHvw/Syhd20D2fjSzcBY57qfzWAaO7wNT/gVJuqd5oAQAtHw6wdHiryuXehALAyVF4EITf+31VhgiwxI3d6pAZGV/Xuyskwr1t66m1Ifl5YOw0qCdEWboWF0torSstypugqe224oSRY0jBLhZaxp+kMbhjW6Vm7KCF2DYs2sBJYqvSND46hhBCy3KAtG59Hrq4kOZVAKFlLCI7B4zIEFNLZBsR7vZCst0BAUawdARBcjHKZJ5TiHEkuN+ilDyUim3/AdiJ7a/WmndUAAAAAElFTkSuQmCC"
++  },
++  "adce0002-35bc-c60a-648b-0b25f1f05503": {
++    "name": "Chrome on Mac",
++    "icon_light": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAFQUlEQVR4nOWbb2xTVRTAH190GgxK1AQ0Chl80SigflODzD+JfFOIfjQaTQQn4YNRxja2MRiRJeBmTDTRIcwPfjIKixsbY/wp93aJIRDjtnbdyiKtunZt927npO3rMeey1+69rn95r3evb8nJ2nffvTnn13PvPfe8dyQpzx8ArIA557MKIwcVmQwpjI4pjESTjMJyEtRJYXR0QccWiJJn8tmW33BG3lIYcYk2rnQodAxk5060pTjjI45qhdFh0QYY6B0Uws71hRkv0xcUmf4jWmkTIASBOWtyG8+c2xSZxEQraxoEmdwCmWxd2viwc73C6LRoJcviCRGyQWs8wIpKmvP5IVCiWRiB0bdFK1VuAZnuWPTrW3eruwMvGL0NYG74OdHKCPOC6JUtksJIq2hFBHpBs4Sho20ByGQQPcBtYw8YkxRGmY0BMEm0EqJFEq2AaJFEK1BRAOKBfog4GsHXVQPeo9Uw3rCKi/foBn4N2/CeigOghC5AsO8jGD+wGlyf3ZVT8J5gXy0o4YuVASDm74GpjqfzGq6XG8efgNjNX6wNIOY/AxOHHynaeFWwL45hSQBK6AJMffFUhlGegw9DsHc3zI93QyJ0ngt+Dvbu4m36+9F7RE4HqdSOOOf1xvi/fw0SM4NZ+2Ab3qPvF+z/2FoA4tNnMxY8NCwpk/z9ZQK+E69qF8am1cJ2B6mUTrid6d0+1y+f6QnnwNOinQ4RR5N1APi6arQu3Lu76DECv36oGcN34hXrAPB+Xq1Rft7TXfQYuDAuHgODJcsAGG9YpVEeV/pix8A+mnWg8X6bAZg5pwPwgN2mwCnrTgFfxiK4y16LYOQOt0F5+DC49t1dcgitCacPrQF29Vh5AcQD/RmBEAY3hQZC7vqVhhifhrC2vACSPBSuzVAEISSCA1n7YBu6upHGqyLmMNSReQzGCA/n97z7ZPow5D7Jr+mjP0sDSJbhOJzLyGUBIJlKiGwq2vgbx5/MmxCxBIAkTofwRQiereWnunyG4z3B/j0F5QAsAyC5IInAAD/V+bpeBm/7xnRStH0jX/ywDe8pdDzLAUgaLLYHMHFobda93hYewK4e45HeUtGeLQAkS/QOWwBgObzDFgCSBokkWgHRIolWQLRIohUQLZJoBSoOQGjwk9T2FBr6NHU9QlpS1/FovGwAKIzKZgHAM4CaJZrq2LwkAMwr3PrzJ4j91ZM1o4QnTt5usPEKI7OS0a/JqgAwy4v/o9e/hH9d32muqQBmBvaCa19VOqBpXQPsWkdqrLCjUZNE8Z963WAAdBRflDxvBoDAz+/ARNujcPPbl8Dfvf32Y/OeDzQAor9/BexaJ/zn/RHk39p5rnCy7THeNjfyDYeD/WZpKwcTvlxvxouStMUUAKff44+90Qj3/nshcOb91CN1FcC85wcOB98zmDyyDtx19/B2JTQEgdPv8s/Yx2jXVwVkckDC6iqzAMSn+8DdcB8HgKkvPYDJI4+Dq66KT4Xo9U7wND/I2zFnUBYAUecmtVhizAwA+H12uI3vAPhZAwDT4winfiXM/fE1hC/VpZ4VIAC8ht/TU6ATwpf2G+f+jIwsKpRy7jQLwGLRewCfInVV3FBc4NQTnpo1QoM9zQ+lF8Hu7Ua6/xu6khlCzXK1XILG5ns7BLfB+N+9Bv761JFRSwhhus4+RVOO6iw1g2QrlpZVdtmc88XctYMyeb6CCye35TReV0NIKsd46sApLhVdPC3THRguWvhXHwGZvlmU4dJSMKJXtmCBEYaOvER9GVaZoE4L5fODCZk0QdSxuRDb/gdmQw4+nQQzYAAAAABJRU5ErkJggg==",
++    "icon_dark": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAACXBIWXMAAAsTAAALEwEAmpwYAAAFd0lEQVR4nOVba2wUVRSe/jdza4otUYwSRBIfgWXvLGpfS6OWl49iBX8YayjFhJgoIJ27bbfttnRpqxLahAQNpPEHscBiQyIvtYBaIaKhSldaQEwLVUGrSAvyNMec2+6ys9vuq7O9O7s3+bKzcx8555tz7z33zBxJCl1S2BxiVimpYYp8iCmkhynyFaYQiC/IV1SFdI/I6Cgzk9lh6Ba0pJQq8hKVklPilYsaPTYzKURdpEjKO2Z5GlPIt3GggD6g5Gi5hUwNS3nVfHcWo+SicKF1hkrJgGoheUGVt1nIXKaQm6KFjRkJCrlho6m5oypfbiFTVYX8IVrIibAEZpIf8tc/JaHmfGgSjmgWRkblpaKFEkDCS96nb/CtLjoCFNLNtV+ryFS0MAKtwCQxSmpFCyLQCqqlEdcRkhJUbkcLOC1cEHHokVRFHooDQYRAVeQhSbQQoiGJFkA0JNECJBQBDmsG7GDZ4G5bDhe+U+HaL3UcF46V8ntYh20SjgB7Zhrsb1wAV8/Uwn+/NQYFttnXMB8qnkpLDAKc+fdB35dvh1TcH/3frIH6BfcbmwBn/hT4u8sesfIeYF8cw5AE2DPT4NzXqwKUutxdBfsbF0LTkoehMnsSB14feHchr/Nvj9YjcjpI0XbEOe+vzImdy6Aq554x+2AdtvHvt3f9PGMRUDN3csCCh4rZLKkh+2KbEy4tCVfP1AjbHaRoOuF25m/2wZ58gCXkpsNgd7VmjO1qlnEIcLct1wiPcz7SMQ68t0gzRteuYuMQcPF7VSN808vTIx4DF0bfMdBZMgwB187WaYSvzJkU8RjYx3eMf8+uSy4CqnLTtQT8XJtcU6B56QzjTgG33yKITk6kY3z2voEXwR3j3Aa3rX4Cbv/aELUL7YtL7kpoWUknlgCHNSPQEXKF7whd79WuIeMnwT6xBDCF8CNtgCvsWgbV1vQx+2Admrqeynsg5DDU91XgYQg9PHRyml+ZwXcHBF7jvcEerfdnaALYBByHgykZFwSwkYBI7+HIAyLnO1aHDIgYggCmEH6e31c/n5/qQimObfY454UVAzAMAWwE1dYMfqrr+qQYfj9Wyj1GBF7j4od12Cbc8QxHANMZSU/AJbd9zL0+KSygZSXlnt5o3l5SEMCitI6kIKAliHUkBQFMJ0iiBRANSbQAoiGJFkA0JNECJBwBux3PeLentqo87/3WtVne+xgOix8CqDwYKwLwDOCJEvUeemtUAjCu0LDoAajLnzJmRAlPnFivt/IqlS9Len8m6yEAo7z4u6VkFmx69RHNPQ8Bn9Y9C7f778QG/3HbYesbs71j7bTlaIIona1F+n8uq1L5YCwIOLypAP76sQJ+2l0Cx1tf44HTzzc8pyHgw+KZsHWFCTYUTIOP3lTgRp8TBn4o53Wbix7l5GC/j9dkcmJcZbkx+FBSIY5YENDe9AJ/7Y1K3Dy3Hr7Y+Lz3lbqHgI2F0zk5+J3Bn8fL4Nb5el5vz0qDg80v8mvso7fp+0yBSgmzq2JFQE3eZLje6+QEYOjLn4CBzjK41V/Pp8KWEhMMnXbweowZTAgBltSZnmSJnlgQgP+3rXqS7wB47UvAcHjcyc3+g9cfh10VVu+7AiRgc9Fj/L93CqwwgavcqqP5k5N3coXMpDBWBPjC3wJwiqAFoKKd24u8JzxP1AgVHjo1bBUInC66PX2FFGhTZig5GitTCwZUNtTXIbgNrnv6Xj2V7wjIJVTnkAeTJWkK8yJHT5ujqbmYWpbQaXOW1OzguYPmuzITNXES8yKlcEo55hBSciSBnnwHTnEpwpKCqWXDGdnilYgKlJy0UbJYGm9RKTFhghG6jkhIPGaZoEz8YVG5nVG5qkwhs8LR7X/+rI/yCE+gcgAAAABJRU5ErkJggg=="
++  }
++}
+\ No newline at end of file
+diff --git a/src/pages/account.astro b/src/pages/account.astro
+new file mode 100644
+index 0000000..ffa3ddd
+--- /dev/null
++++ b/src/pages/account.astro
+@@ -0,0 +1,17 @@
++---
++import Layout from '../layouts/Layout.astro';
++import AccountSettings from '../components/AccountSettings';
++import { db, RP_ID } from '../utils/passkeyStore';
++
++const user = db.getUser();
++const credentials = db.findCredentialsByUserId(user.passkeyUserId);
++---
++
++<Layout title="Account Settings | The DevTools Times">
++  <AccountSettings
++    client:load
++    initialUser={user}
++    initialCredentials={credentials}
++    initialRpId={RP_ID}
++  />
++</Layout>
+diff --git a/src/pages/account/settings.astro b/src/pages/account/settings.astro
+new file mode 100644
+index 0000000..d37ecff
+--- /dev/null
++++ b/src/pages/account/settings.astro
+@@ -0,0 +1,17 @@
++---
++import Layout from '../../layouts/Layout.astro';
++import AccountSettings from '../../components/AccountSettings';
++import { db, RP_ID } from '../../utils/passkeyStore';
++
++const user = db.getUser();
++const credentials = db.findCredentialsByUserId(user.passkeyUserId);
++---
++
++<Layout title="Account Settings | The DevTools Times">
++  <AccountSettings
++    client:load
++    initialUser={user}
++    initialCredentials={credentials}
++    initialRpId={RP_ID}
++  />
++</Layout>
+diff --git a/src/pages/api/credential/[id].ts b/src/pages/api/credential/[id].ts
+new file mode 100644
+index 0000000..1f3e609
+--- /dev/null
++++ b/src/pages/api/credential/[id].ts
+@@ -0,0 +1,73 @@
++import type { APIRoute } from 'astro';
++import { db, RP_ID } from '../../../utils/passkeyStore';
++
++export const PUT: APIRoute = async ({ params, request }) => {
++  const { id } = params;
++  if (!id) {
++    return new Response(JSON.stringify({ error: 'Credential ID is required.' }), {
++      status: 400,
++      headers: { 'Content-Type': 'application/json' },
++    });
++  }
++
++  const user = db.getUser();
++  const cred = db.findCredentialById(id);
++  if (!cred || cred.passkeyUserId !== user.passkeyUserId) {
++    return new Response(JSON.stringify({ error: 'Credential not found.' }), {
++      status: 404,
++      headers: { 'Content-Type': 'application/json' },
++    });
++  }
++
++  const body = await request.json().catch(() => ({}));
++  const name = typeof body.name === 'string' ? body.name.trim() : '';
++  if (!name) {
++    return new Response(JSON.stringify({ error: 'A valid passkey display name is required.' }), {
++      status: 400,
++      headers: { 'Content-Type': 'application/json' },
++    });
++  }
++
++  cred.name = name;
++  const saved = db.saveCredential(cred);
++
++  return new Response(JSON.stringify(saved), {
++    status: 200,
++    headers: { 'Content-Type': 'application/json' },
++  });
++};
++
++export const DELETE: APIRoute = async ({ params }) => {
++  const { id } = params;
++  if (!id) {
++    return new Response(JSON.stringify({ error: 'Credential ID is required.' }), {
++      status: 400,
++      headers: { 'Content-Type': 'application/json' },
++    });
++  }
++
++  const user = db.getUser();
++  const cred = db.findCredentialById(id);
++  if (!cred || cred.passkeyUserId !== user.passkeyUserId) {
++    return new Response(JSON.stringify({ error: 'Credential not found.' }), {
++      status: 404,
++      headers: { 'Content-Type': 'application/json' },
++    });
++  }
++
++  db.deleteCredential(id);
++  const credentials = db.findCredentialsByUserId(user.passkeyUserId);
++
++  return new Response(
++    JSON.stringify({
++      success: true,
++      rpId: RP_ID,
++      userId: user.passkeyUserId,
++      credentials,
++    }),
++    {
++      status: 200,
++      headers: { 'Content-Type': 'application/json' },
++    }
++  );
++};
+diff --git a/src/pages/api/credentials.ts b/src/pages/api/credentials.ts
+new file mode 100644
+index 0000000..069d0b4
+--- /dev/null
++++ b/src/pages/api/credentials.ts
+@@ -0,0 +1,20 @@
++import type { APIRoute } from 'astro';
++import { db, RP_ID } from '../../utils/passkeyStore';
++
++export const GET: APIRoute = async () => {
++  const user = db.getUser();
++  const credentials = db.findCredentialsByUserId(user.passkeyUserId);
++
++  return new Response(
++    JSON.stringify({
++      rpId: RP_ID,
++      userId: user.passkeyUserId,
++      user,
++      credentials,
++    }),
++    {
++      status: 200,
++      headers: { 'Content-Type': 'application/json' },
++    }
++  );
++};
+diff --git a/src/pages/api/credentials/[id].ts b/src/pages/api/credentials/[id].ts
+new file mode 100644
+index 0000000..4439339
+--- /dev/null
++++ b/src/pages/api/credentials/[id].ts
+@@ -0,0 +1 @@
++export { PUT, DELETE } from '../credential/[id]';
+diff --git a/src/pages/api/passkey/register-options.ts b/src/pages/api/passkey/register-options.ts
+new file mode 100644
+index 0000000..b0182e9
+--- /dev/null
++++ b/src/pages/api/passkey/register-options.ts
+@@ -0,0 +1,37 @@
++import type { APIRoute } from 'astro';
++import { generateRegistrationOptions } from '@simplewebauthn/server';
++import type { AuthenticatorTransportFuture } from '@simplewebauthn/server';
++import { db, RP_ID, RP_NAME } from '../../../utils/passkeyStore';
++
++export const POST: APIRoute = async ({ request }) => {
++  const user = db.getUser();
++  const existingCredentials = db.findCredentialsByUserId(user.passkeyUserId);
++
++  const body = await request.json().catch(() => ({}));
++  const isPromotionFlow = Boolean(body?.promotion);
++
++  const options = await generateRegistrationOptions({
++    rpName: RP_NAME,
++    rpID: RP_ID,
++    userID: Buffer.from(user.passkeyUserId, 'base64url'),
++    userName: user.name,
++    userDisplayName: user.displayName,
++    supportedAlgorithmIDs: [-7, -257],
++    excludeCredentials: existingCredentials.map((cred) => ({
++      id: cred.id,
++      transports: cred.transports as AuthenticatorTransportFuture[],
++    })),
++    authenticatorSelection: {
++      residentKey: 'required',
++      userVerification: 'preferred',
++      ...(isPromotionFlow ? { authenticatorAttachment: 'platform' } : {}),
++    },
++  });
++
++  db.setChallenge(user.passkeyUserId, options.challenge);
++
++  return new Response(JSON.stringify(options), {
++    status: 200,
++    headers: { 'Content-Type': 'application/json' },
++  });
++};
+diff --git a/src/pages/api/passkey/register-verify.ts b/src/pages/api/passkey/register-verify.ts
+new file mode 100644
+index 0000000..676c025
+--- /dev/null
++++ b/src/pages/api/passkey/register-verify.ts
+@@ -0,0 +1,115 @@
++import type { APIRoute } from 'astro';
++import { verifyRegistrationResponse } from '@simplewebauthn/server';
++import {
++  db,
++  RP_ID,
++  resolveAaguidProvider,
++  type StoredPasskeyCredential,
++} from '../../../utils/passkeyStore';
++
++export const POST: APIRoute = async ({ request }) => {
++  const user = db.getUser();
++  const expectedChallenge = db.getChallenge(user.passkeyUserId);
++
++  if (!expectedChallenge) {
++    return new Response(
++      JSON.stringify({ error: 'Registration challenge expired or not found.' }),
++      {
++        status: 400,
++        headers: { 'Content-Type': 'application/json' },
++      }
++    );
++  }
++
++  const body = await request.json().catch(() => null);
++  if (!body) {
++    return new Response(JSON.stringify({ error: 'Invalid registration payload.' }), {
++      status: 400,
++      headers: { 'Content-Type': 'application/json' },
++    });
++  }
++
++  try {
++    const originHeader = request.headers.get('origin') || `http://${RP_ID}`;
++    const verification = await verifyRegistrationResponse({
++      response: body,
++      expectedChallenge,
++      expectedOrigin: originHeader,
++      expectedRPID: RP_ID,
++      requireUserVerification: false,
++    });
++
++    if (!verification.verified || !verification.registrationInfo) {
++      return new Response(
++        JSON.stringify({ error: 'Passkey registration verification failed.' }),
++        {
++          status: 400,
++          headers: { 'Content-Type': 'application/json' },
++        }
++      );
++    }
++
++    const { registrationInfo } = verification;
++    const {
++      aaguid,
++      credential,
++      credentialDeviceType,
++      credentialBackedUp,
++    } = registrationInfo;
++
++    const now = Date.now();
++    let credentialName = 'Unknown passkey provider';
++    let providerIcon: string | undefined = undefined;
++
++    if (aaguid === '00000000-0000-0000-0000-000000000000') {
++      credentialName = 'Unknown passkey provider';
++      providerIcon = undefined;
++    } else {
++      const providerMeta = resolveAaguidProvider(aaguid);
++      credentialName = providerMeta.name;
++      providerIcon = providerMeta.providerIcon;
++    }
++
++    const newCred: StoredPasskeyCredential = {
++      id: credential.id,
++      passkeyUserId: user.passkeyUserId,
++      credentialPublicKey: Buffer.from(credential.publicKey).toString('base64url'),
++      credentialType: 'public-key',
++      credentialDeviceType,
++      credentialBackedUp,
++      aaguid,
++      providerIcon,
++      name: credentialName,
++      transports: credential.transports || ['internal'],
++      registeredAt: now,
++      counter: credential.counter,
++    };
++
++    const saved = db.saveCredential(newCred);
++    const credentials = db.findCredentialsByUserId(user.passkeyUserId);
++
++    return new Response(
++      JSON.stringify({
++        verified: true,
++        credential: saved,
++        rpId: RP_ID,
++        userId: user.passkeyUserId,
++        credentials,
++      }),
++      {
++        status: 200,
++        headers: { 'Content-Type': 'application/json' },
++      }
++    );
++  } catch (err: any) {
++    return new Response(
++      JSON.stringify({
++        error: err?.message || 'Verification failed.',
++      }),
++      {
++        status: 400,
++        headers: { 'Content-Type': 'application/json' },
++      }
++    );
++  }
++};
+diff --git a/src/pages/api/user.ts b/src/pages/api/user.ts
+new file mode 100644
+index 0000000..4d7240e
+--- /dev/null
++++ b/src/pages/api/user.ts
+@@ -0,0 +1,49 @@
++import type { APIRoute } from 'astro';
++import { db, RP_ID } from '../../utils/passkeyStore';
++
++export const GET: APIRoute = async () => {
++  const user = db.getUser();
++  return new Response(
++    JSON.stringify({
++      ...user,
++      rpId: RP_ID,
++      userId: user.passkeyUserId,
++    }),
++    {
++      status: 200,
++      headers: { 'Content-Type': 'application/json' },
++    }
++  );
++};
++
++export const PUT: APIRoute = async ({ request }) => {
++  const user = db.getUser();
++  const body = await request.json().catch(() => ({}));
++  const name = typeof body.name === 'string' ? body.name.trim() : user.name;
++  const displayName =
++    typeof body.displayName === 'string' ? body.displayName.trim() : user.displayName;
++
++  if (!name || !displayName) {
++    return new Response(
++      JSON.stringify({ error: 'Both username and display name are required.' }),
++      {
++        status: 400,
++        headers: { 'Content-Type': 'application/json' },
++      }
++    );
++  }
++
++  const updatedUser = db.updateUser(user.id, { name, displayName });
++
++  return new Response(
++    JSON.stringify({
++      ...updatedUser,
++      rpId: RP_ID,
++      userId: updatedUser.passkeyUserId,
++    }),
++    {
++      status: 200,
++      headers: { 'Content-Type': 'application/json' },
++    }
++  );
++};
+diff --git a/src/pages/settings.astro b/src/pages/settings.astro
+new file mode 100644
+index 0000000..ffa3ddd
+--- /dev/null
++++ b/src/pages/settings.astro
+@@ -0,0 +1,17 @@
++---
++import Layout from '../layouts/Layout.astro';
++import AccountSettings from '../components/AccountSettings';
++import { db, RP_ID } from '../utils/passkeyStore';
++
++const user = db.getUser();
++const credentials = db.findCredentialsByUserId(user.passkeyUserId);
++---
++
++<Layout title="Account Settings | The DevTools Times">
++  <AccountSettings
++    client:load
++    initialUser={user}
++    initialCredentials={credentials}
++    initialRpId={RP_ID}
++  />
++</Layout>
+diff --git a/src/utils/passkeyStore.ts b/src/utils/passkeyStore.ts
+new file mode 100644
+index 0000000..e272098
+--- /dev/null
++++ b/src/utils/passkeyStore.ts
+@@ -0,0 +1,219 @@
++import aaguidsData from '../data/aaguids.json';
++
++export const RP_ID = 'localhost';
++export const RP_NAME = 'The DevTools Times';
++
++export interface AaguidEntry {
++  name: string;
++  icon_light?: string;
++  icon_dark?: string;
++}
++
++const aaguids: Record<string, AaguidEntry> = aaguidsData as Record<string, AaguidEntry>;
++
++export interface StoredPasskeyCredential {
++  id: string; // Base64URL-encoded credential ID (unique lookup key)
++  passkeyUserId: string; // Associated application user ID (Base64URL-encoded)
++  credentialPublicKey: string; // Base64URL-encoded public key used to verify assertion signatures
++  credentialType: 'public-key';
++  credentialDeviceType: 'singleDevice' | 'multiDevice';
++  credentialBackedUp: boolean;
++  aaguid: string;
++  providerIcon?: string;
++  name: string;
++  transports: string[];
++  lastUsedAt?: number; // Optional epoch timestamp of last sign-in
++  registeredAt: number; // Registration epoch timestamp
++  counter: number;
++}
++
++export interface UserProfile {
++  id: string;
++  passkeyUserId: string; // Valid unpadded Base64URL string
++  name: string; // Username / email
++  displayName: string; // Reader display name
++  subscriptionTier: string;
++}
++
++// Valid unpadded Base64URL: non-empty, [A-Za-z0-9_-] only, no '=' padding, length % 4 !== 1
++export function isValidBase64Url(value: unknown): value is string {
++  return (
++    typeof value === 'string' &&
++    value.length > 0 &&
++    value.length % 4 !== 1 &&
++    /^[A-Za-z0-9_-]+$/.test(value)
++  );
++}
++
++export function resolveAaguidProvider(
++  aaguid: string,
++  fallbackDeviceName?: string
++): { name: string; providerIcon?: string; iconLight?: string; iconDark?: string } {
++  if (!aaguid || aaguid === '00000000-0000-0000-0000-000000000000') {
++    return {
++      name: fallbackDeviceName || 'Unknown passkey provider',
++      providerIcon: undefined,
++      iconLight: undefined,
++      iconDark: undefined,
++    };
++  }
++  const provider = aaguids[aaguid];
++  return {
++    name: provider?.name || fallbackDeviceName || 'Unknown passkey provider',
++    providerIcon: provider?.icon_light,
++    iconLight: provider?.icon_light,
++    iconDark: provider?.icon_dark,
++  };
++}
++
++// Encode seed IDs as genuine unpadded Base64URL strings
++const DEFAULT_PASSKEY_USER_ID = Buffer.from('reader-alex-morgan-01').toString('base64url');
++const CRED_ID_1 = Buffer.from('cred-google-pm-0001').toString('base64url');
++const CRED_ID_2 = Buffer.from('cred-icloud-key-002').toString('base64url');
++const CRED_ID_3 = Buffer.from('cred-1password-0003').toString('base64url');
++
++const DEFAULT_PUBLIC_KEY_1 = Buffer.from('mock-cose-public-key-google-pm-01').toString('base64url');
++const DEFAULT_PUBLIC_KEY_2 = Buffer.from('mock-cose-public-key-icloud-kc-02').toString('base64url');
++const DEFAULT_PUBLIC_KEY_3 = Buffer.from('mock-cose-public-key-1password-03').toString('base64url');
++
++const gpmMeta = resolveAaguidProvider('ea9b8d66-4d01-1d21-3ce4-b6b48cb575d4');
++const icloudMeta = resolveAaguidProvider('fbfc3007-154e-4ecc-8c0b-6e020557d7bd');
++const onePasswordMeta = resolveAaguidProvider('bada5566-a7aa-401f-bd96-45619a55120d');
++
++interface StoreState {
++  user: UserProfile;
++  credentials: StoredPasskeyCredential[];
++  challenges: Record<string, string>;
++}
++
++// Attach to globalThis so state persists across hot reloads and route handlers
++const globalStoreKey = '__DEVTOOLS_TIMES_PASSKEY_STORE__';
++
++function createInitialState(): StoreState {
++  return {
++    user: {
++      id: DEFAULT_PASSKEY_USER_ID,
++      passkeyUserId: DEFAULT_PASSKEY_USER_ID,
++      name: 'alex.morgan@devtoolstimes.com',
++      displayName: 'Alex Morgan',
++      subscriptionTier: 'All-Access Digital & Print Edition',
++    },
++    credentials: [
++      {
++        id: CRED_ID_1,
++        passkeyUserId: DEFAULT_PASSKEY_USER_ID,
++        credentialPublicKey: DEFAULT_PUBLIC_KEY_1,
++        credentialType: 'public-key',
++        credentialDeviceType: 'multiDevice',
++        credentialBackedUp: true,
++        aaguid: 'ea9b8d66-4d01-1d21-3ce4-b6b48cb575d4',
++        providerIcon: gpmMeta.providerIcon,
++        name: gpmMeta.name,
++        transports: ['internal', 'hybrid'],
++        registeredAt: 1758009600000, // Sep 16, 2025
++        lastUsedAt: 1762689600000, // Nov 9, 2025
++        counter: 14,
++      },
++      {
++        id: CRED_ID_2,
++        passkeyUserId: DEFAULT_PASSKEY_USER_ID,
++        credentialPublicKey: DEFAULT_PUBLIC_KEY_2,
++        credentialType: 'public-key',
++        credentialDeviceType: 'multiDevice',
++        credentialBackedUp: true,
++        aaguid: 'fbfc3007-154e-4ecc-8c0b-6e020557d7bd',
++        providerIcon: icloudMeta.providerIcon,
++        name: 'MacBook Pro (iCloud Keychain)',
++        transports: ['internal', 'hybrid'],
++        registeredAt: 1752566400000, // Jul 15, 2025
++        lastUsedAt: 1761912000000, // Oct 31, 2025
++        counter: 8,
++      },
++      {
++        id: CRED_ID_3,
++        passkeyUserId: DEFAULT_PASSKEY_USER_ID,
++        credentialPublicKey: DEFAULT_PUBLIC_KEY_3,
++        credentialType: 'public-key',
++        credentialDeviceType: 'multiDevice',
++        credentialBackedUp: true,
++        aaguid: 'bada5566-a7aa-401f-bd96-45619a55120d',
++        providerIcon: onePasswordMeta.providerIcon,
++        name: onePasswordMeta.name,
++        transports: ['internal', 'hybrid'],
++        registeredAt: 1748764800000, // Jun 1, 2025
++        lastUsedAt: 1759219200000, // Sep 30, 2025
++        counter: 3,
++      },
++    ],
++    challenges: {},
++  };
++}
++
++function getStore(): StoreState {
++  const g = globalThis as unknown as Record<string, StoreState | undefined>;
++  if (!g[globalStoreKey]) {
++    g[globalStoreKey] = createInitialState();
++  }
++  return g[globalStoreKey]!;
++}
++
++export const db = {
++  getUser(): UserProfile {
++    return { ...getStore().user };
++  },
++
++  updateUser(
++    userId: string,
++    updates: { name?: string; displayName?: string }
++  ): UserProfile {
++    const store = getStore();
++    if (updates.name !== undefined && updates.name.trim().length > 0) {
++      store.user.name = updates.name.trim();
++    }
++    if (updates.displayName !== undefined && updates.displayName.trim().length > 0) {
++      store.user.displayName = updates.displayName.trim();
++    }
++    return { ...store.user };
++  },
++
++  findCredentialsByUserId(passkeyUserId: string): StoredPasskeyCredential[] {
++    const store = getStore();
++    return store.credentials
++      .filter((cred) => cred.passkeyUserId === passkeyUserId)
++      .map((cred) => ({ ...cred }));
++  },
++
++  findCredentialById(id: string): StoredPasskeyCredential | undefined {
++    const store = getStore();
++    const found = store.credentials.find((cred) => cred.id === id);
++    return found ? { ...found } : undefined;
++  },
++
++  saveCredential(cred: StoredPasskeyCredential): StoredPasskeyCredential {
++    const store = getStore();
++    const idx = store.credentials.findIndex((c) => c.id === cred.id);
++    if (idx >= 0) {
++      store.credentials[idx] = { ...cred };
++    } else {
++      store.credentials.unshift({ ...cred });
++    }
++    return { ...cred };
++  },
++
++  deleteCredential(id: string): boolean {
++    const store = getStore();
++    const initialLength = store.credentials.length;
++    store.credentials = store.credentials.filter((cred) => cred.id !== id);
++    return store.credentials.length < initialLength;
++  },
++
++  setChallenge(passkeyUserId: string, challenge: string): void {
++    const store = getStore();
++    store.challenges[passkeyUserId] = challenge;
++  },
++
++  getChallenge(passkeyUserId: string): string | undefined {
++    const store = getStore();
++    return store.challenges[passkeyUserId];
++  },
++};

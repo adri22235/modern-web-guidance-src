@@ -1,0 +1,376 @@
+diff --git a/README.md b/README.md
+index 4479b53..79fa185 100644
+--- a/README.md
++++ b/README.md
+@@ -2,6 +2,16 @@
+ 
+ This project is a sample news application built with Astro, designed to serve as a testing ground for new features in Chrome DevTools.
+ 
++## Developer diagnostics connections
++
++The homepage includes independent browser connections to a hardware test device on the reader’s LAN and a companion CLI on the reader’s machine. The editable example endpoints are `http://192.168.1.100:8080/api/status` and `http://127.0.0.1:45678/health`; these are placeholders, not bundled services. Supply the actual device and CLI status endpoints. LAN targets accept private IP literals and `.local` hostnames; CLI targets accept loopback addresses and localhost.
++
++Each Connect click makes one direct, credential-free CORS GET request and shows the successful response as a timestamped snapshot. No scanning, polling, server proxy, or page-load connection requests are used. Endpoints must return a successful HTTP status and standard `Access-Control-Allow-Origin` headers allowing the website’s origin (including the port, excluding its path). JSON, plain text, and empty successful responses are supported; displayed responses are limited to 4,000 characters.
++
++Serve the website over HTTPS. Each card queries its granular `local-network` or `loopback-network` permission, watches for permission changes, and explains how to unblock denied access in browser site settings. Unsupported permission queries fall back to explicit user-triggered attempts. Requests specify the corresponding `targetAddressSpace`. Browsers without local HTTP support may need a trusted HTTPS endpoint. No deprecated Private Network Access preflight headers are required. See [Chrome’s Local Network Access guidance](https://developer.chrome.com/docs/modern-web-guidance/guides/security/local-network-access).
++
++Run the network helper tests without starting services: `node --test tests/diagnostics.test.mjs` (Node 22.18+ or Node 24).
++
+ 
+ ```sh
+ pnpm install && pnpm run start
+diff --git a/src/components/DiagnosticsConnections.tsx b/src/components/DiagnosticsConnections.tsx
+new file mode 100644
+index 0000000..1def851
+--- /dev/null
++++ b/src/components/DiagnosticsConnections.tsx
+@@ -0,0 +1,164 @@
++import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
++import { parseEndpoint, queryNetworkPermission, requestDiagnostics } from '../utils/diagnostics';
++
++const targets = [
++  { space: 'local' as const, title: 'Hardware test device', label: 'Private Wi-Fi LAN', initial: 'http://192.168.1.100:8080/api/status', description: 'Read diagnostics from a test device on the same Wi-Fi network.', action: 'Connect device' },
++  { space: 'loopback' as const, title: 'Companion CLI', label: 'This machine', initial: 'http://127.0.0.1:45678/health', description: 'Check the companion service running locally on your computer.', action: 'Connect CLI' },
++];
++
++function ConnectionCard({ target }: { target: typeof targets[number] }) {
++  const id = useId();
++  const [endpoint, setEndpoint] = useState(target.initial);
++  const [permission, setPermission] = useState<PermissionState | 'unknown'>('unknown');
++  const [secure, setSecure] = useState<boolean | null>(null);
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState('');
++  const [invalid, setInvalid] = useState(false);
++  const [result, setResult] = useState<(Awaited<ReturnType<typeof requestDiagnostics>> & { url: string; time: string }) | null>(null);
++  const pending = useRef<AbortController | null>(null);
++  const input = useRef<HTMLInputElement>(null);
++  const permissionLabel = target.space === 'local' ? 'Local network' : 'Loopback network';
++
++  useEffect(() => {
++    setSecure(window.isSecureContext);
++    let disposed = false;
++    let status: PermissionStatus | null = null;
++    const update = () => {
++      if (disposed || !status) return;
++      setPermission(status.state);
++      if (status.state === 'denied') {
++        pending.current?.abort();
++        setResult(null);
++      }
++    };
++    void queryNetworkPermission(target.space).then(value => {
++      if (disposed) return;
++      status = value;
++      update();
++      status?.addEventListener('change', update);
++    });
++    return () => {
++      disposed = true;
++      status?.removeEventListener('change', update);
++      pending.current?.abort();
++    };
++  }, [target.space]);
++
++  async function connect(event: FormEvent<HTMLFormElement>) {
++    event.preventDefault();
++    if (pending.current) return;
++    setError('');
++    setResult(null);
++    let url: URL;
++    try {
++      url = parseEndpoint(endpoint, target.space);
++    } catch (cause) {
++      setInvalid(true);
++      setError((cause as Error).message);
++      input.current?.focus();
++      return;
++    }
++    setInvalid(false);
++    if (!window.isSecureContext) {
++      setError('Open The DevTools Times over HTTPS before connecting.');
++      return;
++    }
++    const controller = new AbortController();
++    pending.current = controller;
++    setBusy(true);
++    let timedOut = false;
++    // Leave time for the reader to respond to the browser permission prompt.
++    const timeout = window.setTimeout(() => { timedOut = true; controller.abort(); }, 30000);
++    try {
++      const status = await queryNetworkPermission(target.space);
++      if (controller.signal.aborted) return;
++      setPermission(status?.state ?? 'unknown');
++      if (status?.state === 'denied') return;
++      const response = await requestDiagnostics(url, target.space, controller.signal);
++      if (!controller.signal.aborted) {
++        setResult({ ...response, url: url.href, time: new Date().toLocaleTimeString() });
++      }
++    } catch (cause) {
++      if (controller.signal.aborted) {
++        if (timedOut) setError('Connection timed out after 30 seconds. Check the service and try again.');
++      } else {
++        setError(cause instanceof TypeError
++          ? `Could not connect. Check ${permissionLabel} in browser site settings, the endpoint’s CORS configuration, and ${target.space === 'local' ? 'that the device is powered on and on the same Wi-Fi network' : 'that the companion CLI is running on this computer'}. Your browser may require an HTTPS endpoint if local HTTP access is unsupported.`
++          : cause instanceof Error ? cause.message : 'Connection failed. Check the endpoint and try again.');
++      }
++    } finally {
++      window.clearTimeout(timeout);
++      pending.current = null;
++      setBusy(false);
++      const status = await queryNetworkPermission(target.space);
++      setPermission(status?.state ?? 'unknown');
++    }
++  }
++
++  const permissions = { granted: 'Allowed', prompt: 'Ask on connect', denied: 'Blocked', unknown: 'Browser managed' };
++  const controlClass = 'min-h-12 rounded border border-gray-500 px-3 py-2 text-base focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-700';
++
++  return (
++    <form onSubmit={connect} aria-labelledby={`${id}-title`} className="min-w-0 rounded-lg border border-gray-300 bg-white p-5">
++      <p className="mb-1 text-xs font-semibold uppercase tracking-wider text-gray-600">{target.label}</p>
++      <h3 id={`${id}-title`} className="text-xl font-bold text-gray-900">{target.title}</h3>
++      <p className="mt-2 text-sm text-gray-600">{target.description}</p>
++      <p className="my-4 text-xs text-gray-700">{permissionLabel} permission: <strong>{permissions[permission]}</strong></p>
++      <label htmlFor={`${id}-endpoint`} className="mb-2 block text-sm font-semibold">Endpoint URL (required)</label>
++      <input ref={input} id={`${id}-endpoint`} name="endpoint" type="url" required value={endpoint}
++        autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false} disabled={busy}
++        aria-invalid={invalid || undefined} aria-describedby={`${id}-help ${id}-status`}
++        onChange={event => { setEndpoint(event.target.value); setInvalid(false); setError(''); setResult(null); }}
++        className={`${controlClass} w-full bg-white font-mono text-gray-900 disabled:bg-gray-100`} />
++      <p id={`${id}-help`} className="mt-2 text-xs leading-relaxed text-gray-600">Use your service’s full status URL. Connecting sends one GET request; allow the browser’s access prompt if shown.</p>
++      <div className="mt-4 flex flex-wrap gap-2">
++        <button type="submit" disabled={busy || secure === false || permission === 'denied'}
++          className={`${controlClass} border-gray-900 bg-gray-900 font-semibold text-white hover:bg-gray-700 disabled:cursor-not-allowed disabled:opacity-60`}>
++          {busy ? 'Connecting…' : result ? 'Check again' : target.action}
++        </button>
++        {busy && <button type="button" onClick={() => { pending.current?.abort(); setError('Connection cancelled.'); }} className={controlClass}>Cancel</button>}
++        {result && <button type="button" onClick={() => setResult(null)} className={controlClass}>Clear result</button>}
++      </div>
++      <div id={`${id}-status`} role="status" aria-live="polite" className="mt-4 text-sm leading-relaxed">
++        {secure === false && <p className="text-red-800">Open this page over HTTPS to enable connections.</p>}
++        {permission === 'denied' && <p className="text-red-800">Access is blocked. Open this site’s browser settings, allow {permissionLabel} access, then retry. Reload the page if your browser does not update the permission here.</p>}
++        {busy && <p className="text-gray-600">Waiting for the service or browser permission. You can cancel this attempt.</p>}
++        {error && <p className="text-red-800">{error}</p>}
++        {result && <p className="text-green-800">Connection successful · HTTP {result.status} · Checked at {result.time}. This is a snapshot; use Check again to refresh.</p>}
++      </div>
++      {result && <details className="mt-3 text-sm">
++        <summary className="cursor-pointer py-2 font-semibold focus-visible:outline-2 focus-visible:outline-amber-700">Response details</summary>
++        <p className="my-2 break-all font-mono text-xs text-gray-600">{result.url}</p>
++        <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded bg-gray-100 p-3 text-xs">{result.preview || '(Empty response)'}</pre>
++        {result.truncated && <p className="mt-1 text-xs text-gray-600">Showing the first 4,000 characters.</p>}
++      </details>}
++    </form>
++  );
++}
++
++export default function DiagnosticsConnections() {
++  return (
++    <section aria-labelledby="diagnostics-title" className="border-y border-gray-300 bg-gray-50 p-4 sm:p-6">
++      <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
++        <div>
++          <p className="mb-1 text-xs font-bold uppercase tracking-widest text-amber-800">Developer toolkit</p>
++          <h2 id="diagnostics-title" className="font-brand text-3xl text-gray-900">Diagnostics connections</h2>
++          <p className="mt-2 max-w-2xl text-sm leading-relaxed text-gray-600">Connect your browser to your test bench. Check a hardware device and your local companion CLI independently.</p>
++        </div>
++        <span className="rounded-full border border-gray-300 bg-white px-3 py-1 text-xs text-gray-600">Browser → your device</span>
++      </div>
++      <noscript><p className="mb-4 text-red-800">Enable JavaScript to use diagnostics connections.</p></noscript>
++      <div className="grid gap-4 md:grid-cols-2">
++        {targets.map(target => <ConnectionCard key={target.space} target={target} />)}
++      </div>
++      <details className="mt-4 text-sm text-gray-700">
++        <summary className="cursor-pointer py-2 font-semibold focus-visible:outline-2 focus-visible:outline-amber-700">Service setup &amp; browser support</summary>
++        <div className="mt-2 space-y-2 leading-relaxed">
++          <p>Replace the example URLs with your services’ health or diagnostics endpoints. Each must accept GET and return a successful HTTP status. JSON and plain text responses are supported.</p>
++          <p>Both services must allow this website’s origin with the standard <code>Access-Control-Allow-Origin</code> response header. Requests omit cookies and authorization credentials. They go directly from this browser to the endpoint, without a Times server proxy.</p>
++          <p>Use this website over HTTPS. Browser support for local HTTP connections varies; if blocked, use a browser with Local Network Access support or a service with a trusted HTTPS certificate. Device and CLI access have separate permissions where supported.</p>
++        </div>
++      </details>
++    </section>
++  );
++}
+diff --git a/src/pages/index.astro b/src/pages/index.astro
+index 92f6399..9118804 100644
+--- a/src/pages/index.astro
++++ b/src/pages/index.astro
+@@ -6,6 +6,7 @@ import Ad from '../components/AdSlotBanner';
+ import { getCollection } from 'astro:content';
+ import SimpleTeaserGrid from '../components/SimpleTeaserGrid.astro';
+ import type { RenderResult } from 'astro:content';
++import DiagnosticsConnections from '../components/DiagnosticsConnections';
+ 
+ const articles = await getCollection('articles');
+ articles.sort((a, b) => b.data.date.valueOf() - a.data.date.valueOf());
+@@ -60,6 +61,7 @@ politicsArticles[2] = {
+     </main>
+ 
+     <div class="divide-y divide-gray-200 max-w-6xl mx-auto">
++        <DiagnosticsConnections client:load />
+         <section class="p-4 md:p-6 text-center">
+             <Ad client:visible />
+         </section>
+@@ -81,4 +83,4 @@ politicsArticles[2] = {
+         <TopStoryTeaserGrid title="Politics" articles={politicsArticles} />
+         
+     </div>
+-</Layout>
+\ No newline at end of file
++</Layout>
+diff --git a/src/utils/diagnostics.ts b/src/utils/diagnostics.ts
+new file mode 100644
+index 0000000..b87e6b3
+--- /dev/null
++++ b/src/utils/diagnostics.ts
+@@ -0,0 +1,66 @@
++export type AddressSpace = 'local' | 'loopback';
++export type NetworkPermission = 'local-network' | 'loopback-network';
++
++export const permissionFor = (space: AddressSpace): NetworkPermission =>
++  space === 'local' ? 'local-network' : 'loopback-network';
++
++// Unsupported permission descriptors must never prevent a user-initiated attempt.
++export async function queryNetworkPermission(space: AddressSpace): Promise<PermissionStatus | null> {
++  try {
++    return await navigator.permissions.query({ name: permissionFor(space) as PermissionName });
++  } catch {
++    return null;
++  }
++}
++
++export function parseEndpoint(value: string, space: AddressSpace): URL {
++  let url: URL;
++  try {
++    url = new URL(value.trim());
++  } catch {
++    throw new Error('Enter a complete HTTP or HTTPS endpoint URL, including its port and path.');
++  }
++  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) {
++    throw new Error('Use HTTP or HTTPS without embedded credentials or a URL fragment.');
++  }
++  const host = url.hostname;
++  const parts = host.split('.').map(Number);
++  const ipv4 = parts.length === 4 && parts.every(part => Number.isInteger(part) && part >= 0 && part <= 255);
++  const loopback = (ipv4 && parts[0] === 127) || host === '[::1]' || host === 'localhost' || host.endsWith('.localhost');
++  const local = (ipv4 && (
++    parts[0] === 10 ||
++    (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
++    (parts[0] === 192 && parts[1] === 168) ||
++    (parts[0] === 169 && parts[1] === 254)
++  )) || host.endsWith('.local') || /^\[(?:f[cd][0-9a-f]{2}:|fe[89ab][0-9a-f]:)/i.test(host);
++
++  if (space === 'loopback' ? !loopback : !local) {
++    throw new Error(space === 'local'
++      ? 'Use a private LAN IP address (such as 192.168.1.100) or a device.local hostname.'
++      : 'Use a loopback address: 127.0.0.1, localhost, or [::1].');
++  }
++  return url;
++}
++
++export async function requestDiagnostics(url: URL, space: AddressSpace, signal: AbortSignal) {
++  const options: RequestInit & { targetAddressSpace: AddressSpace } = {
++    method: 'GET',
++    mode: 'cors',
++    targetAddressSpace: space,
++    credentials: 'omit',
++    cache: 'no-store',
++    redirect: 'error',
++    referrerPolicy: 'no-referrer',
++    signal,
++  };
++  const response = await fetch(url.href, options);
++  if (!response.ok) throw new Error(`Endpoint returned HTTP ${response.status}. Check the URL and service configuration.`);
++  const body = await response.text();
++  let preview = body;
++  try {
++    preview = JSON.stringify(JSON.parse(body), null, 2);
++  } catch {
++    // Health endpoints may return plain text or an empty successful response.
++  }
++  return { status: response.status, preview: preview.slice(0, 4000), truncated: preview.length > 4000 };
++}
+diff --git a/tests/diagnostics.test.mjs b/tests/diagnostics.test.mjs
+new file mode 100644
+index 0000000..d370c72
+--- /dev/null
++++ b/tests/diagnostics.test.mjs
+@@ -0,0 +1,80 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { parseEndpoint, queryNetworkPermission, requestDiagnostics } from '../src/utils/diagnostics.ts';
++
++test('LAN and loopback targets remain separate, with private address boundaries enforced', () => {
++  for (const host of ['192.168.1.20', '10.0.0.2', '172.16.0.1', '172.31.255.254', 'device.local', '[fd00::1]']) {
++    assert.equal(parseEndpoint(`http://${host}:8080/status`, 'local').pathname, '/status');
++    assert.throws(() => parseEndpoint(`http://${host}:8080/status`, 'loopback'));
++  }
++  for (const host of ['127.0.0.1', '127.0.0.2', 'localhost', '[::1]']) {
++    assert.equal(parseEndpoint(`http://${host}:45678/health`, 'loopback').pathname, '/health');
++    assert.throws(() => parseEndpoint(`http://${host}:45678/health`, 'local'));
++  }
++  for (const host of ['172.15.0.1', '172.32.0.1', '192.169.1.1', '8.8.8.8', 'example.com']) {
++    for (const space of ['local', 'loopback']) assert.throws(() => parseEndpoint(`http://${host}/`, space));
++  }
++  for (const value of ['invalid', 'ftp://192.168.1.1/', 'http://user:secret@192.168.1.1/', 'http://192.168.1.1/#fragment']) {
++    assert.throws(() => parseEndpoint(value, 'local'));
++  }
++});
++
++test('permission queries use granular names and tolerate unsupported APIs', async t => {
++  const names = [];
++  const status = { state: 'denied' };
++  t.mock.method(navigator.permissions ?? Object.defineProperty(navigator, 'permissions', { configurable: true, value: { query() {} } }).permissions, 'query', async descriptor => {
++    names.push(descriptor.name);
++    return status;
++  });
++  assert.equal(await queryNetworkPermission('local'), status);
++  assert.equal(await queryNetworkPermission('loopback'), status);
++  assert.deepEqual(names, ['local-network', 'loopback-network']);
++  navigator.permissions.query.mock.mockImplementation(async () => { throw new TypeError('Unsupported permission'); });
++  assert.equal(await queryNetworkPermission('local'), null);
++  assert.equal(await queryNetworkPermission('loopback'), null);
++});
++
++test('requests target each address space directly and do not send credentials or follow redirects', async t => {
++  const calls = [];
++  t.mock.method(globalThis, 'fetch', async (url, options) => {
++    calls.push({ url, options });
++    return new Response('{"healthy":true}', { status: 200 });
++  });
++  for (const space of ['local', 'loopback']) {
++    const url = parseEndpoint(space === 'local' ? 'http://192.168.1.5/status' : 'http://127.0.0.1:45678/health', space);
++    const controller = new AbortController();
++    const result = await requestDiagnostics(url, space, controller.signal);
++    const call = calls.at(-1);
++    assert.equal(call.url, url.href);
++    assert.deepEqual(call.options, {
++      method: 'GET', mode: 'cors', targetAddressSpace: space, credentials: 'omit',
++      cache: 'no-store', redirect: 'error', referrerPolicy: 'no-referrer', signal: controller.signal,
++    });
++    assert.equal(result.status, 200);
++    assert.equal(result.preview, '{\n  "healthy": true\n}');
++  }
++});
++
++test('HTTP errors and network failures reject; empty and long responses are handled', async t => {
++  const url = parseEndpoint('http://127.0.0.1:45678/health', 'loopback');
++  const signal = new AbortController().signal;
++  const mock = t.mock.method(globalThis, 'fetch', async () => new Response('unavailable', { status: 503 }));
++  await assert.rejects(requestDiagnostics(url, 'loopback', signal), /HTTP 503/);
++  mock.mock.mockImplementation(async () => { throw new TypeError('Network failure'); });
++  await assert.rejects(requestDiagnostics(url, 'loopback', signal), /Network failure/);
++  mock.mock.mockImplementation(async () => new Response(null, { status: 204 }));
++  assert.equal((await requestDiagnostics(url, 'loopback', signal)).preview, '');
++  mock.mock.mockImplementation(async () => new Response('x'.repeat(4500)));
++  const result = await requestDiagnostics(url, 'loopback', signal);
++  assert.equal(result.preview.length, 4000);
++  assert.equal(result.truncated, true);
++});
++
++test('cancellation propagates to the fetch rather than reporting a successful connection', async t => {
++  t.mock.method(globalThis, 'fetch', async (_url, { signal }) => {
++    signal.throwIfAborted();
++  });
++  const controller = new AbortController();
++  controller.abort();
++  await assert.rejects(requestDiagnostics(new URL('http://127.0.0.1/health'), 'loopback', controller.signal), { name: 'AbortError' });
++});

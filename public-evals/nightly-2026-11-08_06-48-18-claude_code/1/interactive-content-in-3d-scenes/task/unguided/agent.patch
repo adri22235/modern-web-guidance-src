@@ -1,0 +1,479 @@
+diff --git a/coffee-box.js b/coffee-box.js
+new file mode 100644
+--- a/coffee-box.js
++++ b/coffee-box.js
+@@ -0,0 +1,474 @@
++/*
++ * Spinning 3D coffee box with an interactive HTML form on its front face.
++ *
++ * The form is a real DOM <form>. Each frame we compute the exact matrix that
++ * maps the form's CSS pixels onto the box's front face in the WebGL projection
++ * and apply it as a CSS matrix3d() transform. Because browsers hit-test through
++ * CSS transforms, every input and button stays fully clickable while the box
++ * rotates.
++ *
++ * Two rendering paths share that same matrix:
++ *  1. HTML-in-Canvas (WICG proposal: <canvas layoutsubtree>, texElementImage2D,
++ *     "paint" event). When available, the form is a child of the canvas, WebGL
++ *     paints it as the face texture, and the CSS transform keeps hit-testing
++ *     aligned with what is drawn.
++ *  2. Fallback (all other browsers): the form sits in an overlay above the
++ *     canvas and the browser paints it with the CSS 3D transform, landing
++ *     pixel-perfectly on the WebGL face.
++ */
++(function () {
++  'use strict';
++
++  var stage = document.getElementById('box-stage');
++  var canvas = document.getElementById('box-canvas');
++  var overlay = document.getElementById('box-overlay');
++  var form = document.getElementById('box-form');
++  if (!stage || !canvas || !form) return;
++
++  setupFormBehaviour();
++
++  var gl = canvas.getContext('webgl', { antialias: true, alpha: true, premultipliedAlpha: true });
++  if (!gl) return; // No WebGL: the form stays as a normal, flat card.
++
++  var reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
++
++  // ---------------------------------------------------------------------------
++  // Matrix helpers (column-major, matching WebGL and CSS matrix3d)
++  // ---------------------------------------------------------------------------
++  function mul(a, b) {
++    var o = new Float32Array(16);
++    for (var c = 0; c < 4; c++) {
++      for (var r = 0; r < 4; r++) {
++        o[c * 4 + r] =
++          a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
++      }
++    }
++    return o;
++  }
++  function perspective(fovy, aspect, near, far) {
++    var f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far);
++    return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0]);
++  }
++  function translate(x, y, z) {
++    return new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1]);
++  }
++  function rotX(a) {
++    var c = Math.cos(a), s = Math.sin(a);
++    return new Float32Array([1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1]);
++  }
++  function rotY(a) {
++    var c = Math.cos(a), s = Math.sin(a);
++    return new Float32Array([c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1]);
++  }
++  function transformPoint(m, x, y, z) {
++    return [
++      m[0] * x + m[4] * y + m[8] * z + m[12],
++      m[1] * x + m[5] * y + m[9] * z + m[13],
++      m[2] * x + m[6] * y + m[10] * z + m[14]
++    ];
++  }
++
++  // ---------------------------------------------------------------------------
++  // Shaders
++  // ---------------------------------------------------------------------------
++  var vsSrc = [
++    'attribute vec3 aPos;',
++    'attribute vec3 aNormal;',
++    'attribute vec2 aUv;',
++    'uniform mat4 uModel;',
++    'uniform mat4 uViewProj;',
++    'varying vec3 vNormal;',
++    'varying vec2 vUv;',
++    'void main() {',
++    '  vNormal = (uModel * vec4(aNormal, 0.0)).xyz;',
++    '  vUv = aUv;',
++    '  gl_Position = uViewProj * uModel * vec4(aPos, 1.0);',
++    '}'
++  ].join('\n');
++  var fsSrc = [
++    'precision mediump float;',
++    'uniform sampler2D uTex;',
++    'uniform float uLit;',
++    'varying vec3 vNormal;',
++    'varying vec2 vUv;',
++    'void main() {',
++    '  vec3 n = normalize(vNormal);',
++    '  vec3 l = normalize(vec3(0.4, 0.7, 1.0));',
++    '  float d = max(dot(n, l), 0.0);',
++    '  float shade = mix(1.0, 0.45 + 0.6 * d, uLit);',
++    '  vec4 c = texture2D(uTex, vUv);',
++    '  gl_FragColor = vec4(c.rgb * shade, 1.0);',
++    '}'
++  ].join('\n');
++
++  function compile(type, src) {
++    var s = gl.createShader(type);
++    gl.shaderSource(s, src);
++    gl.compileShader(s);
++    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
++    return s;
++  }
++  var prog = gl.createProgram();
++  gl.attachShader(prog, compile(gl.VERTEX_SHADER, vsSrc));
++  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fsSrc));
++  gl.linkProgram(prog);
++  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return;
++  gl.useProgram(prog);
++
++  var loc = {
++    pos: gl.getAttribLocation(prog, 'aPos'),
++    normal: gl.getAttribLocation(prog, 'aNormal'),
++    uv: gl.getAttribLocation(prog, 'aUv'),
++    model: gl.getUniformLocation(prog, 'uModel'),
++    viewProj: gl.getUniformLocation(prog, 'uViewProj'),
++    tex: gl.getUniformLocation(prog, 'uTex'),
++    lit: gl.getUniformLocation(prog, 'uLit')
++  };
++
++  // ---------------------------------------------------------------------------
++  // Geometry: a cube (half-size H), one quad per face so each can be textured.
++  // ---------------------------------------------------------------------------
++  var H = 1;
++  // Each face: normal, then 4 corners (top-left, bottom-left, bottom-right, top-right)
++  // as seen from outside, so uv (0,0) is the top-left of the artwork.
++  var faces = {
++    front:  { n: [0, 0, 1],  c: [[-H, H, H], [-H, -H, H], [H, -H, H], [H, H, H]] },
++    back:   { n: [0, 0, -1], c: [[H, H, -H], [H, -H, -H], [-H, -H, -H], [-H, H, -H]] },
++    right:  { n: [1, 0, 0],  c: [[H, H, H], [H, -H, H], [H, -H, -H], [H, H, -H]] },
++    left:   { n: [-1, 0, 0], c: [[-H, H, -H], [-H, -H, -H], [-H, -H, H], [-H, H, H]] },
++    top:    { n: [0, 1, 0],  c: [[-H, H, -H], [-H, H, H], [H, H, H], [H, H, -H]] },
++    bottom: { n: [0, -1, 0], c: [[-H, -H, H], [-H, -H, -H], [H, -H, -H], [H, -H, H]] }
++  };
++  var uvs = [[0, 0], [0, 1], [1, 1], [1, 0]];
++
++  Object.keys(faces).forEach(function (key) {
++    var f = faces[key], data = [];
++    for (var i = 0; i < 4; i++) data.push.apply(data, f.c[i].concat(f.n, uvs[i]));
++    f.buffer = gl.createBuffer();
++    gl.bindBuffer(gl.ARRAY_BUFFER, f.buffer);
++    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
++  });
++  var indexBuffer = gl.createBuffer();
++  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
++  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array([0, 1, 2, 0, 2, 3]), gl.STATIC_DRAW);
++
++  // ---------------------------------------------------------------------------
++  // Procedural packaging artwork
++  // ---------------------------------------------------------------------------
++  function kraft(ctx, s) {
++    ctx.fillStyle = '#c69c6d';
++    ctx.fillRect(0, 0, s, s);
++    for (var i = 0; i < 4000; i++) {
++      ctx.fillStyle = 'rgba(' + (Math.random() < 0.5 ? '90,60,30' : '230,200,160') + ',' + (Math.random() * 0.12) + ')';
++      ctx.fillRect(Math.random() * s, Math.random() * s, 1 + Math.random() * 3, 1);
++    }
++  }
++  function bean(ctx, x, y, r, rot) {
++    ctx.save();
++    ctx.translate(x, y);
++    ctx.rotate(rot);
++    ctx.fillStyle = '#3e2723';
++    ctx.beginPath();
++    ctx.ellipse(0, 0, r * 0.7, r, 0, 0, Math.PI * 2);
++    ctx.fill();
++    ctx.strokeStyle = '#c69c6d';
++    ctx.lineWidth = r * 0.12;
++    ctx.beginPath();
++    ctx.moveTo(0, -r * 0.85);
++    ctx.bezierCurveTo(r * 0.3, -r * 0.3, -r * 0.3, r * 0.3, 0, r * 0.85);
++    ctx.stroke();
++    ctx.restore();
++  }
++  function makeArt(kind) {
++    var s = 512, c = document.createElement('canvas');
++    c.width = c.height = s;
++    var ctx = c.getContext('2d');
++    kraft(ctx, s);
++    ctx.textAlign = 'center';
++    ctx.textBaseline = 'middle';
++    if (kind === 'back') {
++      ctx.fillStyle = '#4e342e';
++      ctx.fillRect(0, 150, s, 210);
++      bean(ctx, s / 2, 95, 42, 0.4);
++      ctx.fillStyle = '#fff8ee';
++      ctx.font = 'bold 54px "Segoe UI", sans-serif';
++      ctx.fillText('THE DAILY', s / 2, 215);
++      ctx.fillText('GRIND', s / 2, 285);
++      ctx.fillStyle = '#ffab40';
++      ctx.font = '600 24px "Segoe UI", sans-serif';
++      ctx.fillText('HOUSE BLEND · 340g', s / 2, 335);
++      ctx.fillStyle = '#4e342e';
++      ctx.font = '22px "Segoe UI", sans-serif';
++      ctx.fillText('Ethically sourced · Locally roasted', s / 2, 420);
++    } else if (kind === 'side') {
++      for (var i = 0; i < 18; i++) bean(ctx, 40 + (i % 6) * 86, 60 + Math.floor(i / 6) * 170 + (i % 2) * 60, 22, i);
++      ctx.fillStyle = 'rgba(78,52,46,0.92)';
++      ctx.fillRect(40, 200, s - 80, 112);
++      ctx.fillStyle = '#fff8ee';
++      ctx.font = 'bold 34px "Segoe UI", sans-serif';
++      ctx.fillText('ROASTED IN', s / 2, 236);
++      ctx.fillText('SMALL BATCHES', s / 2, 278);
++    } else if (kind === 'top') {
++      ctx.fillStyle = 'rgba(78,52,46,0.85)';
++      ctx.fillRect(s / 2 - 50, 0, 100, s);
++      ctx.fillStyle = '#ffab40';
++      ctx.font = 'bold 26px "Segoe UI", sans-serif';
++      ctx.save();
++      ctx.translate(s / 2, s / 2);
++      ctx.rotate(-Math.PI / 2);
++      ctx.fillText('FRESH • FRAGILE • FRESH', 0, 0);
++      ctx.restore();
++    } else if (kind === 'front') {
++      // Placeholder for the form face (visible only before the form is drawn).
++      ctx.fillStyle = '#fff8ee';
++      ctx.fillRect(14, 14, s - 28, s - 28);
++    }
++    return c;
++  }
++  function createTexture(source) {
++    var t = gl.createTexture();
++    gl.bindTexture(gl.TEXTURE_2D, t);
++    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
++    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
++    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
++    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
++    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
++    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
++    return t;
++  }
++  var sideTex = createTexture(makeArt('side'));
++  var topTex = createTexture(makeArt('top'));
++  faces.front.tex = createTexture(makeArt('front'));
++  faces.back.tex = createTexture(makeArt('back'));
++  faces.right.tex = sideTex;
++  faces.left.tex = sideTex;
++  faces.top.tex = topTex;
++  faces.bottom.tex = topTex;
++
++  // ---------------------------------------------------------------------------
++  // HTML-in-Canvas detection: draw the live form into the front-face texture.
++  // ---------------------------------------------------------------------------
++  var htmlInCanvas = false;
++  if ('layoutSubtree' in HTMLCanvasElement.prototype && typeof gl.texElementImage2D === 'function') {
++    try {
++      canvas.setAttribute('layoutsubtree', '');
++      canvas.removeAttribute('aria-hidden'); // its children are now the real, accessible form
++      canvas.appendChild(form);
++      htmlInCanvas = true;
++      canvas.addEventListener('paint', uploadFormTexture);
++      if (typeof canvas.requestPaint === 'function') canvas.requestPaint();
++    } catch (e) {
++      revertToOverlay();
++    }
++  }
++  function revertToOverlay() {
++    htmlInCanvas = false;
++    canvas.removeAttribute('layoutsubtree');
++    canvas.setAttribute('aria-hidden', 'true');
++    canvas.removeEventListener('paint', uploadFormTexture);
++    overlay.appendChild(form);
++    faces.front.tex = createTexture(makeArt('front'));
++  }
++  function uploadFormTexture() {
++    if (!htmlInCanvas) return;
++    try {
++      gl.bindTexture(gl.TEXTURE_2D, faces.front.tex);
++      gl.texElementImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, form);
++      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
++    } catch (e) {
++      revertToOverlay();
++    }
++  }
++
++  form.classList.add('is-3d');
++
++  // ---------------------------------------------------------------------------
++  // Sizing
++  // ---------------------------------------------------------------------------
++  var cssW = 0, cssH = 0;
++  function resize() {
++    var r = stage.getBoundingClientRect();
++    var dpr = Math.min(window.devicePixelRatio || 1, 2);
++    cssW = r.width;
++    cssH = r.height;
++    canvas.width = Math.round(cssW * dpr);
++    canvas.height = Math.round(cssH * dpr);
++    gl.viewport(0, 0, canvas.width, canvas.height);
++  }
++  if (window.ResizeObserver) new ResizeObserver(resize).observe(stage);
++  else window.addEventListener('resize', resize);
++  resize();
++
++  // ---------------------------------------------------------------------------
++  // Interaction: pause and face the camera while the user is using the form.
++  // ---------------------------------------------------------------------------
++  var hovering = false;
++  form.addEventListener('pointerenter', function () { hovering = true; });
++  form.addEventListener('pointerleave', function () { hovering = false; });
++  // Tapping the box (outside the form) toggles a manual pause on touch devices.
++  var paused = false;
++  canvas.addEventListener('click', function (e) {
++    if (!form.contains(e.target)) paused = !paused;
++  });
++  function engaged() {
++    return hovering || paused || form.contains(document.activeElement);
++  }
++
++  // ---------------------------------------------------------------------------
++  // Render loop
++  // ---------------------------------------------------------------------------
++  var angle = reduceMotion ? 0 : -0.6;
++  var tilt = -0.32;
++  var speed = 0.6; // radians / second
++  var camDist = 5.2;
++  var last = performance.now();
++  var wasFacing = null;
++
++  function frame(now) {
++    var dt = Math.min((now - last) / 1000, 0.05);
++    last = now;
++
++    if (engaged() || reduceMotion) {
++      // Ease toward the nearest angle where the form faces the camera.
++      var target = Math.round(angle / (Math.PI * 2)) * Math.PI * 2;
++      angle += (target - angle) * Math.min(1, dt * 6);
++      tilt += (-0.12 - tilt) * Math.min(1, dt * 6);
++    } else {
++      angle += speed * dt;
++      tilt += (-0.32 - tilt) * Math.min(1, dt * 2);
++    }
++
++    var aspect = cssW / Math.max(cssH, 1);
++    // Keep the box a sensible size on narrow screens.
++    var fov = aspect < 1 ? 2 * Math.atan(Math.tan(0.35) / aspect) : 0.7;
++    var proj = perspective(fov, aspect, 0.1, 50);
++    var view = translate(0, 0, -camDist);
++    var viewProj = mul(proj, view);
++    var bob = reduceMotion ? 0 : Math.sin(now / 900) * 0.05;
++    var model = mul(translate(0, bob, 0), mul(rotX(-tilt), rotY(angle)));
++
++    gl.clearColor(0, 0, 0, 0);
++    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
++    gl.enable(gl.DEPTH_TEST);
++    gl.enable(gl.CULL_FACE);
++    gl.cullFace(gl.BACK);
++    gl.frontFace(gl.CCW);
++
++    gl.uniformMatrix4fv(loc.model, false, model);
++    gl.uniformMatrix4fv(loc.viewProj, false, viewProj);
++    gl.uniform1i(loc.tex, 0);
++    gl.activeTexture(gl.TEXTURE0);
++    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
++
++    Object.keys(faces).forEach(function (key) {
++      var f = faces[key];
++      gl.bindBuffer(gl.ARRAY_BUFFER, f.buffer);
++      gl.enableVertexAttribArray(loc.pos);
++      gl.vertexAttribPointer(loc.pos, 3, gl.FLOAT, false, 32, 0);
++      gl.enableVertexAttribArray(loc.normal);
++      gl.vertexAttribPointer(loc.normal, 3, gl.FLOAT, false, 32, 12);
++      gl.enableVertexAttribArray(loc.uv);
++      gl.vertexAttribPointer(loc.uv, 2, gl.FLOAT, false, 32, 24);
++      gl.bindTexture(gl.TEXTURE_2D, f.tex);
++      // The form face keeps its own colours so it reads like the DOM version.
++      gl.uniform1f(loc.lit, key === 'front' ? 0.35 : 1.0);
++      gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
++    });
++
++    projectForm(model, viewProj);
++    requestAnimationFrame(frame);
++  }
++
++  // Map the form's CSS box onto the front face and apply it as matrix3d().
++  function projectForm(model, viewProj) {
++    var w = form.offsetWidth, h = form.offsetHeight;
++    if (!w || !h) return;
++
++    // Form pixels -> face-local coordinates on the z = +H plane.
++    var toFace = new Float32Array([
++      (2 * H) / w, 0, 0, 0,
++      0, (-2 * H) / h, 0, 0,
++      0, 0, 1, 0,
++      -H, H, H, 1
++    ]);
++    // Clip space -> CSS pixels in the stage (y down). The browser does the
++    // perspective divide for us, exactly like the GPU does.
++    var toScreen = new Float32Array([
++      cssW / 2, 0, 0, 0,
++      0, -cssH / 2, 0, 0,
++      0, 0, 1, 0,
++      cssW / 2, cssH / 2, 0, 1
++    ]);
++    var m = mul(toScreen, mul(viewProj, mul(model, toFace)));
++
++    var parts = new Array(16);
++    for (var i = 0; i < 16; i++) parts[i] = +m[i].toFixed(6);
++    form.style.transform = 'matrix3d(' + parts.join(',') + ')';
++
++    // Only the camera-facing side should receive clicks.
++    var center = transformPoint(model, 0, 0, H);
++    var normalEnd = transformPoint(model, 0, 0, 2 * H);
++    var n = [normalEnd[0] - center[0], normalEnd[1] - center[1], normalEnd[2] - center[2]];
++    var toCam = [-center[0], -center[1], camDist - center[2]];
++    var len = Math.hypot(toCam[0], toCam[1], toCam[2]);
++    var facing = (n[0] * toCam[0] + n[1] * toCam[1] + n[2] * toCam[2]) / len > 0.08;
++    if (facing !== wasFacing) {
++      form.classList.toggle('is-away', !facing);
++      form.setAttribute('aria-hidden', facing ? 'false' : 'true');
++      if (!facing && form.contains(document.activeElement)) document.activeElement.blur();
++      wasFacing = facing;
++    }
++  }
++
++  requestAnimationFrame(frame);
++
++  // ---------------------------------------------------------------------------
++  // Form behaviour (works with or without 3D)
++  // ---------------------------------------------------------------------------
++  function setupFormBehaviour() {
++    var roastButtons = form.querySelectorAll('[data-roast]');
++    var qtyOut = document.getElementById('qty');
++    var status = document.getElementById('box-status');
++    var email = document.getElementById('box-email');
++    var qty = 1;
++
++    function repaint() {
++      if (typeof canvas.requestPaint === 'function' && canvas.hasAttribute('layoutsubtree')) canvas.requestPaint();
++    }
++
++    Array.prototype.forEach.call(roastButtons, function (btn) {
++      btn.addEventListener('click', function () {
++        Array.prototype.forEach.call(roastButtons, function (b) {
++          b.setAttribute('aria-pressed', b === btn ? 'true' : 'false');
++        });
++        repaint();
++      });
++    });
++
++    Array.prototype.forEach.call(form.querySelectorAll('[data-step]'), function (btn) {
++      btn.addEventListener('click', function () {
++        qty = Math.max(1, Math.min(12, qty + Number(btn.getAttribute('data-step'))));
++        qtyOut.textContent = String(qty);
++        repaint();
++      });
++    });
++
++    form.addEventListener('input', repaint);
++
++    form.addEventListener('submit', function (e) {
++      e.preventDefault();
++      var roast = form.querySelector('[data-roast][aria-pressed="true"]').getAttribute('data-roast');
++      var grind = document.getElementById('grind').value;
++      if (!email.value || !email.checkValidity()) {
++        status.style.color = '#c62828';
++        status.textContent = 'Please enter a valid email.';
++        email.focus();
++      } else {
++        status.style.color = '#2e7d32';
++        status.textContent = 'Added ' + qty + '× ' + roast + ' (' + grind.toLowerCase() + ')!';
++        email.value = '';
++      }
++      repaint();
++    });
++  }
++})();

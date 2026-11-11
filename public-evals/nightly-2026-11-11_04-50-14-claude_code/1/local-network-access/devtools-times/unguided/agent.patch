@@ -1,0 +1,645 @@
+diff --git a/src/components/DeviceDiagnostics.tsx b/src/components/DeviceDiagnostics.tsx
+new file mode 100644
+index 0000000..55b6be2
+--- /dev/null
++++ b/src/components/DeviceDiagnostics.tsx
+@@ -0,0 +1,341 @@
++import React, { useEffect, useState } from 'react';
++import {
++  displayValue,
++  probe,
++  queryLnaPermission,
++  validateLanTarget,
++  validateLoopbackTarget,
++  type AddressSpace,
++  type LnaPermissionState,
++  type ProbeResult,
++} from '../utils/localNetwork';
++
++// Fixed endpoint paths. The reader can only change the host and port, never
++// the path, so the widget can't be pointed at arbitrary URLs on a device.
++const DEVICE_STATUS_PATH = '/api/v1/status';
++const CLI_HEALTH_PATH = '/v1/health';
++const DEFAULT_DEVICE_PORT = '80';
++const DEFAULT_CLI_PORT = '47821';
++
++// Only non-secret settings are saved. Tokens stay in memory.
++const STORAGE_KEY = 'devtools-times:diagnostics';
++
++interface SavedSettings {
++  deviceHost?: string;
++  devicePort?: string;
++  cliPort?: string;
++}
++
++function loadSettings(): SavedSettings {
++  try {
++    const raw = localStorage.getItem(STORAGE_KEY);
++    const parsed = raw ? JSON.parse(raw) : {};
++    return {
++      deviceHost: typeof parsed.deviceHost === 'string' ? parsed.deviceHost : undefined,
++      devicePort: typeof parsed.devicePort === 'string' ? parsed.devicePort : undefined,
++      cliPort: typeof parsed.cliPort === 'string' ? parsed.cliPort : undefined,
++    };
++  } catch {
++    return {};
++  }
++}
++
++function saveSettings(s: SavedSettings) {
++  try {
++    localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
++  } catch {
++    /* storage unavailable (private mode, etc.) */
++  }
++}
++
++type ConnState = 'idle' | 'connecting' | 'connected' | 'error';
++
++function StatusPill({ state }: { state: ConnState }) {
++  const styles: Record<ConnState, string> = {
++    idle: 'bg-gray-100 text-gray-600',
++    connecting: 'bg-amber-100 text-amber-800',
++    connected: 'bg-green-100 text-green-800',
++    error: 'bg-red-100 text-red-700',
++  };
++  const labels: Record<ConnState, string> = {
++    idle: 'Not connected',
++    connecting: 'Connecting…',
++    connected: 'Connected',
++    error: 'Failed',
++  };
++  return (
++    <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-semibold ${styles[state]}`}>
++      <span
++        aria-hidden="true"
++        className={`h-1.5 w-1.5 rounded-full ${
++          state === 'connected' ? 'bg-green-600' : state === 'error' ? 'bg-red-600' : state === 'connecting' ? 'bg-amber-500' : 'bg-gray-400'
++        }`}
++      />
++      {labels[state]}
++    </span>
++  );
++}
++
++function PermissionNote({ space }: { space: AddressSpace }) {
++  const [state, setState] = useState<LnaPermissionState | null>(null);
++  useEffect(() => {
++    let cancelled = false;
++    queryLnaPermission(space).then((s) => !cancelled && setState(s));
++    return () => {
++      cancelled = true;
++    };
++  }, [space]);
++
++  if (state === null || state === 'unsupported') return null;
++  const text: Record<PermissionState, string> = {
++    granted: 'Local network access is allowed for this site.',
++    prompt: 'Your browser will ask for local network access the first time you connect.',
++    denied: 'Local network access is blocked for this site. To connect, turn it back on in your site settings.',
++  };
++  return (
++    <p className={`text-xs ${state === 'denied' ? 'text-red-700' : 'text-gray-500'}`}>{text[state]}</p>
++  );
++}
++
++function ResultTable({ result }: { result: ProbeResult }) {
++  const entries = Object.entries(result.data ?? {}).slice(0, 20);
++  return (
++    <div className="mt-3 rounded-md border border-gray-200 bg-gray-50 p-3 text-xs">
++      <div className="mb-2 flex flex-wrap gap-x-4 gap-y-1 text-gray-600">
++        {result.status !== undefined && <span>HTTP {result.status}</span>}
++        <span>{result.latencyMs} ms</span>
++      </div>
++      {result.error && (
++        <p role="alert" className="mb-2 text-red-700">
++          {result.error}
++        </p>
++      )}
++      {entries.length > 0 && (
++        <dl className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 font-mono">
++          {entries.map(([k, v]) => (
++            <React.Fragment key={k}>
++              <dt className="text-gray-500 truncate max-w-[12rem]">{displayValue(k)}</dt>
++              <dd className="text-gray-900 break-all">{displayValue(v)}</dd>
++            </React.Fragment>
++          ))}
++        </dl>
++      )}
++    </div>
++  );
++}
++
++function Field(props: {
++  id: string;
++  label: string;
++  value: string;
++  onChange: (v: string) => void;
++  placeholder?: string;
++  type?: string;
++  inputMode?: React.HTMLAttributes<HTMLInputElement>['inputMode'];
++  disabled?: boolean;
++  hint?: string;
++  className?: string;
++}) {
++  return (
++    <div className={props.className}>
++      <label htmlFor={props.id} className="block text-xs font-semibold uppercase tracking-wider text-gray-700 mb-1">
++        {props.label}
++      </label>
++      <input
++        id={props.id}
++        type={props.type ?? 'text'}
++        inputMode={props.inputMode}
++        value={props.value}
++        disabled={props.disabled}
++        onChange={(e) => props.onChange(e.target.value)}
++        placeholder={props.placeholder}
++        autoComplete="off"
++        spellCheck={false}
++        className="w-full px-3 py-2 border border-gray-300 rounded-md font-mono text-sm focus:outline-none focus:ring-2 focus:ring-gray-900 disabled:bg-gray-100 disabled:text-gray-500"
++      />
++      {props.hint && <p className="mt-1 text-xs text-gray-500">{props.hint}</p>}
++    </div>
++  );
++}
++
++function DevicePanel({ initialHost, initialPort, onSave }: { initialHost: string; initialPort: string; onSave: (h: string, p: string) => void }) {
++  const [host, setHost] = useState(initialHost);
++  const [port, setPort] = useState(initialPort);
++  const [token, setToken] = useState('');
++  const [state, setState] = useState<ConnState>('idle');
++  const [validation, setValidation] = useState<string | null>(null);
++  const [result, setResult] = useState<ProbeResult | null>(null);
++
++  useEffect(() => setHost(initialHost), [initialHost]);
++  useEffect(() => setPort(initialPort), [initialPort]);
++
++  const connect = async (e: React.FormEvent) => {
++    e.preventDefault();
++    const target = validateLanTarget(host, port);
++    if (typeof target === 'string') {
++      setValidation(target);
++      return;
++    }
++    setValidation(null);
++    setState('connecting');
++    setResult(null);
++    onSave(target.host, String(target.port));
++    const r = await probe(target, DEVICE_STATUS_PATH, { token: token.trim() || undefined });
++    setResult(r);
++    setState(r.ok ? 'connected' : 'error');
++  };
++
++  return (
++    <section aria-labelledby="device-heading" className="border border-gray-300 rounded-lg p-5 bg-white">
++      <div className="flex items-start justify-between gap-3 mb-1">
++        <h2 id="device-heading" className="text-lg font-bold text-gray-900">
++          Hardware test device
++        </h2>
++        <StatusPill state={state} />
++      </div>
++      <p className="text-sm text-gray-600 mb-4">
++        Connect to a test rig on your Wi-Fi network, such as <code className="font-mono">192.168.1.50</code>. Requests
++        go straight from your browser to the device and never pass through our servers.
++      </p>
++
++      <form onSubmit={connect} className="space-y-3" noValidate>
++        <div className="grid grid-cols-3 gap-3">
++          <Field
++            id="device-host"
++            label="Device IP"
++            value={host}
++            onChange={setHost}
++            placeholder="192.168.1.50"
++            inputMode="decimal"
++            className="col-span-2"
++          />
++          <Field id="device-port" label="Port" value={port} onChange={setPort} placeholder="80" inputMode="numeric" />
++        </div>
++        <Field
++          id="device-token"
++          label="Access token (optional)"
++          type="password"
++          value={token}
++          onChange={setToken}
++          hint="Only needed if your device requires one. It's held in memory and never saved."
++        />
++        {validation && (
++          <p role="alert" className="text-xs text-red-700">
++            {validation}
++          </p>
++        )}
++        <PermissionNote space="local" />
++        <button
++          type="submit"
++          disabled={state === 'connecting'}
++          className="w-full py-2 px-4 rounded-md text-sm font-semibold text-white bg-gray-900 hover:bg-gray-800 disabled:opacity-60 disabled:cursor-not-allowed"
++        >
++          {state === 'connecting' ? 'Connecting…' : state === 'connected' ? 'Refresh status' : 'Connect to device'}
++        </button>
++      </form>
++      {result && <ResultTable result={result} />}
++    </section>
++  );
++}
++
++function CliPanel({ initialPort, onSave }: { initialPort: string; onSave: (p: string) => void }) {
++  const [port, setPort] = useState(initialPort);
++  const [token, setToken] = useState('');
++  const [state, setState] = useState<ConnState>('idle');
++  const [validation, setValidation] = useState<string | null>(null);
++  const [result, setResult] = useState<ProbeResult | null>(null);
++
++  useEffect(() => setPort(initialPort), [initialPort]);
++
++  const connect = async (e: React.FormEvent) => {
++    e.preventDefault();
++    const target = validateLoopbackTarget(port);
++    if (typeof target === 'string') {
++      setValidation(target);
++      return;
++    }
++    if (!token.trim()) {
++      setValidation('Paste the pairing token printed by `devtools-times-cli serve`.');
++      return;
++    }
++    setValidation(null);
++    setState('connecting');
++    setResult(null);
++    onSave(String(target.port));
++    const r = await probe(target, CLI_HEALTH_PATH, { token: token.trim() });
++    setResult(r);
++    setState(r.ok ? 'connected' : 'error');
++  };
++
++  return (
++    <section aria-labelledby="cli-heading" className="border border-gray-300 rounded-lg p-5 bg-white">
++      <div className="flex items-start justify-between gap-3 mb-1">
++        <h2 id="cli-heading" className="text-lg font-bold text-gray-900">
++          Companion CLI
++        </h2>
++        <StatusPill state={state} />
++      </div>
++      <p className="text-sm text-gray-600 mb-4">
++        Connect to the companion CLI on this computer. Start it with{' '}
++        <code className="font-mono">devtools-times-cli serve</code>, then paste the pairing token it prints.
++      </p>
++
++      <form onSubmit={connect} className="space-y-3" noValidate>
++        <div className="grid grid-cols-3 gap-3">
++          <Field id="cli-host" label="Host" value="127.0.0.1" onChange={() => {}} disabled className="col-span-2" />
++          <Field id="cli-port" label="Port" value={port} onChange={setPort} placeholder={DEFAULT_CLI_PORT} inputMode="numeric" />
++        </div>
++        <Field
++          id="cli-token"
++          label="Pairing token"
++          type="password"
++          value={token}
++          onChange={setToken}
++          hint="Held in memory for this tab only. It's never saved or sent anywhere other than 127.0.0.1."
++        />
++        {validation && (
++          <p role="alert" className="text-xs text-red-700">
++            {validation}
++          </p>
++        )}
++        <PermissionNote space="loopback" />
++        <button
++          type="submit"
++          disabled={state === 'connecting'}
++          className="w-full py-2 px-4 rounded-md text-sm font-semibold text-white bg-gray-900 hover:bg-gray-800 disabled:opacity-60 disabled:cursor-not-allowed"
++        >
++          {state === 'connecting' ? 'Connecting…' : state === 'connected' ? 'Refresh status' : 'Connect to CLI'}
++        </button>
++      </form>
++      {result && <ResultTable result={result} />}
++    </section>
++  );
++}
++
++export default function DeviceDiagnostics() {
++  const [settings, setSettings] = useState<SavedSettings>({});
++
++  // Read saved settings after mount so server and client render the same markup.
++  useEffect(() => setSettings(loadSettings()), []);
++
++  const update = (patch: SavedSettings) => {
++    setSettings((prev) => {
++      const next = { ...prev, ...patch };
++      saveSettings(next);
++      return next;
++    });
++  };
++
++  return (
++    <div className="space-y-6">
++      <div className="grid gap-6 md:grid-cols-2">
++        <DevicePanel
++          initialHost={settings.deviceHost ?? ''}
++          initialPort={settings.devicePort ?? DEFAULT_DEVICE_PORT}
++          onSave={(deviceHost, devicePort) => update({ deviceHost, devicePort })}
++        />
++        <CliPanel initialPort={settings.cliPort ?? DEFAULT_CLI_PORT} onSave={(cliPort) => update({ cliPort })} />
++      </div>
++    </div>
++  );
++}
+diff --git a/src/components/Footer.astro b/src/components/Footer.astro
+index 5f2d281..d742b89 100644
+--- a/src/components/Footer.astro
++++ b/src/components/Footer.astro
+@@ -51,6 +51,7 @@ const baseUrl = import.meta.env.BASE_URL;
+             <h3 class="font-bold text-xs uppercase tracking-wider mb-3">Science & Tech</h3>
+             <ul class="space-y-2">
+                 <li><a href="/category/science" class="text-sm hover:underline">Science</a></li>
++                <li><a href={`${baseUrl}diagnostics`} class="text-sm hover:underline">Developer Diagnostics</a></li>
+             </ul>
+         </div>
+ 
+diff --git a/src/pages/diagnostics.astro b/src/pages/diagnostics.astro
+new file mode 100644
+index 0000000..a2d00ab
+--- /dev/null
++++ b/src/pages/diagnostics.astro
+@@ -0,0 +1,54 @@
++---
++import Layout from '../layouts/Layout.astro';
++import DeviceDiagnostics from '../components/DeviceDiagnostics';
++
++const siteOrigin = new URL(Astro.site ?? Astro.url).origin;
++---
++
++<Layout title="Developer Diagnostics | The DevTools Times">
++  <div class="max-w-5xl mx-auto px-4 py-8 md:py-12">
++    <p class="text-xs font-bold uppercase tracking-wider text-gray-500 mb-2">Developer Tools</p>
++    <h1 class="text-3xl md:text-4xl font-bold text-gray-900 mb-3 pb-2 border-b-2">Diagnostics Connection</h1>
++    <p class="text-gray-700 mb-8 max-w-3xl">
++      Check that your hardware test device and the companion CLI can be reached from this browser. Everything
++      runs on your machine: your browser talks to them directly, and nothing passes through The DevTools Times
++      servers. Your browser may ask whether this site can access devices on your local network. Allow it to
++      continue.
++    </p>
++
++    <DeviceDiagnostics client:only="react" />
++
++    <details class="mt-10 border-t border-gray-300 pt-6 group">
++      <summary class="cursor-pointer font-bold text-gray-900">Integration notes for device and CLI authors</summary>
++      <div class="prose prose-sm max-w-none mt-4">
++        <p>
++          The widget sends a single <code>GET</code> request to a fixed path when the reader clicks
++          <em>Connect</em>. It never scans address ranges and it doesn't retry automatically.
++        </p>
++        <ul>
++          <li><strong>Device:</strong> <code>GET http://&lt;lan-ip&gt;:&lt;port&gt;/api/v1/status</code></li>
++          <li><strong>CLI:</strong> <code>GET http://127.0.0.1:&lt;port&gt;/v1/health</code> with <code>Authorization: Bearer &lt;pairing-token&gt;</code></li>
++        </ul>
++        <p>Respond with a flat JSON object (64 KB max). To allow the browser request, your service must:</p>
++        <ul>
++          <li>
++            Answer the <code>OPTIONS</code> preflight with
++            <code>Access-Control-Allow-Origin: {siteOrigin}</code> (this exact origin, not <code>*</code>),
++            <code>Access-Control-Allow-Headers: Authorization, Accept</code>, and
++            <code>Access-Control-Allow-Private-Network: true</code> (for browsers that still use the older Private Network Access preflight).
++          </li>
++          <li>Never redirect. The widget treats redirects as errors.</li>
++          <li>
++            <strong>CLI:</strong> bind only to <code>127.0.0.1</code>, generate a random pairing token each time it
++            starts, reject requests without that token, and check the <code>Origin</code> header against the
++            allowlist above so other websites can't drive it.
++          </li>
++          <li>
++            Check the <code>Host</code> header (accept only the IP/hostname you expect) to defend against DNS
++            rebinding.
++          </li>
++        </ul>
++      </div>
++    </details>
++  </div>
++</Layout>
+diff --git a/src/utils/localNetwork.ts b/src/utils/localNetwork.ts
+new file mode 100644
+index 0000000..0585376
+--- /dev/null
++++ b/src/utils/localNetwork.ts
+@@ -0,0 +1,220 @@
++/**
++ * Helpers for the developer diagnostics widget, which connects from the
++ * browser to devices on the reader's own private network and to a
++ * companion CLI on loopback.
++ *
++ * These checks run in the browser *before* any request goes out. They make
++ * sure the widget can only reach the address ranges it was built for, so it
++ * can't be used to send requests to arbitrary public hosts or to sweep
++ * address ranges.
++ */
++
++export type AddressSpace = 'local' | 'loopback';
++
++export interface ParsedTarget {
++  host: string; // normalized host (no brackets)
++  port: number;
++  space: AddressSpace;
++}
++
++const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
++// mDNS hostnames such as "testrig-01.local"
++const MDNS_RE = /^(?=.{1,253}\.local$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+local$/i;
++
++function parseIPv4(host: string): number[] | null {
++  const m = IPV4_RE.exec(host);
++  if (!m) return null;
++  const octets = m.slice(1).map(Number);
++  // Reject leading zeros (octal ambiguity) and out-of-range values.
++  if (m.slice(1).some((o) => o.length > 1 && o.startsWith('0'))) return null;
++  if (octets.some((o) => o > 255)) return null;
++  return octets;
++}
++
++/** RFC 1918 private ranges plus IPv4 link-local (169.254/16, minus the cloud metadata address). */
++export function isPrivateIPv4(host: string): boolean {
++  const o = parseIPv4(host);
++  if (!o) return false;
++  const [a, b, c, d] = o;
++  if (a === 10) return true;
++  if (a === 172 && b >= 16 && b <= 31) return true;
++  if (a === 192 && b === 168) return true;
++  if (a === 169 && b === 254) {
++    // 169.254.169.254 is the cloud metadata endpoint. A test device won't
++    // live there, so block it outright.
++    return !(c === 169 && d === 254);
++  }
++  return false;
++}
++
++export function isLoopbackHost(host: string): boolean {
++  return host === '127.0.0.1' || host === '::1' || host === 'localhost';
++}
++
++export function parsePort(raw: string | number): number | null {
++  const s = String(raw).trim();
++  if (!/^\d{1,5}$/.test(s)) return null;
++  const n = Number(s);
++  return n >= 1 && n <= 65535 ? n : null;
++}
++
++/**
++ * Validate a user-supplied LAN device host. Accepts:
++ *  - RFC 1918 / link-local IPv4 literals (e.g. 192.168.1.50)
++ *  - mDNS names ending in .local (e.g. testrig.local)
++ * Anything else (public IPs, internet hostnames, loopback, IPv6, URLs with
++ * paths or credentials) is rejected.
++ */
++export function validateLanTarget(hostRaw: string, portRaw: string | number): ParsedTarget | string {
++  const host = hostRaw.trim().toLowerCase();
++  if (!host) return 'Enter the device IP address.';
++  if (/[\/@?#\s:\[\]]/.test(host)) {
++    return 'Enter only the host (e.g. 192.168.1.50). Put the port in the port field and leave out the scheme and path.';
++  }
++  if (isLoopbackHost(host)) return 'Use the Companion CLI panel for loopback (127.0.0.1).';
++  if (!isPrivateIPv4(host) && !MDNS_RE.test(host)) {
++    return 'Only private LAN addresses are allowed: 10.x.x.x, 172.16–31.x.x, 192.168.x.x, 169.254.x.x, or a *.local name.';
++  }
++  const port = parsePort(portRaw);
++  if (port === null) return 'The port must be a number from 1 to 65535.';
++  return { host, port, space: 'local' };
++}
++
++/** The companion CLI is pinned to 127.0.0.1; only the port is configurable. */
++export function validateLoopbackTarget(portRaw: string | number): ParsedTarget | string {
++  const port = parsePort(portRaw);
++  if (port === null) return 'The port must be a number from 1 to 65535.';
++  return { host: '127.0.0.1', port, space: 'loopback' };
++}
++
++export function targetUrl(t: ParsedTarget, path: string): string {
++  // Fixed, known paths only. The caller never passes user input here.
++  return `http://${t.host}:${t.port}${path}`;
++}
++
++export type LnaPermissionState = PermissionState | 'unsupported';
++
++/**
++ * Ask for the Local Network Access permission state, if the browser exposes
++ * it. Chrome first shipped a single "local-network-access" permission and
++ * later split it into "local-network" and "loopback-network", so try those
++ * names in order.
++ */
++export async function queryLnaPermission(space: AddressSpace): Promise<LnaPermissionState> {
++  if (typeof navigator === 'undefined' || !navigator.permissions?.query) return 'unsupported';
++  const names = space === 'loopback'
++    ? ['loopback-network', 'local-network-access']
++    : ['local-network', 'local-network-access'];
++  for (const name of names) {
++    try {
++      const status = await navigator.permissions.query({ name: name as PermissionName });
++      return status.state;
++    } catch {
++      // Unknown permission name in this browser; try the next one.
++    }
++  }
++  return 'unsupported';
++}
++
++export interface ProbeResult {
++  ok: boolean;
++  status?: number;
++  latencyMs: number;
++  data?: Record<string, unknown>;
++  error?: string;
++}
++
++const MAX_BODY_BYTES = 64 * 1024;
++
++/**
++ * Make one request to a validated local target.
++ *
++ * - `targetAddressSpace` tells Chrome's Local Network Access that the request
++ *   is meant for the private network. That makes the permission prompt
++ *   appear, and it lets an HTTPS page reach a plain-HTTP device without a
++ *   mixed-content block.
++ * - Credentials, referrer, and redirects are turned off, so a device can't
++ *   bounce the request somewhere else and no site cookies leak out.
++ * - The response is treated as untrusted. Its size is capped, it must parse
++ *   as a JSON object, and the UI only ever renders it as text.
++ */
++export async function probe(
++  target: ParsedTarget,
++  path: string,
++  opts: { token?: string; timeoutMs?: number; method?: 'GET' | 'POST'; body?: unknown } = {},
++): Promise<ProbeResult> {
++  const controller = new AbortController();
++  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 5000);
++  const started = performance.now();
++  const headers: Record<string, string> = { Accept: 'application/json' };
++  if (opts.token) headers['Authorization'] = `Bearer ${opts.token}`;
++  if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
++
++  try {
++    const init: RequestInit & { targetAddressSpace?: AddressSpace } = {
++      method: opts.method ?? 'GET',
++      mode: 'cors',
++      credentials: 'omit',
++      cache: 'no-store',
++      redirect: 'error',
++      referrerPolicy: 'no-referrer',
++      headers,
++      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
++      signal: controller.signal,
++      targetAddressSpace: target.space,
++    };
++    const res = await fetch(targetUrl(target, path), init);
++    const latencyMs = Math.round(performance.now() - started);
++
++    const len = Number(res.headers.get('content-length') ?? '0');
++    if (len > MAX_BODY_BYTES) {
++      return { ok: false, status: res.status, latencyMs, error: 'Response too large.' };
++    }
++    const text = await res.text();
++    if (text.length > MAX_BODY_BYTES) {
++      return { ok: false, status: res.status, latencyMs, error: 'Response too large.' };
++    }
++
++    let data: Record<string, unknown> | undefined;
++    if (text) {
++      try {
++        const parsed = JSON.parse(text);
++        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) data = parsed;
++      } catch {
++        return { ok: false, status: res.status, latencyMs, error: 'The response is not valid JSON.' };
++      }
++    }
++    if (!res.ok) {
++      const msg = typeof data?.error === 'string' ? data.error : `HTTP ${res.status}`;
++      return { ok: false, status: res.status, latencyMs, data, error: msg };
++    }
++    return { ok: true, status: res.status, latencyMs, data };
++  } catch (err) {
++    const latencyMs = Math.round(performance.now() - started);
++    if ((err as Error)?.name === 'AbortError') {
++      return { ok: false, latencyMs, error: 'Timed out. Check that the device is powered on and on the same network.' };
++    }
++    // The browser won't say *why* a request failed: CORS, Local Network
++    // Access denial, mixed content, and connection refused all look the same.
++    return {
++      ok: false,
++      latencyMs,
++      error: 'The request was blocked or the connection failed. Check that the service is running, that local network access is allowed, and that its CORS headers allow this site.',
++    };
++  } finally {
++    clearTimeout(timer);
++  }
++}
++
++/** Turn an untrusted JSON value into a short display string. */
++export function displayValue(v: unknown): string {
++  if (v === null || v === undefined) return '—';
++  if (typeof v === 'string') return v.length > 200 ? `${v.slice(0, 200)}…` : v;
++  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
++  try {
++    const s = JSON.stringify(v);
++    return s.length > 200 ? `${s.slice(0, 200)}…` : s;
++  } catch {
++    return '[unrenderable]';
++  }
++}

@@ -1,0 +1,429 @@
+diff --git a/PERFORMANCE.md b/PERFORMANCE.md
+new file mode 100644
+index 0000000..49f97b0
+--- /dev/null
++++ b/PERFORMANCE.md
+@@ -0,0 +1,38 @@
++The homepage loads `performance-monitor.js` with no dependencies or network reporting.
++It measures navigation link clicks, Order Now clicks, and clicks anywhere within each
++Seasonal Favorites card (including View Details and keyboard-activated links).
++
++Read the latest 100 samples in the browser Performance timeline by filtering measure
++names beginning with `daily-grind:`. Each measure's `detail` contains `kind`, `label`,
++`startTime`, `duration` (milliseconds), and `method`. To forward samples to an existing
++analytics service, subscribe to `window`'s `daily-grind:performance` event and read
++`event.detail`. No analytics service or user identifiers are configured here.
++
++Timing starts at the click event timestamp, including input delay, and ends on the
++second animation frame. This allows an intervening paint of synchronous visual
++updates; it is an estimate, not an exact presentation timestamp or an INP metric.
++It does not automatically wait for network requests, image loads, or CSS transitions.
++Samples are discarded when the page becomes hidden or unloads. Full document links
++retain their original behavior; this document cannot measure the destination page's
++paint. A click sample emitted before navigation describes only this document.
++
++History URL changes (`pushState`, `replaceState`), back/forward navigation, and hash
++changes automatically produce `view-switch` samples for the next paint opportunity.
++For asynchronous rendering or switches that do not change the URL, wrap the actual
++update so timing includes the full operation:
++
++```js
++await window.dailyGrindPerformance.measureViewSwitch('menu', async () => {
++  await renderMenu(); // Resolve after committing the DOM update.
++  // Await relevant image.decode() or Animation.finished promises here if needed.
++});
++```
++
++The wrapper preserves the update's return value and errors; errors do not produce
++successful measurements. Its promise resolves when the update completes; the timing
++event follows after the paint opportunity. A wrapped history update may produce both
++an automatic route sample and the explicit render sample; their labels distinguish
++them. No DOM content, URLs, or query parameters are included in emitted samples.
++
++Run `npm test` for deterministic Node tests of timing, navigation behavior, asynchronous
++updates, lifecycle cancellation, and retention. No server or browser is needed.
+diff --git a/index.html b/index.html
+index 66c9173..c78660b 100644
+--- a/index.html
++++ b/index.html
+@@ -5,6 +5,7 @@
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <title>The Daily Grind | Artisanal Coffee</title>
++  <script src="/performance-monitor.js" defer></script>
+   <style>
+     :root {
+       --primary: #4e342e;
+@@ -157,7 +158,7 @@
+ 
+ <body>
+ 
+-  <nav>
++  <nav data-performance="navigation">
+     <div class="logo">THE DAILY GRIND</div>
+     <ul>
+       <li><a href="/menu">Menu</a></li>
+@@ -171,24 +172,24 @@
+   <header class="hero">
+     <h1>Wake Up Your Senses</h1>
+     <p>Ethically sourced, locally roasted, delivered to your cup.</p>
+-    <a href="/order-online" class="btn">Order Now</a>
++    <a href="/order-online" class="btn" data-performance="order-now">Order Now</a>
+   </header>
+ 
+   <main class="container">
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+       <div class="grid">
+-        <div class="card">
++        <div class="card" data-performance="seasonal-maple-oat-latte">
+           <h3>Maple Oat Latte</h3>
+           <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+           <a href="/menu/seasonal" class="btn">View Details</a>
+         </div>
+-        <div class="card">
++        <div class="card" data-performance="seasonal-dark-roast-espresso">
+           <h3>Dark Roast Espresso</h3>
+           <p>Bold, smokey, and perfect for a morning boost.</p>
+           <a href="/menu/espresso" class="btn">View Details</a>
+         </div>
+-        <div class="card">
++        <div class="card" data-performance="seasonal-cold-brew">
+           <h3>Cold Brew</h3>
+           <p>Steeped for 18 hours for maximum smoothness.</p>
+           <a href="/menu/cold-brew" class="btn">View Details</a>
+diff --git a/package.json b/package.json
+index 2bd4d77..b1c23fc 100644
+--- a/package.json
++++ b/package.json
+@@ -2,7 +2,8 @@
+   "name": "daily-grind",
+   "version": "1.0.0",
+   "scripts": {
+-    "start": "pnpm dlx statikk --port ${PORT:-11222}"
++    "start": "pnpm dlx statikk --port ${PORT:-11222}",
++    "test": "node --test"
+   },
+   "pnpm": {
+     "onlyBuiltDependencies": []
+diff --git a/performance-monitor.js b/performance-monitor.js
+new file mode 100644
+index 0000000..73a148c
+--- /dev/null
++++ b/performance-monitor.js
+@@ -0,0 +1,123 @@
++(() => {
++  'use strict';
++
++  if (window.dailyGrindPerformance) return;
++
++  const prefix = 'daily-grind:';
++  const pending = new Set();
++  const retained = [];
++  let sequence = 0;
++
++  function cancel(sample) {
++    if (!sample) return;
++    sample.cancelled = true;
++    cancelAnimationFrame(sample.frame);
++    performance.clearMarks(sample.mark);
++    pending.delete(sample);
++  }
++
++  function begin(kind, label, startTime = performance.now()) {
++    // Background tabs cannot provide meaningful paint latency.
++    if (document.visibilityState !== 'visible') return null;
++    const sample = {
++      kind, label, startTime,
++      id: ++sequence,
++      mark: `${prefix}${sequence}:start`,
++      cancelled: false,
++    };
++    performance.mark(sample.mark, { startTime });
++    pending.add(sample);
++    return sample;
++  }
++
++  function afterPaint(sample) {
++    if (!sample || sample.cancelled) return;
++    // The second callback runs after the browser had a chance to paint the
++    // first frame. This is a paint estimate, not a GPU presentation timestamp.
++    sample.frame = requestAnimationFrame(() => {
++      sample.frame = requestAnimationFrame(() => {
++        if (sample.cancelled || document.visibilityState !== 'visible') {
++          cancel(sample);
++          return;
++        }
++        const endTime = performance.now();
++        const detail = Object.freeze({
++          kind: sample.kind,
++          label: sample.label,
++          startTime: sample.startTime,
++          duration: endTime - sample.startTime,
++          method: 'double-animation-frame',
++        });
++        const name = `${prefix}${sample.kind}:${sample.label}:${sample.id}`;
++        performance.measure(name, { start: sample.mark, end: endTime, detail });
++        performance.clearMarks(sample.mark);
++        pending.delete(sample);
++        // Keep the monitor's timeline bounded, even on long-lived views.
++        retained.push(name);
++        if (retained.length > 100) performance.clearMeasures(retained.shift());
++        window.dispatchEvent(new CustomEvent('daily-grind:performance', { detail }));
++      });
++    });
++  }
++
++  document.addEventListener('click', (event) => {
++    const element = event.target instanceof Element
++      ? event.target.closest('[data-performance]') : null;
++    if (!element) return;
++    let label = element.dataset.performance;
++    if (label === 'navigation') {
++      const link = event.target.closest('a');
++      if (!link || !element.contains(link)) return;
++      label += `:${link.textContent.trim().toLowerCase().replace(/\s+/g, '-')}`;
++    }
++    // Event timestamps include input delay before the capture handler runs.
++    const now = performance.now();
++    const start = event.timeStamp >= 0 && event.timeStamp <= now ? event.timeStamp : now;
++    afterPaint(begin('click', label, start));
++  }, { capture: true, passive: true });
++
++  // Observe route changes without intercepting links or altering navigation.
++  for (const method of ['pushState', 'replaceState']) {
++    const original = history[method];
++    history[method] = function (...args) {
++      const before = location.href;
++      const sample = begin('view-switch', method);
++      try {
++        const result = original.apply(this, args);
++        if (location.href !== before) afterPaint(sample);
++        else cancel(sample);
++        return result;
++      } catch (error) {
++        cancel(sample);
++        throw error;
++      }
++    };
++  }
++  for (const type of ['popstate', 'hashchange']) {
++    window.addEventListener(type, () => afterPaint(begin('view-switch', type)));
++  }
++
++  // Renderers can include asynchronous work, image decoding, or transitions
++  // in the returned promise before the final paint estimate is taken.
++  window.dailyGrindPerformance = Object.freeze({
++    async measureViewSwitch(label, update) {
++      const sample = begin('view-switch', label);
++      try {
++        const result = await update();
++        afterPaint(sample);
++        return result;
++      } catch (error) {
++        cancel(sample);
++        throw error;
++      }
++    },
++  });
++
++  function cancelPending() {
++    for (const sample of pending) cancel(sample);
++  }
++  window.addEventListener('pagehide', cancelPending);
++  document.addEventListener('visibilitychange', () => {
++    if (document.visibilityState !== 'visible') cancelPending();
++  });
++})();
+diff --git a/performance-monitor.test.cjs b/performance-monitor.test.cjs
+new file mode 100644
+index 0000000..7176af0
+--- /dev/null
++++ b/performance-monitor.test.cjs
+@@ -0,0 +1,186 @@
++const { test } = require('node:test');
++const assert = require('node:assert/strict');
++const { readFileSync } = require('node:fs');
++const { runInNewContext } = require('node:vm');
++
++const source = readFileSync(`${__dirname}/performance-monitor.js`, 'utf8');
++
++function setup() {
++  const listeners = new Map();
++  const frames = new Map();
++  const marks = new Map();
++  const measures = new Map();
++  const events = [];
++  let now = 10;
++  let frameId = 0;
++  const target = (name) => ({
++    addEventListener(type, callback) {
++      const key = `${name}:${type}`;
++      listeners.set(key, [...(listeners.get(key) || []), callback]);
++    },
++    dispatchEvent(event) { events.push(event); },
++  });
++  const window = target('window');
++  const document = { ...target('document'), visibilityState: 'visible' };
++  const location = { href: 'https://daily-grind.example/' };
++  const history = {};
++  for (const method of ['pushState', 'replaceState']) {
++    history[method] = function (state, unused, url) {
++      if (state === 'fail') throw new Error('invalid history update');
++      if (url !== undefined) location.href = new URL(url, location.href).href;
++      return 'original-result';
++    };
++  }
++  class Element {
++    constructor(label, link = null) {
++      this.dataset = { performance: label };
++      this.link = link;
++    }
++    closest(selector) { return selector === 'a' ? this.link : this; }
++    contains(link) { return this.link === link; }
++  }
++  const context = {
++    window, document, location, history, Element,
++    CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options.detail; } },
++    performance: {
++      now: () => now,
++      mark: (name, options) => marks.set(name, options.startTime),
++      clearMarks: (name) => marks.delete(name),
++      measure(name, options) {
++        assert.ok(marks.has(options.start));
++        measures.set(name, options);
++      },
++      clearMeasures: (name) => measures.delete(name),
++    },
++    requestAnimationFrame(callback) { frames.set(++frameId, callback); return frameId; },
++    cancelAnimationFrame(id) { frames.delete(id); },
++  };
++  runInNewContext(source, context);
++  return {
++    ...context, events, frames, marks, measures,
++    emit(target, type, event = {}) {
++      for (const callback of listeners.get(`${target}:${type}`) || []) callback(event);
++    },
++    frame() {
++      now += 16;
++      const callbacks = [...frames.values()];
++      frames.clear();
++      callbacks.forEach((callback) => callback(now));
++    },
++    reload() { runInNewContext(source, context); },
++  };
++}
++
++test('requested click targets measure input delay through two animation frames', () => {
++  const env = setup();
++  const targets = [
++    ['navigation', { textContent: ' My Account ' }, 'navigation:my-account'],
++    ['order-now', null, 'order-now'],
++    ['seasonal-maple-oat-latte', null, 'seasonal-maple-oat-latte'],
++    ['seasonal-dark-roast-espresso', null, 'seasonal-dark-roast-espresso'],
++    ['seasonal-cold-brew', null, 'seasonal-cold-brew'],
++  ];
++  for (const [label, link] of targets) {
++    env.emit('document', 'click', { target: new env.Element(label, link), timeStamp: 4 });
++  }
++  env.frame();
++  assert.equal(env.events.length, 0);
++  env.frame();
++  assert.equal(env.events.length, targets.length);
++  env.events.forEach((event, index) => {
++    assert.equal(event.type, 'daily-grind:performance');
++    assert.equal(event.detail.label, targets[index][2]);
++    assert.equal(event.detail.duration, 38);
++    assert.equal(event.detail.kind, 'click');
++  });
++  assert.equal(env.marks.size, 0);
++});
++
++test('unmonitored clicks and navigation background do not produce samples', () => {
++  const env = setup();
++  env.emit('document', 'click', { target: {}, timeStamp: 1 });
++  env.emit('document', 'click', { target: new env.Element('navigation'), timeStamp: 1 });
++  env.frame();
++  env.frame();
++  assert.equal(env.events.length, 0);
++});
++
++test('history wrappers preserve behavior and measure only URL changes', () => {
++  const env = setup();
++  assert.equal(env.history.pushState({}, '', '/menu'), 'original-result');
++  env.history.replaceState({}, '', '/menu');
++  assert.throws(() => env.history.pushState('fail', '', '/broken'), /invalid history/);
++  assert.equal(env.location.href, 'https://daily-grind.example/menu');
++  env.frame();
++  env.frame();
++  assert.equal(env.events.length, 1);
++  assert.equal(env.events[0].detail.label, 'pushState');
++  assert.equal(env.marks.size, 0);
++  for (const type of ['popstate', 'hashchange']) env.emit('window', type);
++  env.frame();
++  env.frame();
++  assert.equal(env.events.length, 3);
++});
++
++test('explicit view timing waits for asynchronous rendering and preserves its result', async () => {
++  const env = setup();
++  let finish;
++  const rendering = new Promise((resolve) => { finish = resolve; });
++  const result = env.window.dailyGrindPerformance.measureViewSwitch('menu', () => rendering);
++  env.frame();
++  env.frame();
++  assert.equal(env.events.length, 0);
++  finish(123);
++  assert.equal(await result, 123);
++  env.frame();
++  assert.equal(env.events.length, 0);
++  env.frame();
++  assert.equal(env.events[0].detail.duration, 64);
++  assert.equal(env.events[0].detail.kind, 'view-switch');
++});
++
++test('failed view updates propagate errors and release marks', async () => {
++  const env = setup();
++  await assert.rejects(env.window.dailyGrindPerformance.measureViewSwitch('failed', () => {
++    throw new Error('render failed');
++  }), /render failed/);
++  await assert.rejects(env.window.dailyGrindPerformance.measureViewSwitch('failed', async () => {
++    throw new Error('async failed');
++  }), /async failed/);
++  assert.equal(env.marks.size, 0);
++  assert.equal(env.frames.size, 0);
++});
++
++test('hidden pages and pagehide discard pending samples, including async updates', async () => {
++  for (const type of ['visibilitychange', 'pagehide']) {
++    const env = setup();
++    let finish;
++    const result = env.window.dailyGrindPerformance.measureViewSwitch('menu', () =>
++      new Promise((resolve) => { finish = resolve; }));
++    env.emit('document', 'click', { target: new env.Element('order-now'), timeStamp: 4 });
++    if (type === 'visibilitychange') env.document.visibilityState = 'hidden';
++    env.emit(type === 'pagehide' ? 'window' : 'document', type);
++    finish();
++    await result;
++    env.frame();
++    env.frame();
++    assert.equal(env.events.length, 0);
++    assert.equal(env.marks.size, 0);
++    env.document.visibilityState = 'hidden';
++    await env.window.dailyGrindPerformance.measureViewSwitch('hidden', () => 1);
++    assert.equal(env.frames.size, 0);
++  }
++});
++
++test('retention stays bounded for repeated labels and setup is idempotent', () => {
++  const env = setup();
++  env.reload();
++  for (let i = 0; i < 105; i++) {
++    env.emit('document', 'click', { target: new env.Element('order-now'), timeStamp: 4 });
++    env.frame();
++    env.frame();
++  }
++  assert.equal(env.events.length, 105);
++  assert.equal(env.measures.size, 100);
++  assert.equal(env.marks.size, 0);
++});

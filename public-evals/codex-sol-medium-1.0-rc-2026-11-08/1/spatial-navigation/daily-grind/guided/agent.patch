@@ -1,0 +1,365 @@
+diff --git a/index.html b/index.html
+index 66c9173..ab2f1df 100644
+--- a/index.html
++++ b/index.html
+@@ -102,11 +102,29 @@
+ 
+     .grid {
+       display: grid;
+-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
++      grid-template-columns: repeat(auto-fit, minmax(min(250px, 100%), 1fr));
+       gap: 20px;
+       margin-top: 20px;
+     }
+ 
++    .grid-row {
++      display: contents;
++    }
++
++    .grid-help {
++      text-align: center;
++      margin-top: 8px;
++    }
++
++    .card .btn:focus-visible {
++      outline: 3px solid var(--primary);
++      outline-offset: 4px;
++    }
++
++    .card .btn {
++      scroll-margin-block-start: 6rem;
++    }
++
+     .card {
+       background: white;
+       padding: 20px;
+@@ -153,6 +171,7 @@
+       font-size: 0.85rem;
+     }
+   </style>
++  <script src="./spatial-navigation.js" defer></script>
+ </head>
+ 
+ <body>
+@@ -176,22 +195,25 @@
+ 
+   <main class="container">
+     <section>
+-      <h2 style="text-align: center;">Seasonal Favorites</h2>
+-      <div class="grid">
+-        <div class="card">
+-          <h3>Maple Oat Latte</h3>
+-          <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+-          <a href="/menu/seasonal" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Dark Roast Espresso</h3>
+-          <p>Bold, smokey, and perfect for a morning boost.</p>
+-          <a href="/menu/espresso" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Cold Brew</h3>
+-          <p>Steeped for 18 hours for maximum smoothness.</p>
+-          <a href="/menu/cold-brew" class="btn">View Details</a>
++      <h2 id="seasonal-heading" style="text-align: center;">Seasonal Favorites</h2>
++      <p id="seasonal-help" class="grid-help" hidden>Use arrow keys to browse favorites, Enter to view details, and Tab to leave.</p>
++      <div class="grid" role="group" data-spatial-grid aria-labelledby="seasonal-heading" aria-describedby="seasonal-help">
++        <div class="grid-row">
++          <div class="card">
++            <h3>Maple Oat Latte</h3>
++            <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
++            <a href="/menu/seasonal" class="btn" aria-label="View Details for Maple Oat Latte">View Details</a>
++          </div>
++          <div class="card">
++            <h3>Dark Roast Espresso</h3>
++            <p>Bold, smokey, and perfect for a morning boost.</p>
++            <a href="/menu/espresso" class="btn" aria-label="View Details for Dark Roast Espresso">View Details</a>
++          </div>
++          <div class="card">
++            <h3>Cold Brew</h3>
++            <p>Steeped for 18 hours for maximum smoothness.</p>
++            <a href="/menu/cold-brew" class="btn" aria-label="View Details for Cold Brew">View Details</a>
++          </div>
+         </div>
+       </div>
+     </section>
+diff --git a/package.json b/package.json
+index 2bd4d77..d1fe2ea 100644
+--- a/package.json
++++ b/package.json
+@@ -2,6 +2,7 @@
+   "name": "daily-grind",
+   "version": "1.0.0",
+   "scripts": {
++    "test": "node --test",
+     "start": "pnpm dlx statikk --port ${PORT:-11222}"
+   },
+   "pnpm": {
+diff --git a/spatial-navigation.js b/spatial-navigation.js
+new file mode 100644
+index 0000000..d87cb2f
+--- /dev/null
++++ b/spatial-navigation.js
+@@ -0,0 +1,100 @@
++(() => {
++  const directions = {
++    ArrowLeft: { axis: 'x', sign: -1 },
++    ArrowRight: { axis: 'x', sign: 1 },
++    ArrowUp: { axis: 'y', sign: -1 },
++    ArrowDown: { axis: 'y', sign: 1 },
++  };
++
++  function isAvailable(item) {
++    if (item.closest('[hidden], [inert], [aria-hidden="true"], [aria-disabled="true"]')) return false;
++    if (item.checkVisibility) {
++      if (!item.checkVisibility({ visibilityProperty: true, opacityProperty: true })) return false;
++    } else {
++      const style = getComputedStyle(item);
++      if (style.visibility !== 'visible' || style.opacity === '0') return false;
++    }
++    const rect = item.getBoundingClientRect();
++    return rect.width > 0 && rect.height > 0;
++  }
++
++  function findNeighbor(current, items, direction) {
++    const origin = current.getBoundingClientRect();
++    const horizontal = direction.axis === 'x';
++    const start = horizontal ? 'left' : 'top';
++    const end = horizontal ? 'right' : 'bottom';
++    const crossStart = horizontal ? 'top' : 'left';
++    const crossEnd = horizontal ? 'bottom' : 'right';
++    const candidates = [];
++
++    for (const item of items) {
++      if (item === current) continue;
++      const rect = item.getBoundingClientRect();
++      const gap = direction.sign > 0 ? rect[start] - origin[end] : origin[start] - rect[end];
++      // Accept subpixel rounding at touching edges, but not overlapping items.
++      if (gap < -1) continue;
++      const overlap = Math.min(origin[crossEnd], rect[crossEnd]) - Math.max(origin[crossStart], rect[crossStart]);
++      const offset = Math.abs((rect[crossStart] + rect[crossEnd] - origin[crossStart] - origin[crossEnd]) / 2);
++      candidates.push({ item, gap: Math.max(0, gap), offset, aligned: overlap > 0 });
++    }
++
++    const aligned = candidates.filter(candidate => candidate.aligned);
++    const ranked = aligned.length ? aligned : candidates;
++    ranked.sort((a, b) => aligned.length
++      ? a.gap - b.gap || a.offset - b.offset
++      : (a.gap + 2 * a.offset) - (b.gap + 2 * b.offset));
++    return ranked[0]?.item;
++  }
++
++  document.querySelectorAll('[data-spatial-grid]').forEach(grid => {
++    const getItems = () => [...grid.querySelectorAll('.card a[href]')];
++    const getAvailableItems = () => getItems().filter(isAvailable);
++    let active = getAvailableItems()[0];
++
++    function setActive(item) {
++      active = item;
++      getItems().forEach(candidate => { candidate.tabIndex = candidate === active ? 0 : -1; });
++    }
++
++    // A layout grid has one logical row, which may wrap visually at any width.
++    // Enhance semantics only with JS, leaving all links tabbable without it.
++    grid.setAttribute('role', 'grid');
++    grid.querySelectorAll('.grid-row').forEach(row => row.setAttribute('role', 'row'));
++    grid.querySelectorAll('.card').forEach(card => card.setAttribute('role', 'gridcell'));
++    const help = document.getElementById(grid.getAttribute('aria-describedby'));
++    if (help) help.hidden = false;
++    setActive(active);
++
++    grid.addEventListener('focusin', event => {
++      if (getAvailableItems().includes(event.target)) setActive(event.target);
++    });
++
++    grid.addEventListener('keydown', event => {
++      const direction = directions[event.key];
++      if (!direction || event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey || event.isComposing) return;
++      const target = event.composedPath()[0];
++      if (!(target instanceof Element) || target.matches(':read-write, select, input, textarea, [role="slider"], [role="spinbutton"]')) return;
++      const items = getAvailableItems();
++      if (!items.includes(target)) return;
++      const next = findNeighbor(target, items, direction);
++      if (!next) return; // Keep native scrolling at the widget's boundaries.
++      event.preventDefault();
++      setActive(next);
++      next.focus({ preventScroll: true });
++      next.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
++    });
++
++    // Recover the entry tab stop if the active link is removed or hidden.
++    const refresh = () => {
++      const items = getAvailableItems();
++      setActive(items.includes(active) ? active : items[0]);
++    };
++    new MutationObserver(refresh).observe(grid, {
++      childList: true,
++      subtree: true,
++      attributes: true,
++      attributeFilter: ['hidden', 'inert', 'aria-hidden', 'aria-disabled', 'class', 'style', 'href'],
++    });
++    new ResizeObserver(refresh).observe(grid);
++  });
++})();
+diff --git a/spatial-navigation.test.cjs b/spatial-navigation.test.cjs
+new file mode 100644
+index 0000000..29049f9
+--- /dev/null
++++ b/spatial-navigation.test.cjs
+@@ -0,0 +1,156 @@
++const { test } = require('node:test');
++const assert = require('node:assert/strict');
++const { readFileSync } = require('node:fs');
++const { runInNewContext } = require('node:vm');
++
++const source = readFileSync(`${__dirname}/spatial-navigation.js`, 'utf8');
++
++function setup(boxes) {
++  const callbacks = {};
++  const listeners = {};
++  const attributes = {};
++  class Element {
++    constructor([left, top, width = 100, height = 40]) {
++      this.rect = { left, top, width, height, right: left + width, bottom: top + height };
++    }
++    getBoundingClientRect() { return this.rect; }
++    closest() { return this.excluded ? this : null; }
++    checkVisibility() { return !this.hidden; }
++    matches() { return !!this.editable; }
++    focus(options) {
++      this.focusOptions = options;
++      listeners.focusin({ target: this });
++    }
++    scrollIntoView(options) { this.scrollOptions = options; }
++    setAttribute(name, value) { this[name] = value; }
++  }
++  const items = boxes.map(box => new Element(box));
++  const row = new Element([0, 0]);
++  const cards = items.map(() => new Element([0, 0]));
++  const help = { hidden: true };
++  const grid = {
++    querySelectorAll(selector) {
++      if (selector === '.grid-row') return [row];
++      if (selector === '.card') return cards;
++      return items;
++    },
++    setAttribute(name, value) { attributes[name] = value; },
++    getAttribute() { return 'help'; },
++    addEventListener(name, listener) { listeners[name] = listener; },
++  };
++  runInNewContext(source, {
++    Element,
++    document: { querySelectorAll: () => [grid], getElementById: () => help },
++    MutationObserver: class { constructor(callback) { callbacks.mutation = callback; } observe() {} },
++    ResizeObserver: class { constructor(callback) { callbacks.resize = callback; } observe() {} },
++    getComputedStyle: () => ({ visibility: 'visible', opacity: '1' }),
++  });
++  function key(target, key, overrides = {}) {
++    const event = {
++      key, target, defaultPrevented: false,
++      composedPath: () => [target],
++      preventDefault() { this.defaultPrevented = true; },
++      ...overrides,
++    };
++    listeners.keydown(event);
++    return event;
++  }
++  return { items, row, cards, attributes, help, callbacks, listeners, key, Element };
++}
++
++test('enhances grid semantics and maintains one tab stop after pointer focus', () => {
++  const grid = setup([[0, 0], [120, 0], [240, 0]]);
++  assert.equal(grid.attributes.role, 'grid');
++  assert.equal(grid.row.role, 'row');
++  assert.ok(grid.cards.every(card => card.role === 'gridcell'));
++  assert.equal(grid.help.hidden, false);
++  assert.deepEqual(grid.items.map(item => item.tabIndex), [0, -1, -1]);
++  grid.listeners.focusin({ target: grid.items[2] });
++  assert.deepEqual(grid.items.map(item => item.tabIndex), [-1, -1, 0]);
++});
++
++test('navigates horizontal, vertical, and wrapped layouts from live geometry', () => {
++  for (const [boxes, from, direction, to] of [
++    [[[0, 0], [120, 0], [240, 0]], 0, 'ArrowRight', 1],
++    [[[0, 0], [120, 0], [240, 0]], 2, 'ArrowLeft', 1],
++    [[[0, 0], [0, 60], [0, 120]], 0, 'ArrowDown', 1],
++    [[[0, 0], [0, 60], [0, 120]], 2, 'ArrowUp', 1],
++    [[[0, 0], [120, 0], [0, 60]], 1, 'ArrowDown', 2],
++    // Visual order differs from DOM order, as with RTL or CSS order.
++    [[[240, 0], [120, 0], [0, 0]], 0, 'ArrowLeft', 1],
++  ]) {
++    const { items, key } = setup(boxes);
++    assert.equal(key(items[from], direction).defaultPrevented, true);
++    assert.equal(items[to].tabIndex, 0);
++    assert.equal(items[to].focusOptions.preventScroll, true);
++    assert.equal(items[to].scrollOptions.block, 'nearest');
++    assert.equal(items[to].scrollOptions.inline, 'nearest');
++  }
++  const { items, key } = setup([[0, 0], [120, 0]]);
++  items[1].rect = { left: 0, right: 100, top: 60, bottom: 100, width: 100, height: 40 };
++  assert.equal(key(items[0], 'ArrowDown').defaultPrevented, true);
++  assert.equal(items[1].tabIndex, 0);
++});
++
++test('prefers aligned candidates and uses weighted fallback for irregular layouts', () => {
++  const aligned = setup([[0, 0], [130, 10], [110, 45]]);
++  aligned.key(aligned.items[0], 'ArrowRight');
++  assert.equal(aligned.items[1].tabIndex, 0);
++  const fallback = setup([[0, 0], [110, 200], [150, 60]]);
++  fallback.key(fallback.items[0], 'ArrowRight');
++  assert.equal(fallback.items[2].tabIndex, 0);
++  // Overlapping cards must not qualify based solely on their centres.
++  const overlapping = setup([[0, 0, 200], [100, 0, 200]]);
++  assert.equal(overlapping.key(overlapping.items[0], 'ArrowRight').defaultPrevented, false);
++});
++
++test('preserves scrolling at boundaries and native Tab and Enter behavior', () => {
++  const { items, key } = setup([[0, 0], [120, 0]]);
++  for (const direction of ['ArrowLeft', 'ArrowUp', 'ArrowDown', 'Tab', 'Enter', ' ']) {
++    assert.equal(key(items[0], direction).defaultPrevented, false);
++  }
++  assert.equal(key(items[1], 'ArrowRight').defaultPrevented, false);
++});
++
++test('ignores modifiers, composing events, consumed events, and nested controls', () => {
++  const { items, key, Element } = setup([[0, 0], [120, 0]]);
++  for (const modifier of ['altKey', 'ctrlKey', 'metaKey', 'shiftKey', 'isComposing']) {
++    assert.equal(key(items[0], 'ArrowRight', { [modifier]: true }).defaultPrevented, false);
++  }
++  key(items[0], 'ArrowRight', { defaultPrevented: true });
++  assert.equal(items[1].focusOptions, undefined);
++  items[0].editable = true;
++  assert.equal(key(items[0], 'ArrowRight').defaultPrevented, false);
++  assert.equal(key(new Element([0, 0]), 'ArrowRight').defaultPrevented, false);
++  items[0].editable = false;
++  assert.equal(key(items[0], 'ArrowRight', { composedPath: () => [new Element([0, 0])] }).defaultPrevented, false);
++});
++
++test('skips hidden, inert, disabled, and zero-size candidates, including visibility fallback', () => {
++  for (const exclude of [
++    item => { item.hidden = true; },
++    item => { item.excluded = true; },
++    item => { item.rect.width = 0; },
++  ]) {
++    const { items, key } = setup([[0, 0], [120, 0], [240, 0]]);
++    exclude(items[1]);
++    key(items[0], 'ArrowRight');
++    assert.equal(items[2].tabIndex, 0);
++  }
++  const { items, key } = setup([[0, 0], [120, 0]]);
++  items[1].checkVisibility = undefined;
++  assert.equal(key(items[0], 'ArrowRight').defaultPrevented, true);
++});
++
++test('restores the entry tab stop after hiding, removal, resize, and emptying', () => {
++  const { items, callbacks } = setup([[0, 0], [120, 0]]);
++  items[0].hidden = true;
++  callbacks.mutation();
++  assert.deepEqual(items.map(item => item.tabIndex), [-1, 0]);
++  items.pop();
++  items[0].hidden = false;
++  callbacks.resize();
++  assert.equal(items[0].tabIndex, 0);
++  items.pop();
++  assert.doesNotThrow(callbacks.mutation);
++});

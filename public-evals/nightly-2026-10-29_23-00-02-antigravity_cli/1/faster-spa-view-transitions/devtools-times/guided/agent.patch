@@ -1,0 +1,366 @@
+diff --git a/src/components/BottomNav.tsx b/src/components/BottomNav.tsx
+index 6d031f5..9165e38 100644
+--- a/src/components/BottomNav.tsx
++++ b/src/components/BottomNav.tsx
+@@ -1,4 +1,4 @@
+-import React, { useState } from 'react';
++import React, { useState, useEffect } from 'react';
+ import FlyoutMenu from './FlyoutMenu';
+ 
+ interface BottomNavProps {
+@@ -11,6 +11,12 @@ interface BottomNavProps {
+ const BottomNav: React.FC<BottomNavProps> = ({ categories, articles, reports, multimedia }) => {
+     const [activeCategory, setActiveCategory] = useState<string | null>(null);
+ 
++    useEffect(() => {
++        const handleBeforeSwap = () => setActiveCategory(null);
++        document.addEventListener('astro:before-swap', handleBeforeSwap);
++        return () => document.removeEventListener('astro:before-swap', handleBeforeSwap);
++    }, []);
++
+     const groupedCategories = {
+         'News & Politics': ['news', 'National', 'Politics', 'Economy', 'Labor', 'Business'],
+         'Arts & Culture': ['Culture', 'Media'],
+diff --git a/src/components/ReadingListButton.tsx b/src/components/ReadingListButton.tsx
+index 29642be..34b80b7 100644
+--- a/src/components/ReadingListButton.tsx
++++ b/src/components/ReadingListButton.tsx
+@@ -20,6 +20,10 @@ export default function ReadingListButton() {
+       setArticles(data);
+     };
+     fetchArticles();
++
++    const handleBeforeSwap = () => setIsOpen(false);
++    document.addEventListener('astro:before-swap', handleBeforeSwap);
++    return () => document.removeEventListener('astro:before-swap', handleBeforeSwap);
+   }, []);
+ 
+   return (
+diff --git a/src/components/SearchButton.tsx b/src/components/SearchButton.tsx
+index 3f57913..f1770a5 100644
+--- a/src/components/SearchButton.tsx
++++ b/src/components/SearchButton.tsx
+@@ -1,5 +1,5 @@
+ 
+-import React, { useState } from 'react';
++import React, { useState, useEffect } from 'react';
+ import SearchFlyout from './SearchFlyout';
+ 
+ interface Article {
+@@ -13,6 +13,12 @@ export default function SearchButton() {
+     const [articles, setArticles] = useState<Article[]>([]);
+     const [isLoading, setIsLoading] = useState(false);
+ 
++    useEffect(() => {
++        const handleBeforeSwap = () => setIsFlyoutOpen(false);
++        document.addEventListener('astro:before-swap', handleBeforeSwap);
++        return () => document.removeEventListener('astro:before-swap', handleBeforeSwap);
++    }, []);
++
+     const openSearch = async () => {
+         try {
+             setArticles([]);
+diff --git a/src/layouts/Layout.astro b/src/layouts/Layout.astro
+index dcf9696..04fb6a4 100644
+--- a/src/layouts/Layout.astro
++++ b/src/layouts/Layout.astro
+@@ -12,6 +12,26 @@ export interface Props {
+ 
+ const { title } = Astro.props;
+ const baseUrl = import.meta.env.BASE_URL;
++
++const normalizeViewPath = (pathname: string): string => {
++  try {
++    pathname = decodeURIComponent(pathname);
++  } catch {}
++  const trimmed = pathname.replace(/\/+$/, "");
++  return (trimmed || "/").toLowerCase();
++};
++
++const getViewId = (pathname: string): string => {
++  const normalized = normalizeViewPath(pathname);
++  const slug = normalized
++    .replace(/^\/+/, "")
++    .replace(/[^a-z0-9]+/g, "-")
++    .replace(/^-+|-+$/g, "");
++  return `spa-view-${slug || "home"}`;
++};
++
++const currentViewPath = normalizeViewPath(Astro.url.pathname);
++const currentViewId = getViewId(Astro.url.pathname);
+ ---
+ 
+ <!doctype html>
+@@ -45,11 +65,244 @@ const baseUrl = import.meta.env.BASE_URL;
+         <div>
+           <Header />
+         </div>
+-        <main class="bg-white relative">
+-          <slot />
++        <main id="spa-view-host" class="bg-white relative">
++          <div
++            id={currentViewId}
++            data-view-path={currentViewPath}
++            data-view-title={title}
++            class="spa-view focus:outline-none"
++            tabindex="-1"
++            aria-hidden="false"
++          >
++            <slot />
++          </div>
+         </main>
+       </div>
+     </div>
+     <Footer />
++
++    <script>
++      import {
++        swapFunctions,
++        type TransitionBeforePreparationEvent,
++        type TransitionBeforeSwapEvent,
++      } from "astro:transitions/client";
++
++      const MAX_CACHED_VIEWS = 10;
++
++      interface CachedViewEntry {
++        id: string;
++        title: string;
++        element: HTMLElement;
++      }
++
++      const viewCache = new Map<string, CachedViewEntry>();
++
++      function normalizeViewPath(pathname: string): string {
++        try {
++          pathname = decodeURIComponent(pathname);
++        } catch {}
++        const trimmed = pathname.replace(/\/+$/, "");
++        return (trimmed || "/").toLowerCase();
++      }
++
++      function getViewId(pathname: string): string {
++        const normalized = normalizeViewPath(pathname);
++        const slug = normalized
++          .replace(/^\/+/, "")
++          .replace(/[^a-z0-9]+/g, "-")
++          .replace(/^-+|-+$/g, "");
++        return `spa-view-${slug || "home"}`;
++      }
++
++      function switchToView(viewId: string) {
++        // Hide all views
++        document.querySelectorAll<HTMLElement>(".spa-view").forEach((view) => {
++          view.classList.add("inactive");
++          view.setAttribute("aria-hidden", "true");
++          view.setAttribute("inert", "inert");
++        });
++
++        // Show the target view
++        const activeView = document.getElementById(viewId);
++        if (!activeView) return;
++        activeView.classList.remove("inactive");
++        activeView.setAttribute("aria-hidden", "false");
++        activeView.removeAttribute("inert");
++
++        // MANDATORY: Move focus to the new view to ensure a logical tab-order
++        activeView.focus();
++      }
++
++      function touchCachedView(viewId: string, entry: CachedViewEntry) {
++        if (viewCache.has(viewId)) {
++          viewCache.delete(viewId);
++        }
++        viewCache.set(viewId, entry);
++
++        // Evict least-recently-used inactive views when cache threshold is exceeded
++        if (viewCache.size > MAX_CACHED_VIEWS) {
++          for (const [candidateId, candidateEntry] of viewCache.entries()) {
++            if (candidateId !== viewId) {
++              candidateEntry.element.remove();
++              viewCache.delete(candidateId);
++              if (viewCache.size <= MAX_CACHED_VIEWS) {
++                break;
++              }
++            }
++          }
++        }
++      }
++
++      function mergeHeadElements(newDoc: Document) {
++        document.title = newDoc.title;
++
++        for (const el of Array.from(newDoc.head.children)) {
++          if (el.tagName === "TITLE") continue;
++
++          if (el.matches('link[rel="stylesheet"]')) {
++            const href = el.getAttribute("href");
++            if (
++              href &&
++              !document.head.querySelector(
++                `link[rel="stylesheet"][href="${CSS.escape(href)}"]`
++              )
++            ) {
++              document.head.appendChild(document.adoptNode(el));
++            }
++            continue;
++          }
++
++          if (el instanceof HTMLStyleElement) {
++            const viteId = el.dataset.viteDevId;
++            const duplicate = viteId
++              ? document.head.querySelector(
++                  `style[data-vite-dev-id="${CSS.escape(viteId)}"]`
++                )
++              : Array.from(document.head.querySelectorAll("style")).find(
++                  (s) => s.textContent === el.textContent
++                );
++            if (!duplicate) {
++              document.head.appendChild(document.adoptNode(el));
++            }
++            continue;
++          }
++
++          if (el instanceof HTMLScriptElement) {
++            if (el.dataset.astroExec !== "") {
++              document.head.appendChild(document.adoptNode(el));
++            }
++            continue;
++          }
++        }
++
++        for (const script of Array.from(newDoc.body.querySelectorAll("script"))) {
++          if (!script.closest(".spa-view") && script.dataset.astroExec !== "") {
++            document.body.appendChild(document.adoptNode(script));
++          }
++        }
++      }
++
++      function registerInitialView() {
++        const currentViewId = getViewId(window.location.pathname);
++        const initialView =
++          document.getElementById(currentViewId) ||
++          document.querySelector<HTMLElement>(".spa-view:not(.inactive)");
++        if (initialView) {
++          const id = initialView.id || currentViewId;
++          initialView.id = id;
++          const title = initialView.dataset.viewTitle || document.title;
++          initialView.dataset.viewTitle = title;
++          touchCachedView(id, {
++            id,
++            title,
++            element: initialView,
++          });
++        }
++      }
++
++      registerInitialView();
++      (window as unknown as { switchToView: typeof switchToView }).switchToView =
++        switchToView;
++
++      document.addEventListener("astro:before-preparation", (e) => {
++        const event = e as TransitionBeforePreparationEvent;
++        if (event.formData) return;
++
++        const targetViewId = getViewId(event.to.pathname);
++        const cachedElement = document.getElementById(targetViewId);
++        if (cachedElement && cachedElement.classList.contains("spa-view")) {
++          if (!viewCache.has(targetViewId)) {
++            touchCachedView(targetViewId, {
++              id: targetViewId,
++              title: cachedElement.dataset.viewTitle || document.title,
++              element: cachedElement,
++            });
++          }
++          event.loader = async () => {};
++        }
++      });
++
++      document.addEventListener("astro:before-swap", (e) => {
++        const event = e as TransitionBeforeSwapEvent;
++        const host =
++          document.getElementById("spa-view-host") ||
++          document.querySelector("main");
++        if (!host) return;
++
++        const targetViewId = getViewId(event.to.pathname);
++        const existingView = document.getElementById(targetViewId);
++
++        event.swap = () => {
++          if (existingView && existingView.classList.contains("spa-view")) {
++            const cachedTitle =
++              viewCache.get(targetViewId)?.title ||
++              existingView.dataset.viewTitle ||
++              document.title;
++            document.title = cachedTitle;
++            switchToView(targetViewId);
++            touchCachedView(targetViewId, {
++              id: targetViewId,
++              title: cachedTitle,
++              element: existingView,
++            });
++            return;
++          }
++
++          const newDoc = event.newDocument;
++          const incomingView =
++            newDoc.getElementById(targetViewId) ||
++            newDoc.querySelector<HTMLElement>(".spa-view");
++
++          if (!incomingView) {
++            swapFunctions.swap(newDoc);
++            registerInitialView();
++            return;
++          }
++
++          swapFunctions.deselectScripts(newDoc);
++          swapFunctions.swapRootAttributes(newDoc);
++          mergeHeadElements(newDoc);
++
++          const resolvedViewId = incomingView.id || targetViewId;
++          incomingView.id = resolvedViewId;
++          incomingView.dataset.viewPath = normalizeViewPath(event.to.pathname);
++          incomingView.dataset.viewTitle = newDoc.title;
++          if (!incomingView.hasAttribute("tabindex")) {
++            incomingView.setAttribute("tabindex", "-1");
++          }
++
++          const adoptedView = document.adoptNode(incomingView);
++          host.appendChild(adoptedView);
++
++          switchToView(resolvedViewId);
++          touchCachedView(resolvedViewId, {
++            id: resolvedViewId,
++            title: newDoc.title,
++            element: adoptedView,
++          });
++        };
++      });
++    </script>
+   </body>
+ </html>
+diff --git a/src/styles/global.css b/src/styles/global.css
+index e9a9abb..42aef7c 100644
+--- a/src/styles/global.css
++++ b/src/styles/global.css
+@@ -4,4 +4,19 @@
+   font-family: "Grenze", serif;
+   font-weight: 500;
+   font-style: normal;
+-}
+\ No newline at end of file
++}
++
++.spa-view.inactive {
++  /* MANDATORY: Use hidden to cache the rendering state of inactive views */
++  content-visibility: hidden;
++
++  /* Prevent hidden views from taking up physical space in layout flow */
++  position: absolute;
++  pointer-events: none;
++}
++
++@supports not (content-visibility: hidden) {
++  .spa-view.inactive {
++    display: none;
++  }
++}

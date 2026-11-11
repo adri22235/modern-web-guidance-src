@@ -1,0 +1,473 @@
+diff --git a/.well-known/web-app-origin-association b/.well-known/web-app-origin-association
+new file mode 100644
+index 0000000..1332fcf
+--- /dev/null
++++ b/.well-known/web-app-origin-association
+@@ -0,0 +1,5 @@
++{
++  "https://www.thedailygrind.example/": {
++    "allow_migration": true
++  }
++}
+diff --git a/app-migration.js b/app-migration.js
+new file mode 100644
+index 0000000..ee0a057
+--- /dev/null
++++ b/app-migration.js
+@@ -0,0 +1,144 @@
++/*
++ * Origin migration for the installed web app.
++ *
++ * The same build is deployed to both origins:
++ *   - OLD_ORIGIN serves legacy.webmanifest (`migrate_to`) so the browser moves
++ *     the existing installation — window, OS shortcuts, dock/start-menu pins,
++ *     permissions — over to the new app.
++ *   - NEW_ORIGIN serves manifest.webmanifest (`migrate_from`), claiming it.
++ *
++ * Browsers never move origin-bound storage, so user configuration kept in
++ * localStorage is handed over here: the old origin serialises it into the URL
++ * fragment (never sent to a server) and the new origin imports it once.
++ * Only keys using the app's `dg:` prefix are carried over.
++ *
++ * Loaded synchronously in <head> so imported settings exist before any other
++ * script reads them.
++ */
++(() => {
++  const OLD_ORIGIN = 'https://app.dailygrind.example';
++  const NEW_ORIGIN = 'https://www.thedailygrind.example';
++
++  const HASH_PARAM = 'dg-migrate';
++  const IMPORTED_FLAG = 'dg-internal:migration-imported';
++  const KEY_PATTERN = /^dg:/;
++  const MAX_PAYLOAD_CHARS = 64 * 1024;
++  const STANDALONE_REDIRECT_DELAY_MS = 4000;
++
++  const here = location.origin;
++  const isOldOrigin = here === OLD_ORIGIN;
++
++  // 1. Advertise the manifest that matches this origin.
++  const manifest = document.createElement('link');
++  manifest.rel = 'manifest';
++  manifest.href = isOldOrigin ? '/legacy.webmanifest' : '/manifest.webmanifest';
++  document.head.appendChild(manifest);
++
++  const toBase64Url = (text) => {
++    const bytes = new TextEncoder().encode(text);
++    let bin = '';
++    bytes.forEach((b) => { bin += String.fromCharCode(b); });
++    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
++  };
++
++  const fromBase64Url = (encoded) => {
++    const bin = atob(encoded.replace(/-/g, '+').replace(/_/g, '/'));
++    return new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
++  };
++
++  const readHashParam = () => new URLSearchParams(location.hash.slice(1)).get(HASH_PARAM);
++
++  const stripHashParam = () => {
++    const params = new URLSearchParams(location.hash.slice(1));
++    params.delete(HASH_PARAM);
++    const rest = params.toString();
++    history.replaceState(history.state, '', location.pathname + location.search + (rest ? `#${rest}` : ''));
++  };
++
++  // 2. New origin: import settings handed over from the old origin.
++  const importSettings = () => {
++    const payload = readHashParam();
++    if (payload === null) return;
++    stripHashParam();
++
++    if (localStorage.getItem(IMPORTED_FLAG)) return;
++    // Only accept handoffs that genuinely came from the old origin.
++    if (!document.referrer || new URL(document.referrer).origin !== OLD_ORIGIN) return;
++    if (payload.length > MAX_PAYLOAD_CHARS) return;
++
++    try {
++      const data = JSON.parse(fromBase64Url(payload));
++      if (!data || typeof data !== 'object' || Array.isArray(data)) return;
++      Object.entries(data).forEach(([key, value]) => {
++        // Never clobber anything the user has already set on the new origin.
++        if (KEY_PATTERN.test(key) && typeof value === 'string' && localStorage.getItem(key) === null) {
++          localStorage.setItem(key, value);
++        }
++      });
++      localStorage.setItem(IMPORTED_FLAG, new Date().toISOString());
++    } catch (err) {
++      console.warn('[migration] Could not import settings from previous address', err);
++    }
++  };
++
++  // 3. Old origin: forward the user (and their settings) to the new origin.
++  const buildHandoffUrl = () => {
++    const settings = {};
++    for (let i = 0; i < localStorage.length; i += 1) {
++      const key = localStorage.key(i);
++      if (KEY_PATTERN.test(key)) settings[key] = localStorage.getItem(key);
++    }
++    const target = new URL(location.pathname + location.search, NEW_ORIGIN);
++    const params = new URLSearchParams(location.hash.slice(1));
++    const encoded = toBase64Url(JSON.stringify(settings));
++    if (Object.keys(settings).length && encoded.length <= MAX_PAYLOAD_CHARS) {
++      params.set(HASH_PARAM, encoded);
++    }
++    const hash = params.toString();
++    return target.href + (hash ? `#${hash}` : '');
++  };
++
++  const showMovedBanner = (go) => {
++    const banner = document.createElement('div');
++    banner.setAttribute('role', 'status');
++    banner.style.cssText = 'position:fixed;inset:auto 0 0 0;z-index:2000;display:flex;gap:12px;'
++      + 'justify-content:center;align-items:center;flex-wrap:wrap;padding:14px 20px;'
++      + 'background:#3e2723;color:#fff;font:15px/1.4 system-ui,sans-serif;';
++    banner.textContent = 'The Daily Grind has moved to a new address. Your settings and shortcuts come with you.';
++    const button = document.createElement('button');
++    button.type = 'button';
++    button.textContent = 'Continue';
++    button.style.cssText = 'background:#ffab40;color:#3e2723;border:0;border-radius:4px;'
++      + 'padding:6px 14px;font:inherit;font-weight:600;cursor:pointer;';
++    button.addEventListener('click', go);
++    banner.appendChild(button);
++    document.body.appendChild(banner);
++  };
++
++  const forwardFromOldOrigin = () => {
++    const go = () => location.replace(buildHandoffUrl());
++    const standalone = matchMedia('(display-mode: standalone)').matches
++      || matchMedia('(display-mode: window-controls-overlay)').matches
++      || navigator.standalone === true;
++
++    if (!standalone) {
++      go();
++      return;
++    }
++    // Inside the installed app, let the page (and legacy manifest) load first so
++    // the browser picks up `migrate_to` before we navigate away.
++    const start = () => {
++      showMovedBanner(go);
++      setTimeout(go, STANDALONE_REDIRECT_DELAY_MS);
++    };
++    if (document.readyState === 'complete') start();
++    else addEventListener('load', start, { once: true });
++  };
++
++  try {
++    if (here === NEW_ORIGIN) importSettings();
++    else if (isOldOrigin) forwardFromOldOrigin();
++  } catch (err) {
++    console.warn('[migration] Origin migration step failed', err);
++  }
++})();
+diff --git a/icons/icon-192.png b/icons/icon-192.png
+new file mode 100644
+index 0000000..d2a4353
+Binary files /dev/null and b/icons/icon-192.png differ
+diff --git a/icons/icon-512.png b/icons/icon-512.png
+new file mode 100644
+index 0000000..6132bf2
+Binary files /dev/null and b/icons/icon-512.png differ
+diff --git a/icons/icon.svg b/icons/icon.svg
+new file mode 100644
+index 0000000..ec6cada
+--- /dev/null
++++ b/icons/icon.svg
+@@ -0,0 +1,8 @@
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
++  <rect width="512" height="512" rx="96" fill="#4e342e"/>
++  <g fill="none" stroke="#ffab40" stroke-width="24" stroke-linecap="round" stroke-linejoin="round">
++    <path d="M136 216h208v88a88 88 0 0 1-88 88h-32a88 88 0 0 1-88-88z"/>
++    <path d="M344 236h20a40 40 0 0 1 0 80h-24"/>
++    <path d="M200 112c-16 20 16 36 0 64M256 112c-16 20 16 36 0 64M312 112c-16 20 16 36 0 64"/>
++  </g>
++</svg>
+diff --git a/icons/maskable-512.png b/icons/maskable-512.png
+new file mode 100644
+index 0000000..009bce9
+Binary files /dev/null and b/icons/maskable-512.png differ
+diff --git a/icons/maskable.svg b/icons/maskable.svg
+new file mode 100644
+index 0000000..cc171b6
+--- /dev/null
++++ b/icons/maskable.svg
+@@ -0,0 +1,8 @@
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
++  <rect width="512" height="512" fill="#4e342e"/>
++  <g transform="translate(77 77) scale(0.7)" fill="none" stroke="#ffab40" stroke-width="24" stroke-linecap="round" stroke-linejoin="round">
++    <path d="M136 216h208v88a88 88 0 0 1-88 88h-32a88 88 0 0 1-88-88z"/>
++    <path d="M344 236h20a40 40 0 0 1 0 80h-24"/>
++    <path d="M200 112c-16 20 16 36 0 64M256 112c-16 20 16 36 0 64M312 112c-16 20 16 36 0 64"/>
++  </g>
++</svg>
+diff --git a/icons/shortcut-96.png b/icons/shortcut-96.png
+new file mode 100644
+index 0000000..a422ae9
+Binary files /dev/null and b/icons/shortcut-96.png differ
+diff --git a/index.html b/index.html
+index 66c9173..e2cf1b6 100644
+--- a/index.html
++++ b/index.html
+@@ -5,6 +5,12 @@
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <title>The Daily Grind | Artisanal Coffee</title>
++  <meta name="description" content="Ethically sourced, locally roasted coffee. Order ahead, find locations and earn rewards.">
++  <meta name="theme-color" content="#4e342e">
++  <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
++  <link rel="apple-touch-icon" href="/icons/icon-192.png">
++  <!-- Adds the origin-appropriate <link rel="manifest"> and handles the origin move. -->
++  <script src="/app-migration.js"></script>
+   <style>
+     :root {
+       --primary: #4e342e;
+@@ -207,6 +213,12 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script>
++    if ('serviceWorker' in navigator) {
++      addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
++    }
++  </script>
++
+ </body>
+ 
+ </html>
+diff --git a/legacy.webmanifest b/legacy.webmanifest
+new file mode 100644
+index 0000000..58b6775
+--- /dev/null
++++ b/legacy.webmanifest
+@@ -0,0 +1,96 @@
++{
++  "id": "/",
++  "name": "The Daily Grind",
++  "short_name": "Daily Grind",
++  "description": "Ethically sourced, locally roasted coffee. Order ahead, find locations and earn rewards.",
++  "start_url": "/?source=pwa",
++  "scope": "/",
++  "display": "standalone",
++  "background_color": "#fafafa",
++  "theme_color": "#4e342e",
++  "lang": "en",
++  "dir": "ltr",
++  "categories": [
++    "food",
++    "shopping",
++    "lifestyle"
++  ],
++  "icons": [
++    {
++      "src": "/icons/icon-192.png",
++      "sizes": "192x192",
++      "type": "image/png",
++      "purpose": "any"
++    },
++    {
++      "src": "/icons/icon-512.png",
++      "sizes": "512x512",
++      "type": "image/png",
++      "purpose": "any"
++    },
++    {
++      "src": "/icons/maskable-512.png",
++      "sizes": "512x512",
++      "type": "image/png",
++      "purpose": "maskable"
++    },
++    {
++      "src": "/icons/icon.svg",
++      "sizes": "any",
++      "type": "image/svg+xml",
++      "purpose": "any"
++    }
++  ],
++  "shortcuts": [
++    {
++      "name": "Order Now",
++      "short_name": "Order",
++      "url": "/order-online?source=shortcut",
++      "icons": [
++        {
++          "src": "/icons/shortcut-96.png",
++          "sizes": "96x96",
++          "type": "image/png"
++        }
++      ]
++    },
++    {
++      "name": "Menu",
++      "url": "/menu?source=shortcut",
++      "icons": [
++        {
++          "src": "/icons/shortcut-96.png",
++          "sizes": "96x96",
++          "type": "image/png"
++        }
++      ]
++    },
++    {
++      "name": "Rewards",
++      "url": "/rewards?source=shortcut",
++      "icons": [
++        {
++          "src": "/icons/shortcut-96.png",
++          "sizes": "96x96",
++          "type": "image/png"
++        }
++      ]
++    },
++    {
++      "name": "My Account",
++      "short_name": "Account",
++      "url": "/account?source=shortcut",
++      "icons": [
++        {
++          "src": "/icons/shortcut-96.png",
++          "sizes": "96x96",
++          "type": "image/png"
++        }
++      ]
++    }
++  ],
++  "migrate_to": {
++    "id": "https://www.thedailygrind.example/",
++    "install_url": "https://www.thedailygrind.example/?source=pwa"
++  }
++}
+diff --git a/manifest.webmanifest b/manifest.webmanifest
+new file mode 100644
+index 0000000..4e50262
+--- /dev/null
++++ b/manifest.webmanifest
+@@ -0,0 +1,98 @@
++{
++  "id": "/",
++  "name": "The Daily Grind",
++  "short_name": "Daily Grind",
++  "description": "Ethically sourced, locally roasted coffee. Order ahead, find locations and earn rewards.",
++  "start_url": "/?source=pwa",
++  "scope": "/",
++  "display": "standalone",
++  "background_color": "#fafafa",
++  "theme_color": "#4e342e",
++  "lang": "en",
++  "dir": "ltr",
++  "categories": [
++    "food",
++    "shopping",
++    "lifestyle"
++  ],
++  "icons": [
++    {
++      "src": "/icons/icon-192.png",
++      "sizes": "192x192",
++      "type": "image/png",
++      "purpose": "any"
++    },
++    {
++      "src": "/icons/icon-512.png",
++      "sizes": "512x512",
++      "type": "image/png",
++      "purpose": "any"
++    },
++    {
++      "src": "/icons/maskable-512.png",
++      "sizes": "512x512",
++      "type": "image/png",
++      "purpose": "maskable"
++    },
++    {
++      "src": "/icons/icon.svg",
++      "sizes": "any",
++      "type": "image/svg+xml",
++      "purpose": "any"
++    }
++  ],
++  "shortcuts": [
++    {
++      "name": "Order Now",
++      "short_name": "Order",
++      "url": "/order-online?source=shortcut",
++      "icons": [
++        {
++          "src": "/icons/shortcut-96.png",
++          "sizes": "96x96",
++          "type": "image/png"
++        }
++      ]
++    },
++    {
++      "name": "Menu",
++      "url": "/menu?source=shortcut",
++      "icons": [
++        {
++          "src": "/icons/shortcut-96.png",
++          "sizes": "96x96",
++          "type": "image/png"
++        }
++      ]
++    },
++    {
++      "name": "Rewards",
++      "url": "/rewards?source=shortcut",
++      "icons": [
++        {
++          "src": "/icons/shortcut-96.png",
++          "sizes": "96x96",
++          "type": "image/png"
++        }
++      ]
++    },
++    {
++      "name": "My Account",
++      "short_name": "Account",
++      "url": "/account?source=shortcut",
++      "icons": [
++        {
++          "src": "/icons/shortcut-96.png",
++          "sizes": "96x96",
++          "type": "image/png"
++        }
++      ]
++    }
++  ],
++  "migrate_from": [
++    {
++      "id": "https://app.dailygrind.example/",
++      "behavior": "force"
++    }
++  ]
++}
+diff --git a/sw.js b/sw.js
+new file mode 100644
+index 0000000..c187928
+--- /dev/null
++++ b/sw.js
+@@ -0,0 +1,26 @@
++const CACHE = 'daily-grind-v1';
++const SHELL = ['/', '/index.html', '/app-migration.js', '/icons/icon-192.png', '/icons/icon-512.png'];
++
++self.addEventListener('install', (event) => {
++  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)).then(() => self.skipWaiting()));
++});
++
++self.addEventListener('activate', (event) => {
++  event.waitUntil(
++    caches.keys()
++      .then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key))))
++      .then(() => self.clients.claim()),
++  );
++});
++
++// Network first so migration redirects and manifest changes are always seen;
++// fall back to the cached shell when offline.
++self.addEventListener('fetch', (event) => {
++  const { request } = event;
++  if (request.method !== 'GET' || new URL(request.url).origin !== self.location.origin) return;
++
++  event.respondWith(
++    fetch(request).catch(() => caches.match(request)
++      .then((cached) => cached || (request.mode === 'navigate' ? caches.match('/') : Response.error()))),
++  );
++});

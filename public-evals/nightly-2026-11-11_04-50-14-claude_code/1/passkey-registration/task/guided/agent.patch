@@ -1,0 +1,239 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -4,8 +4,19 @@
+ <head>
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <title>The Daily Grind | Artisanal Coffee</title>
++  <!-- Pinned, integrity-checked WebAuthn JSON polyfill (only loaded on demand for older browsers). -->
++  <script type="importmap">
++    {
++      "imports": {
++        "webauthn-polyfills": "https://esm.sh/webauthn-polyfills@0.1.7/es2022/webauthn-polyfills.bundle.mjs"
++      },
++      "integrity": {
++        "https://esm.sh/webauthn-polyfills@0.1.7/es2022/webauthn-polyfills.bundle.mjs": "sha384-EBLK1vCYl7ILfHGSetlZN/n8TaV5nbYKx9JrMwcJvy5NTITz1Q9HDYqCG4NxzuR0"
++      }
++    }
++  </script>
+   <style>
+     :root {
+       --primary: #4e342e;
+       --secondary: #d7ccc8;
+@@ -134,8 +145,38 @@
+     .btn:hover {
+       background: #3e2723;
+     }
+ 
++    button.btn {
++      border: none;
++      font: inherit;
++      cursor: pointer;
++    }
++
++    button.btn:disabled {
++      opacity: 0.6;
++      cursor: not-allowed;
++    }
++
++    .passkey-card {
++      max-width: 600px;
++      margin: 40px auto 0;
++    }
++
++    .passkey-status {
++      margin-top: 12px;
++      min-height: 1.6em;
++      font-size: 0.95rem;
++    }
++
++    .passkey-status[data-state="error"] {
++      color: #b71c1c;
++    }
++
++    .passkey-status[data-state="success"] {
++      color: #1b5e20;
++    }
++
+     footer {
+       background: var(--secondary);
+       text-align: center;
+       padding: 40px 20px;
+@@ -194,8 +235,17 @@
+           <a href="/menu/cold-brew" class="btn">View Details</a>
+         </div>
+       </div>
+     </section>
++
++    <section class="card passkey-card" aria-labelledby="passkey-heading">
++      <h3 id="passkey-heading">Sign in faster with a passkey</h3>
++      <p>Use your fingerprint, face, or screen lock to sign in to your Daily Grind account. No password to remember.</p>
++      <button type="button" class="btn" id="register-button" data-testid="register-button" disabled>
++        Create passkey
++      </button>
++      <p class="passkey-status" id="passkey-status" role="status" aria-live="polite"></p>
++    </section>
+   </main>
+ 
+   <footer>
+     <div class="footer-links">
+@@ -206,7 +256,158 @@
+     </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script type="module">
++    const button = document.getElementById('register-button');
++    const statusEl = document.getElementById('passkey-status');
++
++    function setStatus(message, state = 'info') {
++      statusEl.textContent = message;
++      statusEl.dataset.state = state;
++    }
++
++    // Load the JSON (de)serialization polyfill only if the browser lacks native support.
++    async function ensureWebAuthnJSON() {
++      if (
++        typeof PublicKeyCredential.parseCreationOptionsFromJSON !== 'function' ||
++        typeof PublicKeyCredential.prototype.toJSON !== 'function'
++      ) {
++        await import('webauthn-polyfills');
++      }
++    }
++
++    async function getCapabilities() {
++      if (typeof PublicKeyCredential.getClientCapabilities === 'function') {
++        return PublicKeyCredential.getClientCapabilities();
++      }
++      // Fallback for browsers without getClientCapabilities().
++      const [platform, conditional] = await Promise.all([
++        PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable?.() ?? false,
++        PublicKeyCredential.isConditionalMediationAvailable?.() ?? false,
++      ]);
++      return { passkeyPlatformAuthenticator: platform, conditionalGet: conditional };
++    }
++
++    async function signalUnknown(rpId, credentialId) {
++      if (typeof PublicKeyCredential.signalUnknownCredential !== 'function' || !rpId) return;
++      try {
++        await PublicKeyCredential.signalUnknownCredential({ rpId, credentialId });
++      } catch (err) {
++        console.warn('signalUnknownCredential failed:', err);
++      }
++    }
++
++    async function registerPasskey() {
++      button.disabled = true;
++      setStatus('Preparing your passkey…');
++
++      try {
++        await ensureWebAuthnJSON();
++
++        // 1. Fetch creation options (challenge is generated and stored server-side).
++        let optionsJSON;
++        try {
++          const res = await fetch('/api/register/options', {
++            method: 'POST',
++            credentials: 'same-origin',
++            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
++            body: JSON.stringify({ promotion: true }),
++          });
++          if (!res.ok) throw new Error(`Options request failed (${res.status})`);
++          optionsJSON = await res.json();
++        } catch (err) {
++          console.error(err);
++          setStatus('We couldn\'t start passkey creation. Please try again later.', 'error');
++          return;
++        }
++
++        const publicKey = PublicKeyCredential.parseCreationOptionsFromJSON(optionsJSON);
++
++        // 2. Create the credential.
++        let credential;
++        try {
++          credential = await navigator.credentials.create({ publicKey });
++        } catch (err) {
++          switch (err.name) {
++            case 'InvalidStateError':
++              setStatus('A passkey for this account already exists on this device or password manager.', 'error');
++              break;
++            case 'NotAllowedError':
++              setStatus('Passkey creation was cancelled.');
++              break;
++            case 'AbortError':
++              setStatus('Passkey creation was aborted.');
++              break;
++            case 'SecurityError':
++              console.error('WebAuthn security error (RP ID mismatch or insecure context):', err);
++              setStatus('Passkeys aren\'t available on this site right now.', 'error');
++              break;
++            default:
++              console.error('Passkey creation failed:', err);
++              setStatus('Something went wrong creating your passkey.', 'error');
++          }
++          return; // Do not signal unknown credential for standard WebAuthn failures.
++        }
++
++        if (!credential) {
++          setStatus('Passkey creation was cancelled.');
++          return;
++        }
++
++        // 3. Verify with the server.
++        const encodedResponse = credential.toJSON();
++        const rpId = publicKey.rp?.id; // Always use the server-provided RP ID.
++        try {
++          const res = await fetch('/api/register/verify', {
++            method: 'POST',
++            credentials: 'same-origin',
++            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
++            body: JSON.stringify(encodedResponse),
++          });
++          if (!res.ok) {
++            await signalUnknown(rpId, encodedResponse.id);
++            setStatus('We couldn\'t verify your passkey. Please try again.', 'error');
++            return;
++          }
++        } catch (err) {
++          console.error('Server verification network failure:', err);
++          await signalUnknown(rpId, encodedResponse.id);
++          setStatus('We couldn\'t verify your passkey. Please check your connection and try again.', 'error');
++          return;
++        }
++
++        setStatus('Your passkey is ready! Next time, sign in with your fingerprint, face, or screen lock.', 'success');
++      } catch (err) {
++        console.error('Unexpected passkey registration error:', err);
++        setStatus('Something went wrong creating your passkey.', 'error');
++      } finally {
++        button.disabled = false;
++      }
++    }
++
++    // Gate the UI on page load: only enable the button where passkeys are supported.
++    async function init() {
++      if (!window.isSecureContext || typeof window.PublicKeyCredential === 'undefined') {
++        setStatus('Passkeys aren\'t supported in this browser.');
++        return;
++      }
++      try {
++        const caps = await getCapabilities();
++        if (!caps.passkeyPlatformAuthenticator || !caps.conditionalGet) {
++          setStatus('Passkeys aren\'t supported on this device.');
++          return;
++        }
++      } catch (err) {
++        console.warn('Could not determine passkey capabilities:', err);
++        return;
++      }
++      button.disabled = false;
++      button.addEventListener('click', registerPasskey);
++    }
++
++    init();
++  </script>
++
+ </body>
+ 
+ </html>

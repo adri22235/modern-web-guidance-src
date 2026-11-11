@@ -1,0 +1,330 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -206,7 +206,326 @@
+     </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script>
++    (function () {
++      'use strict';
++
++      var DEFAULT_CONFIG = {
++        endpoint: '/api/analytics',
++        debounceMs: 750,
++        maxWaitMs: 5000,
++        maxBatchSize: 25
++      };
++
++      var config = Object.assign({}, DEFAULT_CONFIG);
++      var eventQueue = [];
++      var sentBatches = [];
++      var debounceTimer = null;
++      var maxWaitTimer = null;
++      var sessionId = getOrCreateSessionId();
++
++      function getOrCreateSessionId() {
++        var key = 'dg_analytics_session_id';
++        try {
++          var existing = window.sessionStorage.getItem(key);
++          if (existing) return existing;
++          var created = 'dg_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
++          window.sessionStorage.setItem(key, created);
++          return created;
++        } catch (err) {
++          return 'dg_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
++        }
++      }
++
++      function getPageContext() {
++        return {
++          url: window.location.href,
++          path: window.location.pathname,
++          title: document.title,
++          referrer: document.referrer || null,
++          viewport: {
++            width: window.innerWidth,
++            height: window.innerHeight
++          }
++        };
++      }
++
++      function getSectionName(el) {
++        if (!el || !el.closest) return 'page';
++        if (el.closest('nav')) return 'navigation';
++        if (el.closest('.hero')) return 'hero';
++        if (el.closest('.card')) return 'seasonal-favorites';
++        if (el.closest('main')) return 'main';
++        if (el.closest('footer')) return 'footer';
++        return 'page';
++      }
++
++      function getElementDescriptor(target) {
++        if (!target || target.nodeType !== 1) return null;
++
++        var interactive = target.closest
++          ? target.closest('a, button, [role="button"], .btn, .card, input, select, textarea') || target
++          : target;
++
++        var tag = interactive.tagName ? interactive.tagName.toLowerCase() : 'unknown';
++        var text = (interactive.innerText || interactive.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 120);
++        var href = interactive.getAttribute ? interactive.getAttribute('href') : null;
++        var id = interactive.id || null;
++        var className = typeof interactive.className === 'string' && interactive.className.trim()
++          ? interactive.className.trim()
++          : null;
++        var section = getSectionName(interactive);
++
++        var cardEl = interactive.closest ? interactive.closest('.card') : null;
++        var cardTitleEl = cardEl ? cardEl.querySelector('h3') : null;
++        var cardTitle = cardTitleEl ? cardTitleEl.textContent.trim() : null;
++
++        return {
++          tag: tag,
++          id: id,
++          className: className,
++          text: text || null,
++          href: href || null,
++          section: section,
++          cardTitle: cardTitle
++        };
++      }
++
++      function enqueueEvent(type, data) {
++        var now = Date.now();
++        var lastEvent = eventQueue.length > 0 ? eventQueue[eventQueue.length - 1] : null;
++
++        // Coalesce rapid repeated click interactions on the exact same element target
++        if (
++          type === 'click' &&
++          lastEvent &&
++          lastEvent.type === 'click' &&
++          lastEvent.data &&
++          data &&
++          lastEvent.data.signature &&
++          lastEvent.data.signature === data.signature &&
++          now - lastEvent.lastTimestamp < config.debounceMs
++        ) {
++          lastEvent.count = (lastEvent.count || 1) + 1;
++          lastEvent.lastTimestamp = now;
++          lastEvent.data.coordinates = data.coordinates;
++          scheduleFlush(false);
++          return lastEvent;
++        }
++
++        var entry = {
++          id: 'evt_' + now.toString(36) + '_' + Math.random().toString(36).slice(2, 8),
++          type: type,
++          timestamp: new Date(now).toISOString(),
++          lastTimestamp: now,
++          count: 1,
++          sessionId: sessionId,
++          page: getPageContext(),
++          data: data || {}
++        };
++
++        eventQueue.push(entry);
++
++        if (eventQueue.length >= config.maxBatchSize) {
++          clearTimers();
++          runDeferredFlush(false);
++        } else {
++          scheduleFlush(false);
++        }
++
++        return entry;
++      }
++
++      function clearTimers() {
++        if (debounceTimer !== null) {
++          clearTimeout(debounceTimer);
++          debounceTimer = null;
++        }
++        if (maxWaitTimer !== null) {
++          clearTimeout(maxWaitTimer);
++          maxWaitTimer = null;
++        }
++      }
++
++      function scheduleFlush() {
++        if (debounceTimer !== null) {
++          clearTimeout(debounceTimer);
++        }
++
++        debounceTimer = setTimeout(function () {
++          clearTimers();
++          runDeferredFlush(false);
++        }, config.debounceMs);
++
++        if (maxWaitTimer === null) {
++          maxWaitTimer = setTimeout(function () {
++            clearTimers();
++            runDeferredFlush(false);
++          }, config.maxWaitMs);
++        }
++      }
++
++      function runDeferredFlush(useBeaconOnly) {
++        if (eventQueue.length === 0) return null;
++
++        if (!useBeaconOnly && typeof window.requestIdleCallback === 'function') {
++          window.requestIdleCallback(
++            function () {
++              flushQueue(false);
++            },
++            { timeout: 1000 }
++          );
++          return null;
++        }
++
++        return flushQueue(Boolean(useBeaconOnly));
++      }
++
++      function flushQueue(useBeacon) {
++        clearTimers();
++        if (eventQueue.length === 0) return null;
++
++        var eventsToSend = eventQueue.splice(0, eventQueue.length).map(function (evt) {
++          var cleanData = Object.assign({}, evt.data);
++          delete cleanData.signature;
++          return {
++            id: evt.id,
++            type: evt.type,
++            timestamp: evt.timestamp,
++            count: evt.count,
++            page: evt.page,
++            data: cleanData
++          };
++        });
++
++        var payload = {
++          sessionId: sessionId,
++          sentAt: new Date().toISOString(),
++          eventCount: eventsToSend.length,
++          events: eventsToSend
++        };
++
++        sentBatches.push(payload);
++        sendBatchRequest(payload, useBeacon);
++        return payload;
++      }
++
++      function sendBatchRequest(payload, preferBeacon) {
++        var serialized = JSON.stringify(payload);
++
++        if (preferBeacon && typeof navigator.sendBeacon === 'function') {
++          try {
++            var blob = new Blob([serialized], { type: 'application/json' });
++            if (navigator.sendBeacon(config.endpoint, blob)) {
++              return;
++            }
++          } catch (err) {
++            // Fall through to fetch with keepalive
++          }
++        }
++
++        if (typeof window.fetch === 'function') {
++          try {
++            window.fetch(config.endpoint, {
++              method: 'POST',
++              headers: {
++                'Content-Type': 'application/json'
++              },
++              body: serialized,
++              keepalive: true,
++              credentials: 'same-origin'
++            }).catch(function () {
++              // Suppress network errors so background telemetry never disrupts user experience
++            });
++          } catch (err) {
++            // Ignore synchronous fetch errors
++          }
++        }
++      }
++
++      function trackPageView(extraData) {
++        return enqueueEvent(
++          'pageview',
++          Object.assign(
++            {
++              LoadState: document.readyState
++            },
++            extraData || {}
++          )
++        );
++      }
++
++      function trackClick(event) {
++        if (!event || !event.target) return null;
++        var descriptor = getElementDescriptor(event.target);
++        if (!descriptor) return null;
++
++        var signature = [
++          descriptor.tag,
++          descriptor.section,
++          descriptor.href || '',
++          descriptor.text || '',
++          descriptor.id || ''
++        ].join('|');
++
++        return enqueueEvent('click', {
++          element: descriptor,
++          coordinates: {
++            x: typeof event.clientX === 'number' ? Math.round(event.clientX) : null,
++            y: typeof event.clientY === 'number' ? Math.round(event.clientY) : null
++          },
++          signature: signature
++        });
++      }
++
++      // Attach delegated click listener
++      document.addEventListener('click', trackClick, { capture: true, passive: true });
++
++      // Flush queued telemetry when page visibility changes to hidden or page unloads
++      document.addEventListener('visibilitychange', function () {
++        if (document.visibilityState === 'hidden') {
++          flushQueue(true);
++        }
++      });
++
++      window.addEventListener('pagehide', function () {
++        flushQueue(true);
++      });
++
++      // Record initial page view
++      if (document.readyState === 'loading') {
++        document.addEventListener('DOMContentLoaded', function () {
++          trackPageView();
++        });
++      } else {
++        trackPageView();
++      }
++
++      // Expose public analytics API
++      window.DailyGrindAnalytics = {
++        track: enqueueEvent,
++        trackPageView: trackPageView,
++        trackClick: trackClick,
++        flush: function () {
++          return flushQueue(false);
++        },
++        getQueue: function () {
++          return eventQueue.slice();
++        },
++        getSentBatches: function () {
++          return sentBatches.slice();
++        },
++        configure: function (overrides) {
++          if (overrides && typeof overrides === 'object') {
++            Object.assign(config, overrides);
++          }
++          return Object.assign({}, config);
++        }
++      };
++    })();
++  </script>
++
+ </body>
+ 
+ </html>

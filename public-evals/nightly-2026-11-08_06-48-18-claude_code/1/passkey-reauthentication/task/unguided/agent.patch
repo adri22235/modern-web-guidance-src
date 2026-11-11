@@ -1,0 +1,216 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -151,8 +151,40 @@
+       color: var(--text);
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    /* Re-authentication */
++    .reauth-card {
++      max-width: 520px;
++      margin: 40px auto 0;
++      text-align: left;
++    }
++
++    .reauth-card button.btn {
++      border: none;
++      cursor: pointer;
++      font: inherit;
++    }
++
++    .reauth-card button.btn:disabled {
++      opacity: 0.6;
++      cursor: progress;
++    }
++
++    .reauth-status {
++      margin-top: 12px;
++      font-size: 0.9rem;
++      min-height: 1.4em;
++    }
++
++    .reauth-status.error {
++      color: #c62828;
++    }
++
++    .reauth-status.success {
++      color: #2e7d32;
++    }
+   </style>
+ </head>
+ 
+ <body>
+@@ -194,8 +226,16 @@
+           <a href="/menu/cold-brew" class="btn">View Details</a>
+         </div>
+       </div>
+     </section>
++
++    <section class="card reauth-card" aria-labelledby="reauth-heading">
++      <h3 id="reauth-heading">Confirm It's You</h3>
++      <p>Before changing sensitive account settings, confirm your identity with your registered passkey or
++        security key.</p>
++      <button type="button" class="btn" data-testid="reauth-button" id="reauth-button">Verify with passkey</button>
++      <p class="reauth-status" id="reauth-status" role="status" aria-live="polite"></p>
++    </section>
+   </main>
+ 
+   <footer>
+     <div class="footer-links">
+@@ -206,7 +246,154 @@
+     </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script>
++    (function () {
++      'use strict';
++
++      var button = document.querySelector('[data-testid="reauth-button"]');
++      var statusEl = document.getElementById('reauth-status');
++      if (!button) return;
++
++      function setStatus(message, kind) {
++        statusEl.textContent = message;
++        statusEl.className = 'reauth-status' + (kind ? ' ' + kind : '');
++      }
++
++      function base64urlToBuffer(value) {
++        if (value instanceof ArrayBuffer) return value;
++        if (ArrayBuffer.isView(value)) return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
++        var base64 = String(value).replace(/-/g, '+').replace(/_/g, '/');
++        var pad = base64.length % 4;
++        if (pad) base64 += '===='.slice(pad);
++        var binary = atob(base64);
++        var bytes = new Uint8Array(binary.length);
++        for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
++        return bytes.buffer;
++      }
++
++      function bufferToBase64url(buffer) {
++        if (!buffer) return null;
++        var bytes = new Uint8Array(buffer);
++        var binary = '';
++        for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
++        return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
++      }
++
++      // Convert server JSON (base64url strings) into WebAuthn request options.
++      function toRequestOptions(json) {
++        var opts = json && json.publicKey ? json.publicKey : json;
++        if (!opts || !opts.challenge) throw new Error('Server did not return a valid challenge.');
++        if (!Array.isArray(opts.allowCredentials) || opts.allowCredentials.length === 0) {
++          throw new Error('No registered passkey or security key was found for your account.');
++        }
++
++        var publicKey = {
++          challenge: base64urlToBuffer(opts.challenge),
++          allowCredentials: opts.allowCredentials.map(function (cred) {
++            var descriptor = { type: cred.type || 'public-key', id: base64urlToBuffer(cred.id) };
++            if (Array.isArray(cred.transports)) descriptor.transports = cred.transports;
++            return descriptor;
++          }),
++          // Re-authentication must prove possession AND user verification (PIN/biometric).
++          userVerification: 'required'
++        };
++        if (opts.rpId) publicKey.rpId = opts.rpId;
++        if (typeof opts.timeout === 'number') publicKey.timeout = opts.timeout;
++        if (opts.extensions) publicKey.extensions = opts.extensions;
++        return publicKey;
++      }
++
++      function serializeAssertion(credential) {
++        var r = credential.response;
++        return {
++          id: credential.id,
++          rawId: bufferToBase64url(credential.rawId),
++          type: credential.type,
++          authenticatorAttachment: credential.authenticatorAttachment || null,
++          clientExtensionResults: credential.getClientExtensionResults ? credential.getClientExtensionResults() : {},
++          response: {
++            clientDataJSON: bufferToBase64url(r.clientDataJSON),
++            authenticatorData: bufferToBase64url(r.authenticatorData),
++            signature: bufferToBase64url(r.signature),
++            userHandle: r.userHandle ? bufferToBase64url(r.userHandle) : null
++          }
++        };
++      }
++
++      async function postJSON(url, body) {
++        var res = await fetch(url, {
++          method: 'POST',
++          credentials: 'same-origin',
++          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
++          body: JSON.stringify(body || {})
++        });
++        var data = null;
++        try { data = await res.json(); } catch (e) { /* empty or non-JSON body */ }
++        if (!res.ok) {
++          var msg = (data && (data.error || data.message)) || ('Request failed (' + res.status + ').');
++          throw new Error(msg);
++        }
++        return data;
++      }
++
++      var inFlight = false;
++
++      button.addEventListener('click', async function () {
++        if (inFlight) return;
++
++        if (!window.PublicKeyCredential || !navigator.credentials || !navigator.credentials.get) {
++          setStatus('Your browser does not support passkeys / security keys.', 'error');
++          return;
++        }
++
++        inFlight = true;
++        button.disabled = true;
++        button.setAttribute('aria-busy', 'true');
++        setStatus('Requesting challenge…');
++
++        try {
++          // 1. Fetch a fresh, server-generated challenge scoped to this user's registered credentials.
++          var optionsJSON = await postJSON('/api/reauth/options', {});
++          var publicKey = toRequestOptions(optionsJSON);
++
++          // 2. Run the WebAuthn assertion ceremony (origin-bound, so phishing-resistant).
++          setStatus('Follow your browser’s prompt to verify…');
++          var credential = await navigator.credentials.get({ publicKey: publicKey });
++          if (!credential) throw new Error('No credential was returned.');
++
++          // 3. Submit the signed assertion for server-side verification.
++          setStatus('Verifying…');
++          var result = await postJSON('/api/reauth/verify', serializeAssertion(credential));
++
++          if (result && (result.verified === false || result.success === false)) {
++            throw new Error(result.error || result.message || 'Verification failed.');
++          }
++
++          setStatus('Identity confirmed. You can now make account changes.', 'success');
++          document.dispatchEvent(new CustomEvent('reauth:success', { detail: result }));
++        } catch (err) {
++          var message;
++          if (err && err.name === 'NotAllowedError') {
++            message = 'Verification was cancelled or timed out. Please try again.';
++          } else if (err && err.name === 'InvalidStateError') {
++            message = 'This authenticator is not registered to your account.';
++          } else if (err && err.name === 'SecurityError') {
++            message = 'Verification is not allowed on this site.';
++          } else {
++            message = (err && err.message) || 'Verification failed.';
++          }
++          setStatus(message, 'error');
++          document.dispatchEvent(new CustomEvent('reauth:failure', { detail: { error: message } }));
++        } finally {
++          inFlight = false;
++          button.disabled = false;
++          button.removeAttribute('aria-busy');
++        }
++      });
++    })();
++  </script>
++
+ </body>
+ 
+ </html>

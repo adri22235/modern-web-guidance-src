@@ -1,0 +1,429 @@
+diff --git a/src/wasm/smallpt.cpp b/src/wasm/smallpt.cpp
+new file mode 100644
+index 0000000..cfdc3fe
+--- /dev/null
++++ b/src/wasm/smallpt.cpp
+@@ -0,0 +1,248 @@
++// smallpt, a Path Tracer by Kevin Beason, 2008
++// Adapted for WebAssembly client-side rendering with customizable/randomized sphere colors.
++
++#include <cmath>
++#include <cstdlib>
++#include <cstdint>
++#include <emscripten.h>
++
++#ifndef M_PI
++#define M_PI 3.14159265358979323846
++#endif
++
++struct Vec {
++  double x, y, z; // position, also color (r,g,b)
++  constexpr Vec(double x_ = 0, double y_ = 0, double z_ = 0) : x(x_), y(y_), z(z_) {}
++  Vec operator+(const Vec &b) const { return Vec(x + b.x, y + b.y, z + b.z); }
++  Vec operator-(const Vec &b) const { return Vec(x - b.x, y - b.y, z - b.z); }
++  Vec operator*(double b) const { return Vec(x * b, y * b, z * b); }
++  Vec mult(const Vec &b) const { return Vec(x * b.x, y * b.y, z * b.z); }
++  Vec &norm() { return *this = *this * (1.0 / std::sqrt(x * x + y * y + z * z)); }
++  double dot(const Vec &b) const { return x * b.x + y * b.y + z * b.z; }
++  Vec operator%(const Vec &b) const {
++    return Vec(y * b.z - z * b.y, z * b.x - x * b.z, x * b.y - y * b.x);
++  }
++};
++
++struct Ray {
++  Vec o, d;
++  Ray(Vec o_, Vec d_) : o(o_), d(d_) {}
++};
++
++enum Refl_t { DIFF, SPEC, REFR }; // material types, used in radiance()
++
++struct Sphere {
++  double rad;  // radius
++  Vec p, e, c; // position, emission, color
++  Refl_t refl; // reflection type (DIFFuse, SPECular, REFRactive)
++  constexpr Sphere(double rad_, Vec p_, Vec e_, Vec c_, Refl_t refl_)
++      : rad(rad_), p(p_), e(e_), c(c_), refl(refl_) {}
++  double intersect(const Ray &r) const { // returns distance, 0 if nohit
++    Vec op = p - r.o; // Solve t^2*d.d + 2*t*(o-p).d + (o-p).(o-p)-R^2 = 0
++    double t, eps = 1e-4, b = op.dot(r.d), det = b * b - op.dot(op) + rad * rad;
++    if (det < 0)
++      return 0;
++    else
++      det = std::sqrt(det);
++    return (t = b - det) > eps ? t : ((t = b + det) > eps ? t : 0);
++  }
++};
++
++Sphere spheres[] = {
++    // Scene: radius, position, emission, color, material
++    Sphere(1e5, Vec(1e5 + 1, 40.8, 81.6), Vec(), Vec(.75, .25, .25), DIFF),   // Left
++    Sphere(1e5, Vec(-1e5 + 99, 40.8, 81.6), Vec(), Vec(.25, .25, .75), DIFF), // Rght
++    Sphere(1e5, Vec(50, 40.8, 1e5), Vec(), Vec(.75, .75, .75), DIFF),         // Back
++    Sphere(1e5, Vec(50, 40.8, -1e5 + 170), Vec(), Vec(), DIFF),               // Frnt
++    Sphere(1e5, Vec(50, 1e5, 81.6), Vec(), Vec(.75, .75, .75), DIFF),         // Botm
++    Sphere(1e5, Vec(50, -1e5 + 81.6, 81.6), Vec(), Vec(.75, .75, .75), DIFF), // Top
++    Sphere(16.5, Vec(27, 16.5, 47), Vec(), Vec(.999, .999, .999), SPEC),      // Mirr
++    Sphere(16.5, Vec(73, 16.5, 78), Vec(), Vec(.999, .999, .999), REFR),      // Glas
++    Sphere(600, Vec(50, 681.6 - .27, 81.6), Vec(12, 12, 12), Vec(), DIFF)     // Lite
++};
++
++inline double clamp(double x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
++inline int toInt(double x) { return int(std::pow(clamp(x), 1.0 / 2.2) * 255.0 + 0.5); }
++
++inline bool intersect(const Ray &r, double &t, int &id) {
++  double n = sizeof(spheres) / sizeof(Sphere), d, inf = t = 1e20;
++  for (int i = int(n); i--;)
++    if ((d = spheres[i].intersect(r)) && d < t) {
++      t = d;
++      id = i;
++    }
++  return t < inf;
++}
++
++Vec radiance(const Ray &r, int depth, unsigned short *Xi) {
++  double t;                               // distance to intersection
++  int id = 0;                             // id of intersected object
++  if (!intersect(r, t, id)) return Vec(); // if miss, return black
++  const Sphere &obj = spheres[id];        // the hit object
++  Vec x = r.o + r.d * t, n = (x - obj.p).norm(), nl = n.dot(r.d) < 0 ? n : n * -1, f = obj.c;
++  double p = f.x > f.y && f.x > f.z ? f.x : f.y > f.z ? f.y : f.z; // max refl
++  if (++depth > 5) {
++    if (p > 0 && depth < 64 && erand48(Xi) < p)
++      f = f * (1.0 / p);
++    else
++      return obj.e; // R.R.
++  }
++  if (obj.refl == DIFF) { // Ideal DIFFUSE reflection
++    double r1 = 2.0 * M_PI * erand48(Xi), r2 = erand48(Xi), r2s = std::sqrt(r2);
++    Vec w = nl, u = ((std::fabs(w.x) > .1 ? Vec(0, 1) : Vec(1)) % w).norm(), v = w % u;
++    Vec d = (u * std::cos(r1) * r2s + v * std::sin(r1) * r2s + w * std::sqrt(1.0 - r2)).norm();
++    return obj.e + f.mult(radiance(Ray(x, d), depth, Xi));
++  } else if (obj.refl == SPEC) { // Ideal SPECULAR reflection
++    return obj.e + f.mult(radiance(Ray(x, r.d - n * 2.0 * n.dot(r.d)), depth, Xi));
++  }
++  Ray reflRay(x, r.d - n * 2.0 * n.dot(r.d)); // Ideal dielectric REFRACTION
++  bool into = n.dot(nl) > 0;                   // Ray from outside going in?
++  double nc = 1.0, nt = 1.5, nnt = into ? nc / nt : nt / nc, ddn = r.d.dot(nl), cos2t;
++  if ((cos2t = 1.0 - nnt * nnt * (1.0 - ddn * ddn)) < 0) // Total internal reflection
++    return obj.e + f.mult(radiance(reflRay, depth, Xi));
++  Vec tdir = (r.d * nnt - n * ((into ? 1.0 : -1.0) * (ddn * nnt + std::sqrt(cos2t)))).norm();
++  double a = nt - nc, b = nt + nc, R0 = a * a / (b * b), c = 1.0 - (into ? -ddn : tdir.dot(n));
++  double Re = R0 + (1.0 - R0) * c * c * c * c * c, Tr = 1.0 - Re, P = .25 + .5 * Re, RP = Re / P,
++         TP = Tr / (1.0 - P);
++  return obj.e + f.mult(depth > 2
++                            ? (erand48(Xi) < P ? // Russian roulette
++                                   radiance(reflRay, depth, Xi) * RP
++                                               : radiance(Ray(x, tdir), depth, Xi) * TP)
++                            : radiance(reflRay, depth, Xi) * Re +
++                                  radiance(Ray(x, tdir), depth, Xi) * Tr);
++}
++
++static Vec hsvToRgb(double h, double s, double v) {
++  double c = v * s;
++  double hp = std::fmod(h * 6.0, 6.0);
++  double x = c * (1.0 - std::fabs(std::fmod(hp, 2.0) - 1.0));
++  double m = v - c;
++  Vec rgb;
++  if (hp < 1.0)
++    rgb = Vec(c, x, 0);
++  else if (hp < 2.0)
++    rgb = Vec(x, c, 0);
++  else if (hp < 3.0)
++    rgb = Vec(0, c, x);
++  else if (hp < 4.0)
++    rgb = Vec(0, x, c);
++  else if (hp < 5.0)
++    rgb = Vec(x, 0, c);
++  else
++    rgb = Vec(c, 0, x);
++  return Vec(rgb.x + m, rgb.y + m, rgb.z + m);
++}
++
++extern "C" {
++
++EMSCRIPTEN_KEEPALIVE
++void reset_sphere_colors() {
++  spheres[0].c = Vec(.75, .25, .25);      // Left
++  spheres[1].c = Vec(.25, .25, .75);      // Right
++  spheres[2].c = Vec(.75, .75, .75);      // Back
++  spheres[3].c = Vec(0.0, 0.0, 0.0);      // Front (behind camera)
++  spheres[4].c = Vec(.75, .75, .75);      // Bottom
++  spheres[5].c = Vec(.75, .75, .75);      // Top
++  spheres[6].c = Vec(.999, .999, .999);   // Mirror sphere
++  spheres[7].c = Vec(.999, .999, .999);   // Glass sphere
++}
++
++EMSCRIPTEN_KEEPALIVE
++void randomize_sphere_colors(unsigned int seed) {
++  unsigned short Xi[3] = {
++      static_cast<unsigned short>((seed & 0xFFFF) ^ 0x330E),
++      static_cast<unsigned short>(((seed >> 16) & 0xFFFF) ^ 0xABCD),
++      static_cast<unsigned short>((seed * 1103515245u + 12345u) & 0xFFFF)};
++
++  // Randomize Left, Right, Back, Bottom, Top wall spheres with distinct vibrant hues
++  double baseHue = erand48(Xi);
++  spheres[0].c = hsvToRgb(std::fmod(baseHue + 0.00, 1.0), 0.65 + 0.25 * erand48(Xi), 0.70 + 0.20 * erand48(Xi));
++  spheres[1].c = hsvToRgb(std::fmod(baseHue + 0.38 + 0.15 * erand48(Xi), 1.0), 0.65 + 0.25 * erand48(Xi), 0.70 + 0.20 * erand48(Xi));
++  spheres[2].c = hsvToRgb(std::fmod(baseHue + 0.68 + 0.15 * erand48(Xi), 1.0), 0.35 + 0.35 * erand48(Xi), 0.72 + 0.18 * erand48(Xi));
++  spheres[3].c = Vec(0.0, 0.0, 0.0); // Keep front wall dark
++  spheres[4].c = hsvToRgb(erand48(Xi), 0.25 + 0.40 * erand48(Xi), 0.70 + 0.20 * erand48(Xi));
++  spheres[5].c = hsvToRgb(erand48(Xi), 0.15 + 0.25 * erand48(Xi), 0.80 + 0.15 * erand48(Xi));
++
++  // Randomize Mirror and Glass foreground spheres with rich metallic/gem tints
++  spheres[6].c = hsvToRgb(erand48(Xi), 0.35 + 0.45 * erand48(Xi), 0.92 + 0.079 * erand48(Xi));
++  spheres[7].c = hsvToRgb(erand48(Xi), 0.40 + 0.50 * erand48(Xi), 0.92 + 0.079 * erand48(Xi));
++}
++
++EMSCRIPTEN_KEEPALIVE
++void get_sphere_colors(double *out_rgb) {
++  const int count = int(sizeof(spheres) / sizeof(Sphere));
++  for (int i = 0; i < count; ++i) {
++    out_rgb[i * 3 + 0] = spheres[i].c.x;
++    out_rgb[i * 3 + 1] = spheres[i].c.y;
++    out_rgb[i * 3 + 2] = spheres[i].c.z;
++  }
++}
++
++EMSCRIPTEN_KEEPALIVE
++void render_samples(
++    double *accum_buffer,
++    unsigned char *rgba_buffer,
++    int w,
++    int h,
++    int start_sample,
++    int num_samples,
++    unsigned int seed) {
++  if (w <= 0 || h <= 0 || num_samples <= 0) return;
++
++  Ray cam(Vec(50, 52, 295.6), Vec(0, -0.042612, -1).norm()); // cam pos, dir
++  Vec cx = Vec(w * .5135 / h);
++  Vec cy = (cx % cam.d).norm() * .5135;
++
++  if (start_sample == 0) {
++    for (int i = 0; i < w * h * 3; ++i) {
++      accum_buffer[i] = 0.0;
++    }
++  }
++
++  for (int y = 0; y < h; y++) { // Loop over image rows
++    for (int x = 0; x < w; x++) { // Loop cols
++      int idx = (h - y - 1) * w + x;
++      for (int sy = 0; sy < 2; sy++) { // 2x2 subpixel rows
++        for (int sx = 0; sx < 2; sx++) { // 2x2 subpixel cols
++          unsigned int sub_seed =
++              seed ^ static_cast<unsigned int>(y * 1973 + x * 9277 + sy * 26699 + sx * 31873);
++          unsigned short Xi[3] = {
++              static_cast<unsigned short>((sub_seed + start_sample * 17) & 0xFFFF),
++              static_cast<unsigned short>(((sub_seed >> 8) + y * y * y + start_sample * 31) & 0xFFFF),
++              static_cast<unsigned short>((y * y * y + x * 13 + start_sample * 97 + (seed & 0xFFFF)) & 0xFFFF)};
++          Vec r(0, 0, 0);
++          for (int s = 0; s < num_samples; s++) {
++            double r1 = 2.0 * erand48(Xi), dx = r1 < 1.0 ? std::sqrt(r1) - 1.0 : 1.0 - std::sqrt(2.0 - r1);
++            double r2 = 2.0 * erand48(Xi), dy = r2 < 1.0 ? std::sqrt(r2) - 1.0 : 1.0 - std::sqrt(2.0 - r2);
++            Vec d = cx * (((sx + .5 + dx) / 2.0 + x) / w - .5) +
++                    cy * (((sy + .5 + dy) / 2.0 + y) / h - .5) + cam.d;
++            r = r + radiance(Ray(cam.o + d * 140.0, d.norm()), 0, Xi);
++          }
++          // Each 2x2 subpixel contributes 0.25 of the pixel average
++          accum_buffer[idx * 3 + 0] += clamp(r.x * (1.0 / num_samples)) * 0.25 * num_samples;
++          accum_buffer[idx * 3 + 1] += clamp(r.y * (1.0 / num_samples)) * 0.25 * num_samples;
++          accum_buffer[idx * 3 + 2] += clamp(r.z * (1.0 / num_samples)) * 0.25 * num_samples;
++        }
++      }
++
++      double total_samples = static_cast<double>(start_sample + num_samples);
++      double inv_total = 1.0 / total_samples;
++      rgba_buffer[idx * 4 + 0] = static_cast<unsigned char>(toInt(accum_buffer[idx * 3 + 0] * inv_total));
++      rgba_buffer[idx * 4 + 1] = static_cast<unsigned char>(toInt(accum_buffer[idx * 3 + 1] * inv_total));
++      rgba_buffer[idx * 4 + 2] = static_cast<unsigned char>(toInt(accum_buffer[idx * 3 + 2] * inv_total));
++      rgba_buffer[idx * 4 + 3] = 255;
++    }
++  }
++}
++
++EMSCRIPTEN_KEEPALIVE
++void render_frame(unsigned char *rgba_buffer, int w, int h, int samples) {
++  if (w <= 0 || h <= 0) return;
++  int samps = samples > 0 ? (samples / 4 > 0 ? samples / 4 : 1) : 1;
++  double *accum = static_cast<double *>(std::malloc(sizeof(double) * w * h * 3));
++  if (!accum) return;
++  render_samples(accum, rgba_buffer, w, h, 0, samps, 1u);
++  std::free(accum);
++}
++
++} // extern "C"
+diff --git a/src/wasm/smallpt.js b/src/wasm/smallpt.js
+new file mode 100644
+index 0000000..f17dbfb
+--- /dev/null
++++ b/src/wasm/smallpt.js
+@@ -0,0 +1,161 @@
++// Generated by Emscripten (ES6 Module)
++export default async function initModule(moduleArg = {}) {
++  const module = { ...moduleArg };
++  let memory = null;
++  let heapU8 = null;
++  let heapU16 = null;
++  let heapU32 = null;
++  let heap32 = null;
++  let heapF32 = null;
++  let heapF64 = null;
++
++  function updateMemoryViews() {
++    if (!memory) return;
++    const buf = memory.buffer;
++    if (!heapU8 || heapU8.buffer !== buf) {
++      heapU8 = new Uint8Array(buf);
++      heapU16 = new Uint16Array(buf);
++      heapU32 = new Uint32Array(buf);
++      heap32 = new Int32Array(buf);
++      heapF32 = new Float32Array(buf);
++      heapF64 = new Float64Array(buf);
++    }
++  }
++
++  Object.defineProperties(module, {
++    HEAPU8: {
++      get() {
++        updateMemoryViews();
++        return heapU8;
++      },
++      enumerable: true,
++    },
++    HEAPU16: {
++      get() {
++        updateMemoryViews();
++        return heapU16;
++      },
++      enumerable: true,
++    },
++    HEAPU32: {
++      get() {
++        updateMemoryViews();
++        return heapU32;
++      },
++      enumerable: true,
++    },
++    HEAP32: {
++      get() {
++        updateMemoryViews();
++        return heap32;
++      },
++      enumerable: true,
++    },
++    HEAPF32: {
++      get() {
++        updateMemoryViews();
++        return heapF32;
++      },
++      enumerable: true,
++    },
++    HEAPF64: {
++      get() {
++        updateMemoryViews();
++        return heapF64;
++      },
++      enumerable: true,
++    },
++  });
++
++  const wasiImports = {
++    args_get: () => 0,
++    args_sizes_get: () => 0,
++    environ_get: () => 0,
++    environ_sizes_get: () => 0,
++    clock_res_get: () => 0,
++    clock_time_get: () => 0,
++    fd_advise: () => 0,
++    fd_close: () => 0,
++    fd_datasync: () => 0,
++    fd_fdstat_get: () => 0,
++    fd_fdstat_set_flags: () => 0,
++    fd_filestat_get: () => 0,
++    fd_pread: () => 0,
++    fd_prestat_get: () => 8,
++    fd_prestat_dir_name: () => 8,
++    fd_pwrite: () => 0,
++    fd_read: () => 0,
++    fd_readdir: () => 0,
++    fd_seek: () => 0,
++    fd_sync: () => 0,
++    fd_tell: () => 0,
++    fd_write: () => 0,
++    path_open: () => 8,
++    proc_exit: (code) => {
++      throw new Error(`Wasm proc_exit(${code})`);
++    },
++    random_get: (bufPtr, bufLen) => {
++      updateMemoryViews();
++      const slice = heapU8.subarray(bufPtr, bufPtr + bufLen);
++      if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
++        crypto.getRandomValues(slice);
++      } else {
++        for (let i = 0; i < bufLen; i++) slice[i] = (Math.random() * 256) | 0;
++      }
++      return 0;
++    },
++    sched_yield: () => 0,
++  };
++
++  const imports = {
++    env: {},
++    wasi_snapshot_preview1: wasiImports,
++  };
++
++  const wasmUrl = module.locateFile
++    ? module.locateFile("smallpt.wasm", import.meta.url)
++    : new URL("./smallpt.wasm", import.meta.url);
++
++  let instance;
++  if (module.wasmBinary) {
++    const res = await WebAssembly.instantiate(module.wasmBinary, imports);
++    instance = res.instance;
++  } else if (typeof WebAssembly.instantiateStreaming === 'function') {
++    try {
++      const response = fetch(wasmUrl);
++      const res = await WebAssembly.instantiateStreaming(response, imports);
++      instance = res.instance;
++    } catch {
++      const response = await fetch(wasmUrl);
++      const bytes = await response.arrayBuffer();
++      const res = await WebAssembly.instantiate(bytes, imports);
++      instance = res.instance;
++    }
++  } else {
++    const response = await fetch(wasmUrl);
++    const bytes = await response.arrayBuffer();
++    const res = await WebAssembly.instantiate(bytes, imports);
++    instance = res.instance;
++  }
++
++  const exports = instance.exports;
++  memory = exports.memory;
++  module.wasmMemory = memory;
++  module.asm = exports;
++  updateMemoryViews();
++
++  if (typeof exports.__wasm_call_ctors === 'function') {
++    exports.__wasm_call_ctors();
++  }
++
++  for (const [name, val] of Object.entries(exports)) {
++    if (typeof val === 'function') {
++      module[name] = val;
++      if (!name.startsWith('_')) {
++        module['_' + name] = val;
++      }
++    }
++  }
++
++  return module;
++}
+diff --git a/src/wasm/smallpt.o b/src/wasm/smallpt.o
+new file mode 100644
+index 0000000..4d53c88
+Binary files /dev/null and b/src/wasm/smallpt.o differ
+diff --git a/src/wasm/smallpt.wasm b/src/wasm/smallpt.wasm
+new file mode 100755
+index 0000000..760e275
+Binary files /dev/null and b/src/wasm/smallpt.wasm differ

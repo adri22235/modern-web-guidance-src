@@ -1,0 +1,225 @@
+diff --git a/index.html b/index.html
+index 66c9173..86e734d 100644
+--- a/index.html
++++ b/index.html
+@@ -195,6 +195,13 @@
+         </div>
+       </div>
+     </section>
++    <section style="text-align: center; margin-top: 3rem;">
++      <h2>Path-Traced in Your Browser</h2>
++      <p>Rendered client-side by <a href="http://www.kevinbeason.com/smallpt/">smallpt</a>, compiled to WebAssembly.</p>
++      <canvas id="smallpt-canvas" width="512" height="384" style="max-width: 100%; margin: 1rem 0; background: #222;"></canvas>
++      <div><button id="smallpt-btn" class="btn" disabled>Render again with random colors</button></div>
++      <p id="smallpt-status" style="font-size: .9rem;"></p>
++    </section>
+   </main>
+ 
+   <footer>
+@@ -207,6 +214,28 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script>
++    (function () {
++      const canvas = document.getElementById('smallpt-canvas');
++      const ctx = canvas.getContext('2d');
++      const btn = document.getElementById('smallpt-btn');
++      const status = document.getElementById('smallpt-status');
++      const worker = new Worker('smallpt-worker.js');
++      const render = (seed) => {
++        btn.disabled = true;
++        status.textContent = 'Rendering…';
++        worker.postMessage({ w: canvas.width, h: canvas.height, samps: 25, seed });
++      };
++      worker.onmessage = ({ data: { w, h, px, ms } }) => {
++        ctx.putImageData(new ImageData(new Uint8ClampedArray(px.buffer), w, h), 0, 0);
++        status.textContent = 'Rendered in ' + (ms / 1000).toFixed(1) + 's';
++        btn.disabled = false;
++      };
++      worker.onerror = () => { status.textContent = 'Failed to load smallpt.wasm (run wasm/build.sh).'; };
++      btn.onclick = () => render((Math.random() * 0xffffffff >>> 0) || 1);
++      render(0); // original Cornell box colors
++    })();
++  </script>
+ </body>
+ 
+ </html>
+diff --git a/smallpt-worker.js b/smallpt-worker.js
+new file mode 100644
+index 0000000..d0a84b8
+--- /dev/null
++++ b/smallpt-worker.js
+@@ -0,0 +1,10 @@
++importScripts('smallpt.js');
++const ready = createSmallpt();
++onmessage = async ({ data: { w, h, samps, seed } }) => {
++  const m = await ready;
++  m._set_colors(seed);
++  const t0 = performance.now();
++  const ptr = m._render(w, h, samps);
++  const px = m.HEAPU8.slice(ptr, ptr + w * h * 4);
++  postMessage({ w, h, px, ms: performance.now() - t0 }, [px.buffer]);
++};
+diff --git a/wasm/build.sh b/wasm/build.sh
+new file mode 100755
+index 0000000..f6fb29c
+--- /dev/null
++++ b/wasm/build.sh
+@@ -0,0 +1,8 @@
++#!/bin/sh
++# Requires the Emscripten SDK (emcc) on PATH. Outputs ../smallpt.js and ../smallpt.wasm.
++set -e
++cd "$(dirname "$0")"
++emcc smallpt.cpp -O3 -o ../smallpt.js \
++  -sMODULARIZE=1 -sEXPORT_NAME=createSmallpt -sENVIRONMENT=worker,web \
++  -sALLOW_MEMORY_GROWTH=1 -sEXPORTED_RUNTIME_METHODS=cwrap,HEAPU8 \
++  -sEXPORTED_FUNCTIONS=_render,_set_colors,_malloc,_free
+diff --git a/wasm/smallpt.cpp b/wasm/smallpt.cpp
+new file mode 100644
+index 0000000..97dc23c
+--- /dev/null
++++ b/wasm/smallpt.cpp
+@@ -0,0 +1,142 @@
++// smallpt: Global Illumination in 99 lines of C++ (c) Kevin Beason, MIT license.
++// Adapted: renders to an RGBA buffer and exposes a C API for WebAssembly;
++// sphere colors can be randomized via a seed.
++#include <math.h>
++#include <stdlib.h>
++#include <emscripten.h>
++
++struct Vec {
++  double x, y, z;
++  Vec(double x_ = 0, double y_ = 0, double z_ = 0) { x = x_; y = y_; z = z_; }
++  Vec operator+(const Vec &b) const { return Vec(x + b.x, y + b.y, z + b.z); }
++  Vec operator-(const Vec &b) const { return Vec(x - b.x, y - b.y, z - b.z); }
++  Vec operator*(double b) const { return Vec(x * b, y * b, z * b); }
++  Vec mult(const Vec &b) const { return Vec(x * b.x, y * b.y, z * b.z); }
++  Vec &norm() { return *this = *this * (1 / sqrt(x * x + y * y + z * z)); }
++  double dot(const Vec &b) const { return x * b.x + y * b.y + z * b.z; }
++  Vec operator%(Vec &b) { return Vec(y * b.z - z * b.y, z * b.x - x * b.z, x * b.y - y * b.x); }
++};
++struct Ray { Vec o, d; Ray(Vec o_, Vec d_) : o(o_), d(d_) {} };
++enum Refl_t { DIFF, SPEC, REFR };
++struct Sphere {
++  double rad; Vec p, e, c; Refl_t refl;
++  Sphere(double rad_, Vec p_, Vec e_, Vec c_, Refl_t refl_)
++    : rad(rad_), p(p_), e(e_), c(c_), refl(refl_) {}
++  double intersect(const Ray &r) const {
++    Vec op = p - r.o;
++    double t, eps = 1e-4, b = op.dot(r.d), det = b * b - op.dot(op) + rad * rad;
++    if (det < 0) return 0; else det = sqrt(det);
++    return (t = b - det) > eps ? t : ((t = b + det) > eps ? t : 0);
++  }
++};
++
++static Sphere spheres[] = {
++  Sphere(1e5,  Vec( 1e5 + 1, 40.8, 81.6),   Vec(), Vec(.75, .25, .25), DIFF), // Left
++  Sphere(1e5,  Vec(-1e5 + 99, 40.8, 81.6),  Vec(), Vec(.25, .25, .75), DIFF), // Right
++  Sphere(1e5,  Vec(50, 40.8, 1e5),          Vec(), Vec(.75, .75, .75), DIFF), // Back
++  Sphere(1e5,  Vec(50, 40.8, -1e5 + 170),   Vec(), Vec(),              DIFF), // Front
++  Sphere(1e5,  Vec(50, 1e5, 81.6),          Vec(), Vec(.75, .75, .75), DIFF), // Bottom
++  Sphere(1e5,  Vec(50, -1e5 + 81.6, 81.6),  Vec(), Vec(.75, .75, .75), DIFF), // Top
++  Sphere(16.5, Vec(27, 16.5, 47),           Vec(), Vec(1, 1, 1) * .999, SPEC), // Mirror
++  Sphere(16.5, Vec(73, 16.5, 78),           Vec(), Vec(1, 1, 1) * .999, REFR), // Glass
++  Sphere(600,  Vec(50, 681.6 - .27, 81.6),  Vec(12, 12, 12), Vec(),    DIFF)  // Light
++};
++static const int numSpheres = sizeof(spheres) / sizeof(Sphere);
++
++static inline double clamp(double x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
++static inline int toInt(double x) { return int(pow(clamp(x), 1 / 2.2) * 255 + .5); }
++static inline bool intersect(const Ray &r, double &t, int &id) {
++  double n = numSpheres, d, inf = t = 1e20;
++  for (int i = int(n); i--;) if ((d = spheres[i].intersect(r)) && d < t) { t = d; id = i; }
++  return t < inf;
++}
++
++// Per-thread-free RNG (erand48 replacement, same 48-bit LCG).
++static double rnd(unsigned short *X) {
++  unsigned long long x = ((unsigned long long)X[2] << 32) | ((unsigned long long)X[1] << 16) | X[0];
++  x = (x * 0x5DEECE66DULL + 0xB) & 0xFFFFFFFFFFFFULL;
++  X[0] = x & 0xFFFF; X[1] = (x >> 16) & 0xFFFF; X[2] = (x >> 32) & 0xFFFF;
++  return (double)x / (double)(1ULL << 48);
++}
++
++static Vec radiance(const Ray &r, int depth, unsigned short *Xi) {
++  double t; int id = 0;
++  if (!intersect(r, t, id)) return Vec();
++  const Sphere &obj = spheres[id];
++  Vec x = r.o + r.d * t, n = (x - obj.p).norm(), nl = n.dot(r.d) < 0 ? n : n * -1, f = obj.c;
++  double p = f.x > f.y && f.x > f.z ? f.x : f.y > f.z ? f.y : f.z;
++  if (++depth > 5) { if (rnd(Xi) < p) f = f * (1 / p); else return obj.e; }
++  if (obj.refl == DIFF) {
++    double r1 = 2 * M_PI * rnd(Xi), r2 = rnd(Xi), r2s = sqrt(r2);
++    Vec w = nl, u = ((fabs(w.x) > .1 ? Vec(0, 1) : Vec(1)) % w).norm(), v = w % u;
++    Vec d = (u * cos(r1) * r2s + v * sin(r1) * r2s + w * sqrt(1 - r2)).norm();
++    return obj.e + f.mult(radiance(Ray(x, d), depth, Xi));
++  } else if (obj.refl == SPEC)
++    return obj.e + f.mult(radiance(Ray(x, r.d - n * 2 * n.dot(r.d)), depth, Xi));
++  Ray reflRay(x, r.d - n * 2 * n.dot(r.d));
++  bool into = n.dot(nl) > 0;
++  double nc = 1, nt = 1.5, nnt = into ? nc / nt : nt / nc, ddn = r.d.dot(nl), cos2t;
++  if ((cos2t = 1 - nnt * nnt * (1 - ddn * ddn)) < 0) return obj.e + f.mult(radiance(reflRay, depth, Xi));
++  Vec tdir = (r.d * nnt - n * ((into ? 1 : -1) * (ddn * nnt + sqrt(cos2t)))).norm();
++  double a = nt - nc, b = nt + nc, R0 = a * a / (b * b), c = 1 - (into ? -ddn : tdir.dot(n));
++  double Re = R0 + (1 - R0) * c * c * c * c * c, Tr = 1 - Re, P = .25 + .5 * Re, RP = Re / P, TP = Tr / (1 - P);
++  return obj.e + f.mult(depth > 2
++    ? (rnd(Xi) < P ? radiance(reflRay, depth, Xi) * RP : radiance(Ray(x, tdir), depth, Xi) * TP)
++    : radiance(reflRay, depth, Xi) * Re + radiance(Ray(x, tdir), depth, Xi) * Tr);
++}
++
++static unsigned char *pixels = 0;
++
++extern "C" {
++
++// Randomize the colors of the walls, mirror and glass spheres. seed==0 restores defaults.
++EMSCRIPTEN_KEEPALIVE void set_colors(unsigned seed) {
++  static const Vec defaults[] = {Vec(.75, .25, .25), Vec(.25, .25, .75), Vec(.75, .75, .75),
++                                 Vec(), Vec(.75, .75, .75), Vec(.75, .75, .75),
++                                 Vec(.999, .999, .999), Vec(.999, .999, .999)};
++  unsigned short X[3] = {(unsigned short)seed, (unsigned short)(seed >> 16), 0x330E};
++  for (int i = 0; i < 8; i++) {
++    if (i == 3) continue; // front wall stays black (behind the camera)
++    if (!seed) { spheres[i].c = defaults[i]; continue; }
++    // Random saturated hue; the mirror stays tinted lightly, glass stays mostly clear.
++    double h = rnd(X) * 6, s = i >= 6 ? .35 : .75, v = i >= 6 ? .999 : .8;
++    int k = int(h); double f = h - k, pp = v * (1 - s), q = v * (1 - s * f), t = v * (1 - s * (1 - f));
++    double cols[6][3] = {{v, t, pp}, {q, v, pp}, {pp, v, t}, {pp, q, v}, {t, pp, v}, {v, pp, q}};
++    spheres[i].c = Vec(cols[k % 6][0], cols[k % 6][1], cols[k % 6][2]);
++  }
++}
++
++// Renders w*h image with `samps` samples per pixel (x4 subpixels). Returns RGBA buffer.
++EMSCRIPTEN_KEEPALIVE unsigned char *render(int w, int h, int samps) {
++  free(pixels);
++  pixels = (unsigned char *)malloc(w * h * 4);
++  Ray cam(Vec(50, 52, 295.6), Vec(0, -0.042612, -1).norm());
++  Vec cx = Vec(w * .5135 / h), cy = (cx % cam.d).norm() * .5135, r, *c = new Vec[w * h];
++  for (int y = 0; y < h; y++) {
++    unsigned short Xi[3] = {0, 0, (unsigned short)(y * y * y)};
++    for (int x = 0; x < w; x++) {
++      int i = (h - y - 1) * w + x;
++      for (int sy = 0; sy < 2; sy++)
++        for (int sx = 0; sx < 2; sx++) {
++          r = Vec();
++          for (int s = 0; s < samps; s++) {
++            double r1 = 2 * rnd(Xi), dx = r1 < 1 ? sqrt(r1) - 1 : 1 - sqrt(2 - r1);
++            double r2 = 2 * rnd(Xi), dy = r2 < 1 ? sqrt(r2) - 1 : 1 - sqrt(2 - r2);
++            Vec d = cx * (((sx + .5 + dx) / 2 + x) / w - .5) + cy * (((sy + .5 + dy) / 2 + y) / h - .5) + cam.d;
++            r = r + radiance(Ray(cam.o + d * 140, d.norm()), 0, Xi) * (1.0 / samps);
++          }
++          c[i] = c[i] + Vec(clamp(r.x), clamp(r.y), clamp(r.z)) * .25;
++        }
++    }
++  }
++  for (int y = 0; y < h; y++)
++    for (int x = 0; x < w; x++) {
++      int o = (y * w + x) * 4;
++      const Vec &p = c[y * w + x]; // c[] is already stored top-down
++      pixels[o] = toInt(p.x); pixels[o + 1] = toInt(p.y); pixels[o + 2] = toInt(p.z); pixels[o + 3] = 255;
++    }
++  delete[] c;
++  return pixels;
++}
++
++}

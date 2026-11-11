@@ -1,0 +1,176 @@
+diff --git a/analytics.js b/analytics.js
+new file mode 100644
+--- a/analytics.js
++++ b/analytics.js
+@@ -0,0 +1,171 @@
++/*
++ * The Daily Grind - lightweight client-side analytics.
++ *
++ * Records page views and click interactions, then coalesces them into a
++ * single batched background request:
++ *   - Events are queued in memory.
++ *   - Each new event resets a debounce timer (DEBOUNCE_MS), so a burst of
++ *     rapid clicks results in one request once the user pauses.
++ *   - MAX_WAIT_MS caps how long events can be held during continuous activity.
++ *   - The send itself is deferred to browser idle time when possible.
++ *   - On page hide/unload (e.g. clicking a link that navigates away) the queue
++ *     is flushed immediately with navigator.sendBeacon so events aren't lost.
++ */
++(function () {
++  'use strict';
++
++  var ENDPOINT = '/api/analytics';
++  var DEBOUNCE_MS = 2000;
++  var MAX_WAIT_MS = 10000;
++  var MAX_BATCH = 50;      // max events per request
++  var MAX_QUEUE = 500;     // hard cap to avoid unbounded memory growth
++  var MAX_TEXT = 80;       // truncate captured element text
++
++  // Respect Do Not Track / Global Privacy Control.
++  var nav = window.navigator || {};
++  if (nav.doNotTrack === '1' || window.doNotTrack === '1' || nav.globalPrivacyControl === true) {
++    return;
++  }
++
++  var queue = [];
++  var debounceTimer = null;
++  var maxWaitTimer = null;
++  var sessionId = getSessionId();
++
++  function getSessionId() {
++    var key = 'dg_analytics_sid';
++    try {
++      var id = sessionStorage.getItem(key);
++      if (!id) {
++        id = (window.crypto && crypto.randomUUID)
++          ? crypto.randomUUID()
++          : Date.now().toString(36) + Math.random().toString(36).slice(2);
++        sessionStorage.setItem(key, id);
++      }
++      return id;
++    } catch (e) {
++      return null; // storage unavailable (e.g. privacy mode)
++    }
++  }
++
++  function track(type, data) {
++    if (queue.length >= MAX_QUEUE) queue.shift(); // drop oldest
++    queue.push({
++      type: type,
++      ts: Date.now(),
++      path: location.pathname,
++      data: data || {}
++    });
++    schedule();
++  }
++
++  function schedule() {
++    clearTimeout(debounceTimer);
++    debounceTimer = setTimeout(flushDeferred, DEBOUNCE_MS);
++    if (!maxWaitTimer) {
++      maxWaitTimer = setTimeout(flushDeferred, MAX_WAIT_MS);
++    }
++  }
++
++  function clearTimers() {
++    clearTimeout(debounceTimer);
++    clearTimeout(maxWaitTimer);
++    debounceTimer = maxWaitTimer = null;
++  }
++
++  // Normal path: wait for the browser to be idle before sending.
++  function flushDeferred() {
++    clearTimers();
++    if (window.requestIdleCallback) {
++      requestIdleCallback(function () { flush(false); }, { timeout: 2000 });
++    } else {
++      setTimeout(function () { flush(false); }, 0);
++    }
++  }
++
++  function flush(isUnloading) {
++    if (isUnloading) clearTimers();
++    while (queue.length) {
++      var batch = queue.splice(0, MAX_BATCH);
++      send(batch, isUnloading);
++      if (!isUnloading) break; // one request per idle slot; reschedule rest
++    }
++    if (queue.length) schedule();
++  }
++
++  function send(events, isUnloading) {
++    var body = JSON.stringify({
++      sessionId: sessionId,
++      sentAt: Date.now(),
++      userAgent: nav.userAgent,
++      events: events
++    });
++
++    // sendBeacon is non-blocking and survives page navigation/unload.
++    if (nav.sendBeacon) {
++      try {
++        var blob = new Blob([body], { type: 'application/json' });
++        if (nav.sendBeacon(ENDPOINT, blob)) return;
++      } catch (e) { /* fall through */ }
++    }
++
++    if (window.fetch) {
++      fetch(ENDPOINT, {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: body,
++        keepalive: true,
++        credentials: 'same-origin'
++      }).catch(function () {
++        // Analytics must never break the page; requeue once if still on page.
++        if (!isUnloading && queue.length + events.length <= MAX_QUEUE) {
++          queue = events.concat(queue);
++        }
++      });
++    }
++  }
++
++  function describe(el) {
++    var text = (el.getAttribute('aria-label') || el.textContent || '')
++      .replace(/\s+/g, ' ').trim().slice(0, MAX_TEXT);
++    var info = {
++      tag: el.tagName.toLowerCase(),
++      text: text
++    };
++    if (el.id) info.id = el.id;
++    if (typeof el.className === 'string' && el.className) info.classes = el.className;
++    if (el.dataset && el.dataset.track) info.label = el.dataset.track;
++    if (el.tagName === 'A' && el.getAttribute('href')) info.href = el.getAttribute('href');
++    var section = el.closest('nav, header, main, footer, section');
++    if (section) info.region = section.tagName.toLowerCase();
++    return info;
++  }
++
++  // --- Page view ---
++  track('page_view', {
++    title: document.title,
++    referrer: document.referrer || null,
++    viewport: window.innerWidth + 'x' + window.innerHeight
++  });
++
++  // --- Clicks (delegated, capture phase so we see them before navigation) ---
++  document.addEventListener('click', function (e) {
++    var target = e.target && e.target.closest
++      ? e.target.closest('a, button, [role="button"], [data-track], .card')
++      : null;
++    if (!target) return;
++    var data = describe(target);
++    data.x = e.clientX;
++    data.y = e.clientY;
++    track('click', data);
++  }, { capture: true, passive: true });
++
++  // --- Flush before the page goes away ---
++  document.addEventListener('visibilitychange', function () {
++    if (document.visibilityState === 'hidden') flush(true);
++  });
++  window.addEventListener('pagehide', function () { flush(true); });
++
++  // Small public API for manual/custom events.
++  window.dgAnalytics = { track: track, flush: function () { flush(true); } };
++})();

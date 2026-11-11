@@ -1,0 +1,667 @@
+diff --git a/app.js b/app.js
+new file mode 100644
+index 0000000..4496052
+--- /dev/null
++++ b/app.js
+@@ -0,0 +1,157 @@
++// Daily Grind - Newsletter and Client-side Outbound Request Handling
++
++/**
++ * Client-side helper that catches blocked outbound requests gracefully without unhandled rejections.
++ * Conforms to modern-web-guidance for restrict-outbound-connections.
++ */
++export async function fetchWithPolicyHandling(url, options = {}) {
++  const { statusElement, ...fetchOptions } = options;
++  try {
++    const response = await fetch(url, fetchOptions);
++    if (!response.ok) {
++      let errorMsg = `HTTP ${response.status}`;
++      try {
++        const errorData = await response.json();
++        if (errorData && (errorData.message || errorData.error)) {
++          errorMsg = errorData.message || errorData.error;
++        }
++      } catch (_) {}
++      throw new Error(errorMsg);
++    }
++
++    const contentType = response.headers.get('content-type') || '';
++    const body = contentType.includes('application/json')
++      ? await response.json()
++      : await response.text();
++
++    if (statusElement) {
++      const msg = (body && typeof body === 'object' && body.message)
++        ? body.message
++        : 'Thank you for subscribing to The Daily Grind!';
++      statusElement.textContent = msg;
++      statusElement.className = 'form-status success';
++    }
++    return { ok: true, body, error: null };
++  } catch (error) {
++    const message = error instanceof Error ? error.message : String(error);
++    if (statusElement) {
++      statusElement.textContent = `Sorry, your request could not go through. (${message})`;
++      statusElement.className = 'form-status error';
++    }
++    return { ok: false, body: null, error };
++  }
++}
++
++// Expose on window for accessibility and testing
++if (typeof window !== 'undefined') {
++  window.fetchWithPolicyHandling = fetchWithPolicyHandling;
++}
++
++function initNewsletter() {
++  if (typeof window === 'undefined' || window.__dailyGrindNewsletterInit) return;
++  window.__dailyGrindNewsletterInit = true;
++
++  const form = document.getElementById('newsletter-form');
++  const emailInput =
++    document.getElementById('newsletter-email') ||
++    document.getElementById('email') ||
++    document.querySelector('input[type="email"]') ||
++    document.querySelector('input[name="email"]');
++  const submitBtn = document.getElementById('newsletter-submit-btn') || form?.querySelector('button[type="submit"]');
++  const statusDiv = document.getElementById('newsletter-status');
++
++  if (!form || !emailInput || !statusDiv) return;
++
++  // Listen for security policy violations (e.g., CSP or connection allowlist blocks)
++  window.addEventListener('securitypolicyviolation', (event) => {
++    if (statusDiv) {
++      statusDiv.textContent = `A request to ${event.blockedURI || 'an external host'} could not go through (blocked by security policy).`;
++      statusDiv.className = 'form-status error';
++    }
++  });
++
++  // Handle unhandled rejections that might be caused by blocked network connections
++  window.addEventListener('unhandledrejection', (event) => {
++    if (statusDiv && (!statusDiv.textContent || statusDiv.textContent.includes('Subscribing'))) {
++      statusDiv.textContent = 'Sorry, your request could not go through. Please try again.';
++      statusDiv.className = 'form-status error';
++    }
++  });
++
++  // Clear errors on input
++  emailInput.addEventListener('input', () => {
++    if (emailInput.getAttribute('aria-invalid') === 'true') {
++      emailInput.removeAttribute('aria-invalid');
++    }
++    if (statusDiv.classList.contains('error')) {
++      statusDiv.textContent = '';
++      statusDiv.className = 'form-status';
++    }
++  });
++
++  // Form submission handler
++  form.addEventListener('submit', async (e) => {
++    e.preventDefault();
++
++    const email = emailInput.value.trim();
++
++    // Client-side validation
++    if (!email || !emailInput.checkValidity()) {
++      emailInput.setAttribute('aria-invalid', 'true');
++      statusDiv.textContent = 'Please enter a valid email address.';
++      statusDiv.className = 'form-status error';
++      emailInput.focus();
++      return;
++    }
++
++    emailInput.removeAttribute('aria-invalid');
++    if (submitBtn) submitBtn.disabled = true;
++    statusDiv.textContent = 'Submitting...';
++    statusDiv.className = 'form-status info';
++
++    const targetUrl = form.getAttribute('action') || '/api/newsletter';
++
++    const result = await fetchWithPolicyHandling(targetUrl, {
++      method: 'POST',
++      headers: {
++        'Content-Type': 'application/json',
++        'Accept': 'application/json',
++      },
++      body: JSON.stringify({ email }),
++      statusElement: statusDiv,
++    });
++
++    if (result.ok) {
++      form.reset();
++      emailInput.removeAttribute('aria-invalid');
++    } else {
++      emailInput.setAttribute('aria-invalid', 'true');
++      if (!statusDiv.textContent.includes('could not go through')) {
++        statusDiv.textContent = 'Sorry, your request could not go through. Please try again.';
++        statusDiv.className = 'form-status error';
++      }
++    }
++
++    if (submitBtn) submitBtn.disabled = false;
++  });
++
++  // Handle URL query parameters if redirected after standard POST
++  try {
++    const params = new URLSearchParams(window.location.search);
++    if (params.get('subscribed') === 'true') {
++      statusDiv.textContent = 'Thank you for subscribing to The Daily Grind!';
++      statusDiv.className = 'form-status success';
++    } else if (params.get('error')) {
++      statusDiv.textContent = 'Sorry, your request could not go through. Please try again.';
++      statusDiv.className = 'form-status error';
++    }
++  } catch (_) {}
++}
++
++if (typeof document !== 'undefined') {
++  if (document.readyState === 'loading') {
++    document.addEventListener('DOMContentLoaded', initNewsletter);
++  } else {
++    initNewsletter();
++  }
++}
+diff --git a/index.html b/index.html
+index 66c9173..8ea63ac 100644
+--- a/index.html
++++ b/index.html
+@@ -4,6 +4,7 @@
+ <head>
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' https://images.unsplash.com; connect-src 'self' https://images.unsplash.com; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; form-action 'self'; object-src 'none'; base-uri 'self';">
+   <title>The Daily Grind | Artisanal Coffee</title>
+   <style>
+     :root {
+@@ -152,6 +153,138 @@
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    /* Newsletter Section */
++    .newsletter-section {
++      margin-top: 50px;
++    }
++
++    .newsletter-card {
++      background: white;
++      padding: 40px;
++      border-radius: 8px;
++      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
++      text-align: center;
++      max-width: 650px;
++      margin: 0 auto;
++    }
++
++    .newsletter-card h2 {
++      color: var(--primary);
++      margin-bottom: 12px;
++    }
++
++    .newsletter-card p {
++      margin-bottom: 24px;
++      color: #5d4037;
++    }
++
++    .form-group {
++      display: flex;
++      flex-direction: column;
++      align-items: center;
++      gap: 8px;
++      width: 100%;
++    }
++
++    .form-group label {
++      font-weight: 600;
++      font-size: 0.95rem;
++      align-self: flex-start;
++      max-width: 480px;
++      margin: 0 auto;
++      width: 100%;
++      text-align: left;
++    }
++
++    .input-row {
++      display: flex;
++      gap: 10px;
++      width: 100%;
++      max-width: 480px;
++      justify-content: center;
++    }
++
++    input[type="email"] {
++      flex: 1;
++      font: inherit;
++      font-size: max(1rem, 1em);
++      padding: 10px 14px;
++      min-height: 48px;
++      border: 1.5px solid #a1887f;
++      border-radius: 5px;
++      box-sizing: border-box;
++      outline: none;
++      transition: border-color 0.2s, box-shadow 0.2s;
++    }
++
++    input[type="email"]:focus-visible {
++      border-color: var(--primary);
++      outline: 2px solid var(--accent);
++      outline-offset: 2px;
++    }
++
++    input[type="email"]:user-invalid {
++      border-color: #c62828;
++    }
++
++    .btn[type="submit"] {
++      cursor: pointer;
++      border: none;
++      font: inherit;
++      font-weight: 600;
++      margin-top: 0;
++      min-height: 48px;
++      padding: 10px 24px;
++    }
++
++    .btn[type="submit"]:disabled {
++      opacity: 0.65;
++      cursor: not-allowed;
++    }
++
++    .form-status {
++      margin-top: 16px;
++      padding: 10px 16px;
++      border-radius: 4px;
++      font-size: 0.95rem;
++      font-weight: 500;
++      display: none;
++      max-width: 480px;
++      margin-left: auto;
++      margin-right: auto;
++    }
++
++    .form-status:not(:empty) {
++      display: block;
++    }
++
++    .form-status.success {
++      background-color: #e8f5e9;
++      color: #2e7d32;
++      border: 1px solid #a5d6a7;
++    }
++
++    .form-status.error {
++      background-color: #ffebee;
++      color: #c62828;
++      border: 1px solid #ef9a9a;
++    }
++
++    .form-status.info {
++      background-color: #e1f5fe;
++      color: #0277bd;
++      border: 1px solid #81d4fa;
++    }
++
++    @media (max-width: 600px) {
++      .input-row {
++        flex-direction: column;
++      }
++      .btn[type="submit"] {
++        width: 100%;
++      }
++    }
+   </style>
+ </head>
+ 
+@@ -195,6 +328,34 @@
+         </div>
+       </div>
+     </section>
++
++    <section class="newsletter-section" aria-labelledby="newsletter-heading">
++      <div class="newsletter-card">
++        <h2 id="newsletter-heading">Stay Grounded &amp; Caffeinated</h2>
++        <p>Subscribe to our newsletter for exclusive offers, seasonal roasts, and brewing tips delivered straight to your inbox.</p>
++        <form id="newsletter-form" action="/api/newsletter" method="POST" novalidate>
++          <div class="form-group">
++            <label for="newsletter-email">Email Address <span aria-hidden="true">*</span></label>
++            <div class="input-row">
++              <input
++                type="email"
++                id="newsletter-email"
++                name="email"
++                required
++                autocomplete="email"
++                autocorrect="off"
++                autocapitalize="none"
++                spellcheck="false"
++                placeholder="coffee-lover@example.com"
++                aria-describedby="newsletter-status"
++              >
++              <button type="submit" id="newsletter-submit-btn" class="btn">Subscribe</button>
++            </div>
++          </div>
++          <div id="newsletter-status" role="status" aria-live="polite" class="form-status"></div>
++        </form>
++      </div>
++    </section>
+   </main>
+ 
+   <footer>
+@@ -207,6 +368,7 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script type="module" src="/app.js"></script>
+ </body>
+ 
+ </html>
+diff --git a/package.json b/package.json
+index 2bd4d77..e49b21f 100644
+--- a/package.json
++++ b/package.json
+@@ -1,8 +1,9 @@
+ {
+   "name": "daily-grind",
+   "version": "1.0.0",
++  "type": "module",
+   "scripts": {
+-    "start": "pnpm dlx statikk --port ${PORT:-11222}"
++    "start": "node server.js"
+   },
+   "pnpm": {
+     "onlyBuiltDependencies": []
+diff --git a/server.js b/server.js
+new file mode 100644
+index 0000000..7ece45c
+--- /dev/null
++++ b/server.js
+@@ -0,0 +1,289 @@
++// Daily Grind - Custom Node.js Server with Connection-Allowlist & CSP Security Headers
++import http from 'node:http';
++import fs from 'node:fs';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++const __filename = fileURLToPath(import.meta.url);
++const __dirname = path.dirname(__filename);
++
++export const ALLOWLIST_DESTS = new Set([
++  'document',
++  'iframe',
++  'worker',
++  'sharedworker',
++  'serviceworker',
++]);
++
++/**
++ * Normalizes a URLPattern string for Connection-Allowlist per RFC 9651.
++ * Rewrites ws:// and wss:// to http:// and https:// and strips bare trailing slashes.
++ */
++export function normalizeAllowlistPattern(rawPattern) {
++  const trimmed = String(rawPattern).trim().replace(/^ws(s?):\/\//i, 'http$1://');
++  if (!/^https?:\/\//i.test(trimmed)) {
++    throw new Error(`Pattern must include an http:// or https:// scheme: ${rawPattern}`);
++  }
++  if (/[\s,]/.test(trimmed)) {
++    throw new Error(`Pattern must be a single URLPattern without spaces or commas: ${rawPattern}`);
++  }
++  if (/[()]/.test(trimmed)) {
++    throw new Error(`Custom regex groups are rejected by Connection-Allowlist: ${rawPattern}`);
++  }
++  return trimmed.replace(/^(https?:\/\/[^/?#]+)\/$/i, '$1');
++}
++
++/**
++ * Builds an RFC 9651 Inner List header value for Connection-Allowlist.
++ */
++export function buildConnectionAllowlistHeader({
++  allowSelf = true,
++  patterns = [],
++  reportTo,
++  redirects = 'block',
++  webrtc = 'block',
++} = {}) {
++  const items = allowSelf ? ['response-origin'] : [];
++  for (const pattern of patterns) {
++    const raw = String(pattern).trim();
++    if (raw === 'response-origin') {
++      if (!items.includes('response-origin')) items.push('response-origin');
++      continue;
++    }
++    const normalized = normalizeAllowlistPattern(raw);
++    items.push(`"${normalized.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
++  }
++  let header = `(${items.join(' ')})`;
++  if (redirects === 'allow') header += '; redirects=allow';
++  if (webrtc === 'allow') header += '; webrtc=allow';
++  if (reportTo) {
++    const endpointToken = String(reportTo).trim().replace(/^"+|"+$/g, '');
++    header += `; report-to=${endpointToken}`;
++  }
++  return header;
++}
++
++// Pre-computed Connection-Allowlist and Content-Security-Policy headers
++export const CONNECTION_ALLOWLIST_HEADER = buildConnectionAllowlistHeader({
++  allowSelf: true,
++  patterns: ['https://images.unsplash.com'],
++});
++
++export const CSP_HEADER = [
++  "default-src 'self'",
++  "img-src 'self' https://images.unsplash.com",
++  "connect-src 'self' https://images.unsplash.com",
++  "script-src 'self' 'unsafe-inline'",
++  "style-src 'self' 'unsafe-inline'",
++  "form-action 'self'",
++  "frame-ancestors 'none'",
++  "object-src 'none'",
++  "base-uri 'self'",
++].join('; ');
++
++const MIME_TYPES = {
++  '.html': 'text/html; charset=utf-8',
++  '.js': 'application/javascript; charset=utf-8',
++  '.mjs': 'application/javascript; charset=utf-8',
++  '.css': 'text/css; charset=utf-8',
++  '.json': 'application/json; charset=utf-8',
++  '.png': 'image/png',
++  '.jpg': 'image/jpeg',
++  '.jpeg': 'image/jpeg',
++  '.gif': 'image/gif',
++  '.svg': 'image/svg+xml',
++  '.ico': 'image/x-icon',
++  '.txt': 'text/plain; charset=utf-8',
++};
++
++// In-memory subscriber list
++export const subscribers = [];
++
++export function isValidEmail(email) {
++  if (typeof email !== 'string') return false;
++  const trimmed = email.trim();
++  return /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/.test(
++    trimmed
++  );
++}
++
++/**
++ * Applies security headers to the response object.
++ */
++export function applySecurityHeaders(res, req = null) {
++  res.setHeader('Vary', 'Sec-Fetch-Dest');
++  res.setHeader('Connection-Allowlist', CONNECTION_ALLOWLIST_HEADER);
++  res.setHeader('Content-Security-Policy', CSP_HEADER);
++  res.setHeader('X-Content-Type-Options', 'nosniff');
++  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
++  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
++}
++
++/**
++ * Handles incoming HTTP requests.
++ */
++export function requestHandler(req, res) {
++  applySecurityHeaders(res, req);
++
++  const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
++  const pathname = parsedUrl.pathname;
++
++  // Handle preflight OPTIONS
++  if (req.method === 'OPTIONS') {
++    res.writeHead(204, {
++      'Allow': 'GET, POST, OPTIONS',
++    });
++    res.end();
++    return;
++  }
++
++  // Newsletter signup endpoints
++  if (pathname === '/api/newsletter' || pathname === '/newsletter' || pathname === '/subscribe' || pathname === '/api/subscribe') {
++    if (req.method === 'POST') {
++      let body = '';
++      req.on('data', (chunk) => {
++        body += chunk;
++        if (body.length > 1e6) {
++          req.destroy();
++        }
++      });
++
++      req.on('end', () => {
++        let email = '';
++        const contentType = req.headers['content-type'] || '';
++
++        if (contentType.includes('application/json')) {
++          try {
++            const parsed = JSON.parse(body);
++            email = parsed.email;
++          } catch (_) {
++            res.writeHead(400, { 'Content-Type': 'application/json' });
++            res.end(JSON.stringify({ success: false, error: 'Invalid JSON payload' }));
++            return;
++          }
++        } else if (contentType.includes('application/x-www-form-urlencoded')) {
++          const params = new URLSearchParams(body);
++          email = params.get('email');
++        } else {
++          try {
++            const parsed = JSON.parse(body);
++            email = parsed.email;
++          } catch (_) {
++            const params = new URLSearchParams(body);
++            email = params.get('email');
++          }
++        }
++
++        if (!email || !isValidEmail(email)) {
++          res.writeHead(400, { 'Content-Type': 'application/json' });
++          res.end(
++            JSON.stringify({
++              success: false,
++              error: 'Invalid email address',
++              message: 'Please provide a valid email address.',
++            })
++          );
++          return;
++        }
++
++        const trimmedEmail = email.trim().toLowerCase();
++        subscribers.push({
++          email: trimmedEmail,
++          subscribedAt: new Date().toISOString(),
++        });
++
++        // Non-AJAX form submissions can redirect back to homepage
++        const acceptHeader = req.headers['accept'] || '';
++        if (contentType.includes('application/x-www-form-urlencoded') && !acceptHeader.includes('application/json')) {
++          res.writeHead(303, { Location: '/?subscribed=true' });
++          res.end();
++          return;
++        }
++
++        res.writeHead(200, { 'Content-Type': 'application/json' });
++        res.end(
++          JSON.stringify({
++            success: true,
++            message: 'Thank you for subscribing to The Daily Grind!',
++            email: trimmedEmail,
++          })
++        );
++      });
++      return;
++    }
++
++    if (req.method === 'GET') {
++      res.writeHead(200, { 'Content-Type': 'application/json' });
++      res.end(
++        JSON.stringify({
++          subscribers: subscribers.map((s) => s.email),
++          count: subscribers.length,
++        })
++      );
++      return;
++    }
++
++    res.writeHead(405, { 'Content-Type': 'application/json' });
++    res.end(JSON.stringify({ error: 'Method Not Allowed' }));
++    return;
++  }
++
++  // Health check endpoint
++  if (pathname === '/health' || pathname === '/ping') {
++    res.writeHead(200, { 'Content-Type': 'application/json' });
++    res.end(JSON.stringify({ status: 'ok' }));
++    return;
++  }
++
++  // Static file serving
++  if (req.method !== 'GET' && req.method !== 'HEAD') {
++    res.writeHead(405, { 'Content-Type': 'text/plain; charset=utf-8' });
++    res.end('Method Not Allowed');
++    return;
++  }
++
++  let relativePath = pathname === '/' ? '/index.html' : pathname;
++  // Prevent directory traversal
++  const safePath = path.normalize(relativePath).replace(/^(\.\.[/\\])+/, '');
++  const filePath = path.join(__dirname, safePath);
++
++  // Security check: ensure filePath is within __dirname
++  if (!filePath.startsWith(__dirname)) {
++    res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
++    res.end('Forbidden');
++    return;
++  }
++
++  fs.stat(filePath, (err, stats) => {
++    if (err || !stats.isFile()) {
++      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
++      res.end('Not Found');
++      return;
++    }
++
++    const ext = path.extname(filePath).toLowerCase();
++    const contentType = MIME_TYPES[ext] || 'application/octet-stream';
++
++    res.writeHead(200, { 'Content-Type': contentType });
++    if (req.method === 'HEAD') {
++      res.end();
++      return;
++    }
++
++    const stream = fs.createReadStream(filePath);
++    stream.pipe(res);
++  });
++}
++
++export const server = http.createServer(requestHandler);
++
++export const PORT = Number(process.env.PORT) || 11222;
++export const HOST = process.env.HOST || '0.0.0.0';
++
++// Only listen automatically when executed directly as main script
++const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
++if (isMain) {
++  server.listen(PORT, HOST, () => {
++    console.log(`The Daily Grind server listening on http://${HOST}:${PORT}`);
++  });
++}

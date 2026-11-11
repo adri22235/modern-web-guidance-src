@@ -1,0 +1,712 @@
+diff --git a/SECURITY.md b/SECURITY.md
+new file mode 100644
+index 0000000..1408e82
+--- /dev/null
++++ b/SECURITY.md
+@@ -0,0 +1,56 @@
++# Security audit and deployment
++
++The site has no login implementation, credential validation, or server session
++store. The previous logout route only displayed text. Logout now expires the
++root-path cookies sent by the browser and returns Clear-Site-Data for cookies,
++storage, and cache. The external logout script also clears localStorage and
++sessionStorage when available. When authentication is added, revoke the actual
++server session/token in the POST handler before returning success; client cleanup
++alone cannot revoke a copied token. Use host-only, root-path authentication cookies.
++Cookies with other domain/path scopes rely on browser Clear-Site-Data support.
++
++Logout uses a native POST form so it works without JavaScript. GET and HEAD show
++confirmation without changing state, preventing link prefetchers from logging out
++visitors. POST checks the exact Origin and Fetch Metadata when present; missing,
++opaque, or cross-origin requests fail closed. No user input is rendered as HTML.
++Only explicit page aliases and two public assets are served. Existing page aliases
++still show the original homepage; this change does not create new menu/account pages.
++
++Inline CSS and the style attribute were moved into /styles.css. No inline scripts,
++inline event handlers, eval, dynamic HTML sinks, third-party scripts, analytics,
++iframes, or service workers were present or introduced. The only remote resource
++is the existing Unsplash background image; CSP allows that image host explicitly.
++The logout script uses browser storage APIs and registers a history restoration
++handler without injecting markup. Trusted Types disallows policy creation and
++requires trusted values for script sinks in supporting browsers. Unsupported
++browsers still receive the other CSP restrictions.
++
++The server enforces CSP by default, denies framing, disables MIME sniffing, strips
++referrers, restricts sensitive browser features, and isolates browsing contexts.
++All responses use no-store so authentication views and logout results are not
++retained in the HTTP cache. No dependency or runtime framework is required.
++
++## Deployment
++
++- Run `npm run build` and `npm test` before deployment. Tests call the independent
++  request handler with mock requests/responses; they never start a listener or
++  import server.js. There are no browser verification steps.
++- `npm start` runs the Node server. `PORT` defaults to 11222.
++- Serve production traffic over HTTPS. When TLS terminates at a reverse proxy,
++  set `PUBLIC_ORIGIN=https://your-actual-host.example` (no trailing slash), preserve
++  the Origin header, and configure HSTS at that proxy. Direct TLS responses get
++  HSTS automatically. The app does not trust arbitrary forwarded headers.
++- Clear-Site-Data depends on browser support and a secure context. Its cookies
++  directive can clear cookies across sibling subdomains; deploy on a dedicated
++  site if those subdomains must retain independent sign-ins.
++- To stage policy changes, set `CSP_MODE=report-only`. The same CSP is delivered
++  as Content-Security-Policy-Report-Only, with browser console violation messages;
++  other security headers remain active. There is no remote report collector.
++  Use automated checks in staging, review violations, and return to the default
++  `CSP_MODE=enforce` before release. Report-only does not enforce CSP restrictions.
++  Avoid adding unsafe-inline, unsafe-eval, wildcard sources, or a permissive
++  Trusted Types default policy to silence violations.
++
++References: [MDN CSP guide](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CSP),
++[MDN Clear-Site-Data](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Clear-Site-Data),
++[MDN Trusted Types enforcement](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Content-Security-Policy/require-trusted-types-for).
+diff --git a/app.js b/app.js
+new file mode 100644
+index 0000000..c0e80bd
+--- /dev/null
++++ b/app.js
+@@ -0,0 +1,107 @@
++const fs = require('node:fs');
++const path = require('node:path');
++
++const policy = [
++  "default-src 'none'",
++  "script-src 'self'",
++  "script-src-attr 'none'",
++  "style-src 'self'",
++  'img-src https://images.unsplash.com',
++  "connect-src 'none'",
++  "base-uri 'none'",
++  "object-src 'none'",
++  "frame-ancestors 'none'",
++  "form-action 'self'",
++  "require-trusted-types-for 'script'",
++  "trusted-types 'none'",
++].join('; ');
++
++const assets = new Map([
++  ['/styles.css', ['public/styles.css', 'text/css; charset=utf-8']],
++  ['/logout.js', ['public/logout.js', 'text/javascript; charset=utf-8']],
++]);
++// Retain the original site's navigation aliases without exposing arbitrary files.
++const pages = new Set(['/', '/index.html', '/menu', '/locations', '/rewards',
++  '/account', '/order-online', '/menu/seasonal', '/menu/espresso',
++  '/menu/cold-brew', '/about', '/careers', '/contact', '/privacy-policy']);
++
++function documentPage(title, content, script = '') {
++  return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${title} | The Daily Grind</title><link rel="stylesheet" href="/styles.css">${script}</head><body><main class="container"><h1>${title}</h1>${content}</main></body></html>`;
++}
++
++function createHandler({ reportOnly = false, publicOrigin } = {}) {
++  if (publicOrigin && (new URL(publicOrigin).origin !== publicOrigin ||
++      !['http:', 'https:'].includes(new URL(publicOrigin).protocol))) {
++    throw new Error('PUBLIC_ORIGIN must be an HTTP(S) origin without a trailing slash');
++  }
++  return function handleRequest(req, res) {
++    res.setHeader(reportOnly ? 'Content-Security-Policy-Report-Only' : 'Content-Security-Policy', policy);
++    res.setHeader('X-Content-Type-Options', 'nosniff');
++    res.setHeader('X-Frame-Options', 'DENY');
++    res.setHeader('Referrer-Policy', 'no-referrer');
++    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
++    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
++    res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
++    res.setHeader('Cache-Control', 'no-store');
++    // TLS can terminate at a proxy; do not trust client-supplied forwarding headers.
++    if (req.socket?.encrypted) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
++
++    const send = (status, body, type = 'text/html; charset=utf-8') => {
++      res.writeHead(status, { 'Content-Type': type });
++      res.end(req.method === 'HEAD' ? undefined : body);
++    };
++    let pathname;
++    try {
++      if (!req.url.startsWith('/') || req.url.startsWith('//')) throw new Error('Invalid target');
++      pathname = new URL(req.url, 'http://localhost').pathname;
++    } catch {
++      return send(400, 'Bad request', 'text/plain; charset=utf-8');
++    }
++
++    if (pathname === '/logout' || pathname === '/logout/') {
++      if (req.method === 'GET' || req.method === 'HEAD') {
++        return send(200, documentPage('Sign out', '<p>Sign out of The Daily Grind on this browser?</p><form action="/logout" method="post"><button class="btn" type="submit">Logout</button></form><p><a href="/">Return home</a></p>'));
++      }
++      if (req.method !== 'POST') {
++        res.setHeader('Allow', 'GET, HEAD, POST');
++        return send(405, 'Method not allowed', 'text/plain; charset=utf-8');
++      }
++      // Native same-origin form submissions send Origin. Reject opaque/missing origins
++      // and cross-site requests, including sibling subdomains, before changing state.
++      let sameOrigin = false;
++      try {
++        const origin = new URL(req.headers.origin);
++        sameOrigin = ['http:', 'https:'].includes(origin.protocol) &&
++          origin.origin === req.headers.origin &&
++          origin.origin === (publicOrigin || `${req.socket?.encrypted ? 'https' : 'http'}://${req.headers.host}`);
++      } catch { /* Missing or malformed Origin is forbidden. */ }
++      if (!sameOrigin || (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin')) {
++        return send(403, 'Forbidden', 'text/plain; charset=utf-8');
++      }
++      // There is no session store in this site. Expire root cookies, including
++      // HttpOnly credentials, and clear browser data on supporting HTTPS clients.
++      const names = new Set(['session', 'sid']);
++      for (const cookie of (req.headers.cookie || '').split(';')) {
++        const name = cookie.trim().split('=')[0];
++        if (/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name)) names.add(name);
++      }
++      res.setHeader('Set-Cookie', [...names].map(name =>
++        `${name}=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax${req.socket?.encrypted || req.headers.origin.startsWith('https:') || name.startsWith('__Secure-') || name.startsWith('__Host-') ? '; Secure' : ''}`));
++      res.setHeader('Clear-Site-Data', '"cache", "cookies", "storage"');
++      return send(200, documentPage('Logged out', '<p>You have been signed out on this browser.</p><p><a href="/">Return home</a></p>', '<script src="/logout.js" defer></script>'));
++    }
++
++    if (req.method !== 'GET' && req.method !== 'HEAD') {
++      res.setHeader('Allow', 'GET, HEAD');
++      return send(405, 'Method not allowed', 'text/plain; charset=utf-8');
++    }
++    const asset = assets.get(pathname) || (pages.has(pathname) ? ['index.html', 'text/html; charset=utf-8'] : null);
++    if (!asset) return send(404, 'Not found', 'text/plain; charset=utf-8');
++    fs.readFile(path.join(__dirname, asset[0]), (error, data) => {
++      if (error) return send(500, 'Server error', 'text/plain; charset=utf-8');
++      send(200, data, asset[1]);
++    });
++  };
++}
++
++module.exports = { createHandler, policy };
+diff --git a/index.html b/index.html
+index 66c9173..ad25121 100644
+--- a/index.html
++++ b/index.html
+@@ -5,166 +5,19 @@
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <title>The Daily Grind | Artisanal Coffee</title>
+-  <style>
+-    :root {
+-      --primary: #4e342e;
+-      --secondary: #d7ccc8;
+-      --accent: #ffab40;
+-      --text: #3e2723;
+-      --light: #fafafa;
+-    }
+-
+-    * {
+-      box-sizing: border-box;
+-      margin: 0;
+-      padding: 0;
+-    }
+-
+-    body {
+-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+-      line-height: 1.6;
+-      color: var(--text);
+-      background-color: var(--light);
+-    }
+-
+-    /* Navigation */
+-    nav {
+-      background: var(--primary);
+-      color: white;
+-      padding: 1rem 5%;
+-      display: flex;
+-      justify-content: space-between;
+-      align-items: center;
+-      position: sticky;
+-      top: 0;
+-      z-index: 1000;
+-    }
+-
+-    .logo {
+-      font-size: 1.5rem;
+-      font-weight: bold;
+-      letter-spacing: 1px;
+-    }
+-
+-    nav ul {
+-      display: flex;
+-      list-style: none;
+-    }
+-
+-    nav ul li {
+-      margin-left: 20px;
+-    }
+-
+-    nav a {
+-      color: white;
+-      text-decoration: none;
+-      font-size: 0.9rem;
+-      transition: color 0.3s;
+-    }
+-
+-    nav a:hover {
+-      color: var(--accent);
+-    }
+-
+-    .logout-link {
+-      border: 1px solid var(--accent);
+-      padding: 5px 12px;
+-      border-radius: 4px;
+-    }
+-
+-    /* Hero Section */
+-    .hero {
+-      height: 60vh;
+-      background: linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)),
+-        url('https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?auto=format&fit=crop&w=1350&q=80');
+-      background-size: cover;
+-      background-position: center;
+-      display: flex;
+-      flex-direction: column;
+-      justify-content: center;
+-      align-items: center;
+-      color: white;
+-      text-align: center;
+-      padding: 0 20px;
+-    }
+-
+-    .hero h1 {
+-      font-size: 3rem;
+-      margin-bottom: 1rem;
+-    }
+-
+-    /* Content Sections */
+-    .container {
+-      max-width: 1100px;
+-      margin: 40px auto;
+-      padding: 0 20px;
+-    }
+-
+-    .grid {
+-      display: grid;
+-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+-      gap: 20px;
+-      margin-top: 20px;
+-    }
+-
+-    .card {
+-      background: white;
+-      padding: 20px;
+-      border-radius: 8px;
+-      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+-      text-align: center;
+-    }
+-
+-    .card h3 {
+-      margin-bottom: 10px;
+-      color: var(--primary);
+-    }
+-
+-    .btn {
+-      display: inline-block;
+-      background: var(--primary);
+-      color: white;
+-      padding: 10px 20px;
+-      text-decoration: none;
+-      border-radius: 5px;
+-      margin-top: 15px;
+-      transition: background 0.3s;
+-    }
+-
+-    .btn:hover {
+-      background: #3e2723;
+-    }
+-
+-    footer {
+-      background: var(--secondary);
+-      text-align: center;
+-      padding: 40px 20px;
+-      margin-top: 40px;
+-    }
+-
+-    .footer-links {
+-      margin-bottom: 20px;
+-    }
+-
+-    .footer-links a {
+-      margin: 0 10px;
+-      color: var(--text);
+-      text-decoration: none;
+-      font-size: 0.85rem;
+-    }
+-  </style>
++  <link rel="stylesheet" href="/styles.css">
+ </head>
+ 
+ <body>
+ 
+-  <nav>
++  <nav aria-label="Main navigation">
+     <div class="logo">THE DAILY GRIND</div>
+     <ul>
+       <li><a href="/menu">Menu</a></li>
+       <li><a href="/locations">Locations</a></li>
+       <li><a href="/rewards">Rewards</a></li>
+       <li><a href="/account">My Account</a></li>
+-      <li><a href="/logout" class="logout-link">Logout</a></li>
++      <li><form action="/logout" method="post" class="logout-form"><button type="submit" class="logout-link">Logout</button></form></li>
+     </ul>
+   </nav>
+ 
+@@ -176,7 +29,7 @@
+ 
+   <main class="container">
+     <section>
+-      <h2 style="text-align: center;">Seasonal Favorites</h2>
++      <h2 class="section-title">Seasonal Favorites</h2>
+       <div class="grid">
+         <div class="card">
+           <h3>Maple Oat Latte</h3>
+diff --git a/package.json b/package.json
+index cffdc93..b798e9d 100644
+--- a/package.json
++++ b/package.json
+@@ -3,7 +3,8 @@
+   "version": "1.0.0",
+   "scripts": {
+     "start": "node server.js",
+-    "build": "node --check server.js"
++    "build": "node --check server.js && node --check app.js && node --check public/logout.js",
++    "test": "node --test"
+   },
+   "pnpm": {
+     "onlyBuiltDependencies": []
+diff --git a/public/logout.js b/public/logout.js
+new file mode 100644
+index 0000000..2bc1698
+--- /dev/null
++++ b/public/logout.js
+@@ -0,0 +1,15 @@
++'use strict';
++
++// Fallback for storage APIs when Clear-Site-Data is unavailable. No HTML sinks,
++// eval, dynamic scripts, or permissive Trusted Types policy are needed.
++for (const name of ['localStorage', 'sessionStorage']) {
++  try {
++    window[name].clear();
++  } catch {
++    // Storage may be disabled by browser privacy settings.
++  }
++}
++// Clear cached account views when restoring the logout confirmation from history.
++window.addEventListener('pageshow', (event) => {
++  if (event.persisted) window.location.replace('/');
++});
+diff --git a/public/styles.css b/public/styles.css
+new file mode 100644
+index 0000000..2a631c4
+--- /dev/null
++++ b/public/styles.css
+@@ -0,0 +1,153 @@
++
++    :root {
++      --primary: #4e342e;
++      --secondary: #d7ccc8;
++      --accent: #ffab40;
++      --text: #3e2723;
++      --light: #fafafa;
++    }
++
++    * {
++      box-sizing: border-box;
++      margin: 0;
++      padding: 0;
++    }
++
++    body {
++      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
++      line-height: 1.6;
++      color: var(--text);
++      background-color: var(--light);
++    }
++
++    /* Navigation */
++    nav {
++      background: var(--primary);
++      color: white;
++      padding: 1rem 5%;
++      display: flex;
++      justify-content: space-between;
++      align-items: center;
++      position: sticky;
++      top: 0;
++      z-index: 1000;
++    }
++
++    .logo {
++      font-size: 1.5rem;
++      font-weight: bold;
++      letter-spacing: 1px;
++    }
++
++    nav ul {
++      display: flex;
++      list-style: none;
++    }
++
++    nav ul li {
++      margin-left: 20px;
++    }
++
++    nav a {
++      color: white;
++      text-decoration: none;
++      font-size: 0.9rem;
++      transition: color 0.3s;
++    }
++
++    nav a:hover {
++      color: var(--accent);
++    }
++
++    .logout-link {
++      border: 1px solid var(--accent);
++      padding: 5px 12px;
++      border-radius: 4px;
++    }
++
++    /* Hero Section */
++    .hero {
++      height: 60vh;
++      background: linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)),
++        url('https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?auto=format&fit=crop&w=1350&q=80');
++      background-size: cover;
++      background-position: center;
++      display: flex;
++      flex-direction: column;
++      justify-content: center;
++      align-items: center;
++      color: white;
++      text-align: center;
++      padding: 0 20px;
++    }
++
++    .hero h1 {
++      font-size: 3rem;
++      margin-bottom: 1rem;
++    }
++
++    /* Content Sections */
++    .container {
++      max-width: 1100px;
++      margin: 40px auto;
++      padding: 0 20px;
++    }
++
++    .grid {
++      display: grid;
++      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
++      gap: 20px;
++      margin-top: 20px;
++    }
++
++    .card {
++      background: white;
++      padding: 20px;
++      border-radius: 8px;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++      text-align: center;
++    }
++
++    .card h3 {
++      margin-bottom: 10px;
++      color: var(--primary);
++    }
++
++    .btn {
++      display: inline-block;
++      background: var(--primary);
++      color: white;
++      padding: 10px 20px;
++      text-decoration: none;
++      border-radius: 5px;
++      margin-top: 15px;
++      transition: background 0.3s;
++    }
++
++    .btn:hover {
++      background: #3e2723;
++    }
++
++    footer {
++      background: var(--secondary);
++      text-align: center;
++      padding: 40px 20px;
++      margin-top: 40px;
++    }
++
++    .footer-links {
++      margin-bottom: 20px;
++    }
++
++    .footer-links a {
++      margin: 0 10px;
++      color: var(--text);
++      text-decoration: none;
++      font-size: 0.85rem;
++    }
++
++.section-title { text-align: center; }
++.logout-form { display: inline; }
++.logout-link { background: transparent; color: white; font: inherit; font-size: 0.9rem; cursor: pointer; }
++.logout-link:hover, .logout-link:focus-visible { color: var(--accent); }
++button.btn { border: 0; font: inherit; cursor: pointer; }
+diff --git a/server.js b/server.js
+index 52c2fd5..2ccda79 100644
+--- a/server.js
++++ b/server.js
+@@ -1,32 +1,12 @@
+ const http = require('node:http');
+-const fs = require('node:fs');
+-const path = require('node:path');
++const { createHandler } = require('./app');
+ 
+-const PORT = parseInt(process.env.PORT || '11222', 10);
+-const WORK_DIR = __dirname;
++const port = Number(process.env.PORT || 11222);
++if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid PORT');
++const mode = process.env.CSP_MODE || 'enforce';
++if (!['enforce', 'report-only'].includes(mode)) throw new Error('Invalid CSP_MODE');
+ 
+-const server = http.createServer((req, res) => {
+-  const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+-  const pathname = parsedUrl.pathname;
+-
+-  if (pathname === '/logout' || pathname === '/logout/') {
+-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+-    res.end('Logged out');
+-    return;
+-  }
+-
+-  const filePath = path.join(WORK_DIR, 'index.html');
+-  fs.readFile(filePath, (err, data) => {
+-    if (err) {
+-      res.writeHead(500);
+-      res.end('Server error');
+-      return;
+-    }
+-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+-    res.end(data);
+-  });
+-});
+-
+-server.listen(PORT, () => {
+-  console.log(`Server running on port ${PORT}`);
+-});
++const server = http.createServer(createHandler({ reportOnly: mode === 'report-only', publicOrigin: process.env.PUBLIC_ORIGIN }));
++server.requestTimeout = 15000;
++server.headersTimeout = 10000;
++server.listen(port, () => console.log(`Server running on port ${port}`));
+diff --git a/test/security.test.js b/test/security.test.js
+new file mode 100644
+index 0000000..02e82b8
+--- /dev/null
++++ b/test/security.test.js
+@@ -0,0 +1,108 @@
++const { test } = require('node:test');
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const { createHandler } = require('../app');
++
++// Exercise the request handler directly: no listening sockets or server entrypoint.
++function request(url = '/', { method = 'GET', headers = {}, encrypted = false, reportOnly = false, publicOrigin } = {}) {
++  return new Promise(resolve => {
++    const responseHeaders = {};
++    const res = {
++      setHeader(name, value) { responseHeaders[name.toLowerCase()] = value; },
++      writeHead(status, headers) {
++        this.status = status;
++        for (const [name, value] of Object.entries(headers)) this.setHeader(name, value);
++      },
++      end(body) { resolve({ status: this.status, headers: responseHeaders, body: body?.toString() || '' }); },
++    };
++    createHandler({ reportOnly, publicOrigin })({ url, method, headers: { host: 'coffee.example', ...headers }, socket: { encrypted } }, res);
++  });
++}
++
++test('pages and assets have restrictive security headers and correct MIME types', async () => {
++  for (const [url, type] of [['/', 'text/html'], ['/styles.css', 'text/css'], ['/logout.js', 'text/javascript']]) {
++    const res = await request(url);
++    assert.equal(res.status, 200);
++    assert.ok(res.headers['content-type'].startsWith(type));
++    const csp = res.headers['content-security-policy'];
++    for (const directive of ["default-src 'none'", "base-uri 'none'", "frame-ancestors 'none'", "form-action 'self'", "require-trusted-types-for 'script'", "trusted-types 'none'"]) assert.ok(csp.includes(directive));
++    assert.ok(!csp.includes('unsafe-inline'));
++    assert.ok(!csp.includes('unsafe-eval'));
++    assert.equal(res.headers['x-content-type-options'], 'nosniff');
++    assert.equal(res.headers['cache-control'], 'no-store');
++    assert.equal(res.headers['referrer-policy'], 'no-referrer');
++  }
++});
++
++test('report-only rollout and TLS headers', async () => {
++  const res = await request('/', { reportOnly: true, encrypted: true });
++  assert.ok(res.headers['content-security-policy-report-only']);
++  assert.equal(res.headers['content-security-policy'], undefined);
++  assert.equal(res.headers['strict-transport-security'], 'max-age=31536000');
++  assert.equal((await request('/')).headers['strict-transport-security'], undefined);
++});
++
++test('GET, HEAD, and speculative navigation cannot log a visitor out', async () => {
++  for (const method of ['GET', 'HEAD']) {
++    const res = await request('/logout', { method, headers: { purpose: 'prefetch', cookie: 'session=secret' } });
++    assert.equal(res.status, 200);
++    assert.equal(res.headers['set-cookie'], undefined);
++    assert.equal(res.headers['clear-site-data'], undefined);
++    if (method === 'HEAD') assert.equal(res.body, '');
++    else assert.match(res.body, /method="post"/);
++  }
++});
++
++test('same-origin POST expires cookies and clears browser data', async () => {
++  const res = await request('/logout/', { method: 'POST', encrypted: true, headers: {
++    origin: 'https://coffee.example', 'sec-fetch-site': 'same-origin',
++    cookie: 'session=secret; __Host-auth=secret; preferences=dark; invalid name=x',
++  } });
++  assert.equal(res.status, 200);
++  assert.match(res.body, /Logged out/);
++  assert.match(res.body, /src="\/logout.js" defer/);
++  assert.equal(res.headers['clear-site-data'], '"cache", "cookies", "storage"');
++  for (const cookie of res.headers['set-cookie']) {
++    assert.match(cookie, /Max-Age=0/);
++    assert.match(cookie, /HttpOnly; SameSite=Lax; Secure/);
++    assert.ok(!cookie.includes('secret'));
++    assert.ok(!cookie.startsWith('invalid name'));
++  }
++  assert.ok(res.headers['set-cookie'].some(cookie => cookie.startsWith('__Host-auth=;')));
++});
++
++test('cross-origin, opaque and missing origins cannot trigger logout', async () => {
++  for (const headers of [{}, { origin: 'null' }, { origin: 'https://evil.example' },
++    { origin: 'https://sub.coffee.example' }, { origin: 'https://coffee.example', 'sec-fetch-site': 'cross-site' }]) {
++    const res = await request('/logout', { method: 'POST', headers });
++    assert.equal(res.status, 403);
++    assert.equal(res.headers['set-cookie'], undefined);
++    assert.equal(res.headers['clear-site-data'], undefined);
++  }
++});
++
++test('unknown files, malformed targets and unsupported methods fail safely', async () => {
++  for (const url of ['/server.js', '/app.js', '/package.json', '/.git/config', '/../../etc/passwd', '/missing']) {
++    assert.equal((await request(url)).status, 404);
++  }
++  assert.equal((await request('//evil.example/logout')).status, 400);
++  assert.equal((await request('/', { method: 'POST' })).status, 405);
++  assert.equal((await request('/logout', { method: 'DELETE' })).headers.allow, 'GET, HEAD, POST');
++  assert.equal((await request('/', { method: 'HEAD' })).body, '');
++});
++
++test('markup and client code remain compatible with the enforced policy', () => {
++  const html = fs.readFileSync('index.html', 'utf8');
++  const script = fs.readFileSync('public/logout.js', 'utf8');
++  assert.doesNotMatch(html, /<style\b|\sstyle\s*=|\son\w+\s*=|javascript:|<base\b/i);
++  assert.match(html, /<form action="\/logout" method="post"/);
++  assert.doesNotMatch(html, /<a[^>]+href="\/logout"/);
++  assert.doesNotMatch(script, /innerHTML|outerHTML|document\.write\s*\(|\beval\s*\(|new Function\s*\(/);
++});
++
++test('proxy deployments pin the public origin and reject scheme mismatches', async () => {
++  const headers = { origin: 'https://coffee.example' };
++  assert.equal((await request('/logout', { method: 'POST', headers })).status, 403);
++  assert.equal((await request('/logout', { method: 'POST', headers, publicOrigin: 'https://coffee.example' })).status, 200);
++  assert.throws(() => createHandler({ publicOrigin: 'https://coffee.example/' }));
++});

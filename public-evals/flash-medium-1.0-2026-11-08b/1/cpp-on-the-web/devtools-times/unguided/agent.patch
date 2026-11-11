@@ -1,0 +1,2250 @@
+diff --git a/build.sh b/build.sh
+new file mode 100755
+index 0000000..5a665b5
+--- /dev/null
++++ b/build.sh
+@@ -0,0 +1,29 @@
++#!/bin/bash
++set -e
++
++DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++CLANG="${CLANG:-/usr/local/bin/clang}"
++
++echo "Compiling smallpt.cpp to WebAssembly with clang..."
++"$CLANG" --target=wasm32 \
++    -O3 \
++    -nostdlib \
++    -Wl,--no-entry \
++    -Wl,--export-all \
++    -Wl,--allow-undefined \
++    -Wl,--initial-memory=16777216 \
++    -o "$DIR/smallpt.wasm" \
++    "$DIR/smallpt.cpp"
++
++# Copy to public directory as well if present
++if [ -d "$DIR/public" ]; then
++    cp "$DIR/smallpt.wasm" "$DIR/public/smallpt.wasm"
++fi
++
++# Update base64 string in index.html if generator is present
++base64 -w 0 "$DIR/smallpt.wasm" > /tmp/smallpt.wasm.b64
++if [ -f "$DIR/scripts/generate_html.cjs" ]; then
++    node "$DIR/scripts/generate_html.cjs"
++fi
++
++echo "Successfully generated smallpt.wasm ($(stat -c%s "$DIR/smallpt.wasm") bytes)"
+diff --git a/index.html b/index.html
+new file mode 100644
+index 0000000..ecf08af
+--- /dev/null
++++ b/index.html
+@@ -0,0 +1,623 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="UTF-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <title>smallpt C++ Path Tracer in WebAssembly</title>
++  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>✨</text></svg>">
++  <style>
++    :root {
++      --bg: #0f172a;
++      --card-bg: #1e293b;
++      --border: #334155;
++      --text: #f8fafc;
++      --text-muted: #94a3b8;
++      --primary: #38bdf8;
++      --primary-hover: #0ea5e9;
++      --accent: #818cf8;
++      --success: #34d399;
++    }
++    * {
++      box-sizing: border-box;
++      margin: 0;
++      padding: 0;
++    }
++    body {
++      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
++      background: radial-gradient(circle at 50% 0%, #1e1b4b 0%, #0f172a 100%);
++      color: var(--text);
++      min-height: 100vh;
++      padding: 2rem 1rem;
++      display: flex;
++      flex-direction: column;
++      align-items: center;
++    }
++    .container {
++      max-width: 980px;
++      width: 100%;
++    }
++    header {
++      text-align: center;
++      margin-bottom: 2rem;
++    }
++    h1 {
++      font-size: 2.25rem;
++      font-weight: 800;
++      background: linear-gradient(to right, #38bdf8, #818cf8, #c084fc);
++      -webkit-background-clip: text;
++      -webkit-text-fill-color: transparent;
++      margin-bottom: 0.5rem;
++    }
++    .subtitle {
++      color: var(--text-muted);
++      font-size: 1.05rem;
++      max-width: 650px;
++      margin: 0 auto;
++      line-height: 1.5;
++    }
++    .badge {
++      display: inline-flex;
++      align-items: center;
++      gap: 0.4rem;
++      padding: 0.25rem 0.75rem;
++      border-radius: 9999px;
++      font-size: 0.8rem;
++      font-weight: 600;
++      background: rgba(56, 189, 248, 0.15);
++      color: var(--primary);
++      border: 1px solid rgba(56, 189, 248, 0.3);
++      margin-top: 0.75rem;
++    }
++    .badge .dot {
++      width: 8px;
++      height: 8px;
++      border-radius: 50%;
++      background: var(--success);
++      box-shadow: 0 0 8px var(--success);
++    }
++    .main-grid {
++      display: grid;
++      grid-template-columns: 1fr;
++      gap: 1.5rem;
++    }
++    @media (min-width: 840px) {
++      .main-grid {
++        grid-template-columns: 1fr 340px;
++      }
++    }
++    .card {
++      background: var(--card-bg);
++      border: 1px solid var(--border);
++      border-radius: 1rem;
++      padding: 1.5rem;
++      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5);
++    }
++    .viewport-card {
++      display: flex;
++      flex-direction: column;
++      align-items: center;
++    }
++    .canvas-wrapper {
++      position: relative;
++      background: #020617;
++      border: 2px solid var(--border);
++      border-radius: 0.75rem;
++      overflow: hidden;
++      display: flex;
++      justify-content: center;
++      align-items: center;
++      box-shadow: inset 0 2px 10px rgba(0,0,0,0.8), 0 0 20px rgba(56, 189, 248, 0.1);
++      width: 100%;
++      min-height: 280px;
++    }
++    canvas {
++      display: block;
++      max-width: 100%;
++      height: auto;
++      image-rendering: auto;
++    }
++    .progress-container {
++      width: 100%;
++      margin-top: 1rem;
++    }
++    .progress-bar-bg {
++      width: 100%;
++      height: 8px;
++      background: #334155;
++      border-radius: 9999px;
++      overflow: hidden;
++    }
++    .progress-bar-fill {
++      height: 100%;
++      width: 0%;
++      background: linear-gradient(90deg, var(--primary), var(--accent));
++      transition: width 0.1s linear;
++    }
++    .status-row {
++      display: flex;
++      justify-content: space-between;
++      margin-top: 0.5rem;
++      font-size: 0.85rem;
++      color: var(--text-muted);
++    }
++    .status-text {
++      color: var(--text);
++      font-weight: 500;
++    }
++    .sidebar {
++      display: flex;
++      flex-direction: column;
++      gap: 1.25rem;
++    }
++    .control-group {
++      display: flex;
++      flex-direction: column;
++      gap: 0.4rem;
++    }
++    label {
++      font-size: 0.85rem;
++      font-weight: 600;
++      color: var(--text-muted);
++      text-transform: uppercase;
++      letter-spacing: 0.05em;
++    }
++    select, button {
++      font-family: inherit;
++      border-radius: 0.5rem;
++      padding: 0.65rem 1rem;
++      font-size: 0.95rem;
++      transition: all 0.2s;
++    }
++    select {
++      background: #0f172a;
++      border: 1px solid var(--border);
++      color: var(--text);
++      outline: none;
++      cursor: pointer;
++    }
++    select:focus {
++      border-color: var(--primary);
++      box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.25);
++    }
++    .btn-primary {
++      background: linear-gradient(135deg, #0284c7 0%, #4f46e5 100%);
++      color: white;
++      border: none;
++      font-weight: 700;
++      cursor: pointer;
++      display: flex;
++      justify-content: center;
++      align-items: center;
++      gap: 0.5rem;
++      box-shadow: 0 4px 14px rgba(2, 132, 199, 0.4);
++    }
++    .btn-primary:hover:not(:disabled) {
++      filter: brightness(1.15);
++      transform: translateY(-1px);
++    }
++    .btn-primary:active:not(:disabled) {
++      transform: translateY(0);
++    }
++    .btn-secondary {
++      background: #0f172a;
++      border: 1px solid var(--border);
++      color: var(--text);
++      font-weight: 600;
++      cursor: pointer;
++    }
++    .btn-secondary:hover:not(:disabled) {
++      background: #1e293b;
++      border-color: var(--text-muted);
++    }
++    button:disabled {
++      opacity: 0.5;
++      cursor: not-allowed;
++    }
++    .sphere-swatches {
++      display: grid;
++      grid-template-columns: repeat(4, 1fr);
++      gap: 0.5rem;
++      margin-top: 0.25rem;
++    }
++    .swatch-item {
++      display: flex;
++      flex-direction: column;
++      align-items: center;
++      gap: 0.25rem;
++      font-size: 0.7rem;
++      color: var(--text-muted);
++    }
++    .swatch {
++      width: 100%;
++      height: 28px;
++      border-radius: 0.35rem;
++      border: 1px solid rgba(255, 255, 255, 0.2);
++      box-shadow: 0 2px 4px rgba(0,0,0,0.3);
++      transition: background-color 0.3s;
++    }
++    .info-card {
++      margin-top: 1.5rem;
++      background: rgba(30, 41, 59, 0.6);
++      border: 1px solid var(--border);
++      border-radius: 0.75rem;
++      padding: 1.25rem;
++      font-size: 0.9rem;
++      color: var(--text-muted);
++      line-height: 1.6;
++    }
++    .info-card h3 {
++      color: var(--text);
++      font-size: 1rem;
++      margin-bottom: 0.5rem;
++      display: flex;
++      align-items: center;
++      gap: 0.5rem;
++    }
++    .info-card a {
++      color: var(--primary);
++      text-decoration: none;
++    }
++    .info-card a:hover {
++      text-decoration: underline;
++    }
++    .info-grid {
++      display: grid;
++      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
++      gap: 0.75rem;
++      margin-top: 0.75rem;
++    }
++    .info-item {
++      background: #0f172a;
++      border: 1px solid var(--border);
++      padding: 0.5rem 0.75rem;
++      border-radius: 0.4rem;
++    }
++    .info-item span {
++      display: block;
++      font-size: 0.75rem;
++      color: var(--text-muted);
++    }
++    .info-item strong {
++      color: var(--text);
++      font-size: 0.85rem;
++    }
++  </style>
++</head>
++<body>
++  <div class="container">
++    <header>
++      <h1>smallpt WebAssembly Path Tracer</h1>
++      <p class="subtitle">
++        Kevin Beason's open-source 99-line C++ global illumination path tracer compiled to WebAssembly, running 100% client-side in your browser.
++      </p>
++      <div class="badge">
++        <span class="dot"></span>
++        <span id="wasm-badge">Initializing WebAssembly...</span>
++      </div>
++    </header>
++
++    <div class="main-grid">
++      <!-- Viewport / Canvas Area -->
++      <div class="card viewport-card">
++        <div class="canvas-wrapper">
++          <canvas id="pt-canvas" width="256" height="192"></canvas>
++        </div>
++
++        <div class="progress-container">
++          <div class="progress-bar-bg">
++            <div id="progress-fill" class="progress-bar-fill"></div>
++          </div>
++          <div class="status-row">
++            <span id="status-text" class="status-text">Ready</span>
++            <span id="timing-text">-- ms</span>
++          </div>
++        </div>
++      </div>
++
++      <!-- Controls Sidebar -->
++      <div class="card sidebar">
++        <div class="control-group">
++          <label>Actions</label>
++          <button id="btn-randomize" class="btn-primary" title="Randomize sphere & wall colors and re-render">
++            🎲 Randomize Sphere Colors
++          </button>
++        </div>
++
++        <div class="control-group" style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
++          <button id="btn-rerender" class="btn-secondary" title="Re-render with same colors and new random seed">
++            🔄 Re-render
++          </button>
++          <button id="btn-reset" class="btn-secondary" title="Reset to original Cornell Box colors">
++            ⏮️ Reset
++          </button>
++        </div>
++
++        <div class="control-group">
++          <label for="resolution-select">Resolution</label>
++          <select id="resolution-select">
++            <option value="160x120">160 × 120 (Fastest)</option>
++            <option value="256x192" selected>256 × 192 (Balanced)</option>
++            <option value="320x240">320 × 240 (Standard)</option>
++            <option value="400x300">400 × 300 (High Quality)</option>
++          </select>
++        </div>
++
++        <div class="control-group">
++          <label for="samples-select">Samples Per Pixel</label>
++          <select id="samples-select">
++            <option value="4">4 SPP (Fast preview)</option>
++            <option value="8" selected>8 SPP (Standard)</option>
++            <option value="16">16 SPP (Crisp)</option>
++            <option value="32">32 SPP (Smooth)</option>
++          </select>
++        </div>
++
++        <div class="control-group">
++          <label>Active Scene Colors</label>
++          <div class="sphere-swatches">
++            <div class="swatch-item">
++              <div id="swatch-left" class="swatch" style="background-color: rgb(191, 64, 64);"></div>
++              <span>Left Wall</span>
++            </div>
++            <div class="swatch-item">
++              <div id="swatch-right" class="swatch" style="background-color: rgb(64, 64, 191);"></div>
++              <span>Right Wall</span>
++            </div>
++            <div class="swatch-item">
++              <div id="swatch-mirror" class="swatch" style="background-color: rgb(255, 255, 255);"></div>
++              <span>Mirror</span>
++            </div>
++            <div class="swatch-item">
++              <div id="swatch-glass" class="swatch" style="background-color: rgb(255, 255, 255);"></div>
++              <span>Glass</span>
++            </div>
++          </div>
++        </div>
++
++        <div class="control-group">
++          <button id="btn-download" class="btn-secondary" title="Save current canvas image as PNG">
++            💾 Save PNG Image
++          </button>
++        </div>
++      </div>
++    </div>
++
++    <!-- Technical Details Card -->
++    <div class="info-card">
++      <h3>
++        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
++          <circle cx="12" cy="12" r="10"></circle>
++          <line x1="12" y1="16" x2="12" y2="12"></line>
++          <line x1="12" y1="8" x2="12.01" y2="8"></line>
++        </svg>
++        About This WebAssembly Port
++      </h3>
++      <p>
++        <strong>smallpt</strong> was created by <a href="http://www.kevinbeason.com/smallpt/" target="_blank" rel="noopener">Kevin Beason</a> as an educational C++ global illumination renderer supporting diffuse reflection, specular mirrors, Fresnel refraction (dielectric glass), and soft lighting via Monte Carlo path tracing.
++      </p>
++      <div class="info-grid">
++        <div class="info-item">
++          <span>Source Language</span>
++          <strong>C++ (smallpt.cpp)</strong>
++        </div>
++        <div class="info-item">
++          <span>Compiler</span>
++          <strong>LLVM Clang (wasm32)</strong>
++        </div>
++        <div class="info-item">
++          <span>Execution</span>
++          <strong>WebAssembly in Browser</strong>
++        </div>
++        <div class="info-item">
++          <span>Binary Size</span>
++          <strong>9.6 KB (.wasm)</strong>
++        </div>
++      </div>
++    </div>
++  </div>
++
++  <script>
++    // Embedded WASM bytecode fallback for file:// protocol or standalone environments
++    const WASM_FALLBACK_BASE64 = "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AAAAAAAAAAAAAAAAAAAAAAAAACuHFtnO9+8/K4cW2c737z8rhxbZzvfvPwIAAAAAAAAAAAAAAADAgkAAAAAAAABJQHE9CtejSoVAZmZmZmZmVEAAAAAAAAAoQAAAAAAAAChAAAAAAAAAKEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACIAgRuYW1lAA0Mc21hbGxwdC53YXNtAcoBCwAGanNfcG93ARFfX3dhc21fY2FsbF9jdG9ycwIqcmFkaWFuY2UoUmF5IGNvbnN0JiwgaW50LCB1bnNpZ25lZCBzaG9ydCopAxBnZXRfaW1hZ2VfYnVmZmVyBA9nZXRfbnVtX3NwaGVyZXMFEHNldF9zcGhlcmVfY29sb3IGEGdldF9zcGhlcmVfY29sb3IHE3Jlc2V0X3NwaGVyZV9jb2xvcnMIEHJhbmRvbWl6ZV9jb2xvcnMJCnJlbmRlcl9yb3cKBnJlbmRlcgcSAQAPX19zdGFja19wb2ludGVyCRECAAcucm9kYXRhAQUuZGF0YQB2CXByb2R1Y2VycwEMcHJvY2Vzc2VkLWJ5AQVjbGFuZ1YyMC4xLjMgKGh0dHBzOi8vZ2l0aHViLmNvbS9sbHZtL2xsdm0tcHJvamVjdCA5MjNhNWM0ZjgzZDJiMzY3NWJiODhlOWZlNDQxZGFlYWE0ZDY5NDg4KQCUAQ90YXJnZXRfZmVhdHVyZXMIKwtidWxrLW1lbW9yeSsPYnVsay1tZW1vcnktb3B0KxZjYWxsLWluZGlyZWN0LW92ZXJsb25nKwptdWx0aXZhbHVlKw9tdXRhYmxlLWdsb2JhbHMrE25vbnRyYXBwaW5nLWZwdG9pbnQrD3JlZmVyZW5jZS10eXBlcysIc2lnbi1leHQ=";
++
++    const canvas = document.getElementById("pt-canvas");
++    const ctx = canvas.getContext("2d");
++    const statusText = document.getElementById("status-text");
++    const timingText = document.getElementById("timing-text");
++    const progressFill = document.getElementById("progress-fill");
++    const wasmBadge = document.getElementById("wasm-badge");
++
++    const btnRandomize = document.getElementById("btn-randomize");
++    const btnRerender = document.getElementById("btn-rerender");
++    const btnReset = document.getElementById("btn-reset");
++    const btnDownload = document.getElementById("btn-download");
++    const resSelect = document.getElementById("resolution-select");
++    const sampsSelect = document.getElementById("samples-select");
++
++    const swatchLeft = document.getElementById("swatch-left");
++    const swatchRight = document.getElementById("swatch-right");
++    const swatchMirror = document.getElementById("swatch-mirror");
++    const swatchGlass = document.getElementById("swatch-glass");
++
++    let wasmInstance = null;
++    let isRendering = false;
++    let cancelRender = false;
++    let currentSeed = 1337;
++
++    // Load and instantiate WebAssembly
++    async function initWasm() {
++      const importObject = {
++        env: {
++          js_pow: Math.pow
++        }
++      };
++
++      try {
++        const resp = await fetch("smallpt.wasm");
++        if (resp.ok) {
++          const buf = await resp.arrayBuffer();
++          const { instance } = await WebAssembly.instantiate(buf, importObject);
++          wasmInstance = instance;
++          wasmBadge.textContent = "WebAssembly Ready (smallpt.wasm)";
++          return;
++        }
++      } catch (err) {
++        console.warn("fetch smallpt.wasm failed (likely file:// protocol), using embedded bytecode:", err);
++      }
++
++      // Decode base64
++      const binary = atob(WASM_FALLBACK_BASE64);
++      const bytes = new Uint8Array(binary.length);
++      for (let i = 0; i < binary.length; i++) {
++        bytes[i] = binary.charCodeAt(i);
++      }
++      const { instance } = await WebAssembly.instantiate(bytes.buffer, importObject);
++      wasmInstance = instance;
++      wasmBadge.textContent = "WebAssembly Ready (Client-Side WASM)";
++    }
++
++    function setSphereColor(id, r, g, b) {
++      if (!wasmInstance) return;
++      wasmInstance.exports.set_sphere_color(id, r, g, b);
++    }
++
++    function randomizeColors() {
++      if (!wasmInstance) return;
++      const rnd = () => Math.random();
++      
++      // Randomize Left Wall (0), Right Wall (1), Back Wall (2)
++      const lR = 0.2 + 0.7 * rnd(), lG = 0.1 + 0.6 * rnd(), lB = 0.1 + 0.6 * rnd();
++      const rR = 0.1 + 0.6 * rnd(), rG = 0.1 + 0.6 * rnd(), rB = 0.2 + 0.7 * rnd();
++      const bR = 0.3 + 0.6 * rnd(), bG = 0.3 + 0.6 * rnd(), bB = 0.3 + 0.6 * rnd();
++
++      // Mirror (6) and Glass (7) tints
++      const mR = 0.6 + 0.39 * rnd(), mG = 0.6 + 0.39 * rnd(), mB = 0.6 + 0.39 * rnd();
++      const gR = 0.6 + 0.39 * rnd(), gG = 0.6 + 0.39 * rnd(), gB = 0.6 + 0.39 * rnd();
++
++      setSphereColor(0, lR, lG, lB);
++      setSphereColor(1, rR, rG, rB);
++      setSphereColor(2, bR, bG, bB);
++      setSphereColor(6, mR, mG, mB);
++      setSphereColor(7, gR, gG, gB);
++
++      swatchLeft.style.backgroundColor = "rgb(" + Math.round(lR*255) + "," + Math.round(lG*255) + "," + Math.round(lB*255) + ")";
++      swatchRight.style.backgroundColor = "rgb(" + Math.round(rR*255) + "," + Math.round(rG*255) + "," + Math.round(rB*255) + ")";
++      swatchMirror.style.backgroundColor = "rgb(" + Math.round(mR*255) + "," + Math.round(mG*255) + "," + Math.round(mB*255) + ")";
++      swatchGlass.style.backgroundColor = "rgb(" + Math.round(gR*255) + "," + Math.round(gG*255) + "," + Math.round(gB*255) + ")";
++    }
++
++    function resetColors() {
++      if (!wasmInstance) return;
++      wasmInstance.exports.reset_sphere_colors();
++      swatchLeft.style.backgroundColor = "rgb(191, 64, 64)";
++      swatchRight.style.backgroundColor = "rgb(64, 64, 191)";
++      swatchMirror.style.backgroundColor = "rgb(255, 255, 255)";
++      swatchGlass.style.backgroundColor = "rgb(255, 255, 255)";
++    }
++
++    async function startRender() {
++      if (!wasmInstance || isRendering) return;
++      isRendering = true;
++      cancelRender = false;
++      btnRandomize.disabled = true;
++      btnRerender.disabled = true;
++      btnReset.disabled = true;
++
++      const [wStr, hStr] = resSelect.value.split("x");
++      const width = parseInt(wStr, 10);
++      const height = parseInt(hStr, 10);
++      const samps = parseInt(sampsSelect.value, 10);
++
++      canvas.width = width;
++      canvas.height = height;
++
++      statusText.textContent = "Rendering " + width + "×" + height + " (" + samps + " spp)...";
++      progressFill.style.width = "0%";
++      const startTime = performance.now();
++
++      currentSeed = (currentSeed * 1664525 + 1013904223) >>> 0;
++
++      const memPtr = wasmInstance.exports.get_image_buffer();
++      const linesPerFrame = Math.max(2, Math.floor(height / 24));
++      let currentY = 0;
++
++      function renderBatch() {
++        if (cancelRender) {
++          isRendering = false;
++          btnRandomize.disabled = false;
++          btnRerender.disabled = false;
++          btnReset.disabled = false;
++          statusText.textContent = "Cancelled";
++          return;
++        }
++
++        const endY = Math.min(currentY + linesPerFrame, height);
++        for (; currentY < endY; currentY++) {
++          wasmInstance.exports.render_row(currentY, width, height, samps, currentSeed);
++        }
++
++        // Blit to canvas
++        const pixelData = new Uint8ClampedArray(
++          wasmInstance.exports.memory.buffer,
++          memPtr,
++          width * height * 4
++        );
++        const imgData = new ImageData(pixelData, width, height);
++        ctx.putImageData(imgData, 0, 0);
++
++        const pct = Math.floor((currentY / height) * 100);
++        progressFill.style.width = pct + "%";
++        timingText.textContent = Math.round(performance.now() - startTime) + " ms";
++
++        if (currentY < height) {
++          requestAnimationFrame(renderBatch);
++        } else {
++          isRendering = false;
++          btnRandomize.disabled = false;
++          btnRerender.disabled = false;
++          btnReset.disabled = false;
++          const totalTime = Math.round(performance.now() - startTime);
++          statusText.textContent = "Done in " + totalTime + " ms (" + width + "×" + height + ", " + samps + " spp)";
++          progressFill.style.width = "100%";
++        }
++      }
++
++      requestAnimationFrame(renderBatch);
++    }
++
++    btnRandomize.addEventListener("click", () => {
++      randomizeColors();
++      startRender();
++    });
++
++    btnRerender.addEventListener("click", () => {
++      startRender();
++    });
++
++    btnReset.addEventListener("click", () => {
++      resetColors();
++      startRender();
++    });
++
++    resSelect.addEventListener("change", () => {
++      startRender();
++    });
++
++    sampsSelect.addEventListener("change", () => {
++      startRender();
++    });
++
++    btnDownload.addEventListener("click", () => {
++      const link = document.createElement("a");
++      link.download = "smallpt-" + canvas.width + "x" + canvas.height + ".png";
++      link.href = canvas.toDataURL("image/png");
++      link.click();
++    });
++
++    // Initialize and run initial render
++    initWasm().then(() => {
++      startRender();
++    });
++  </script>
++</body>
++</html>
+diff --git a/package.json b/package.json
+index bfffcf0..f2bd773 100644
+--- a/package.json
++++ b/package.json
+@@ -4,6 +4,7 @@
+   "version": "0.0.1",
+   "scripts": {
+     "dev": "astro dev",
++    "build:wasm": "./build.sh",
+     "start": "HOST=0.0.0.0 PORT=${PORT:-11224} node ./dist/server/entry.mjs",
+     "build": "astro build",
+     "preview": "astro preview",
+diff --git a/public/index.html b/public/index.html
+new file mode 100644
+index 0000000..ecf08af
+--- /dev/null
++++ b/public/index.html
+@@ -0,0 +1,623 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="UTF-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <title>smallpt C++ Path Tracer in WebAssembly</title>
++  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>✨</text></svg>">
++  <style>
++    :root {
++      --bg: #0f172a;
++      --card-bg: #1e293b;
++      --border: #334155;
++      --text: #f8fafc;
++      --text-muted: #94a3b8;
++      --primary: #38bdf8;
++      --primary-hover: #0ea5e9;
++      --accent: #818cf8;
++      --success: #34d399;
++    }
++    * {
++      box-sizing: border-box;
++      margin: 0;
++      padding: 0;
++    }
++    body {
++      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
++      background: radial-gradient(circle at 50% 0%, #1e1b4b 0%, #0f172a 100%);
++      color: var(--text);
++      min-height: 100vh;
++      padding: 2rem 1rem;
++      display: flex;
++      flex-direction: column;
++      align-items: center;
++    }
++    .container {
++      max-width: 980px;
++      width: 100%;
++    }
++    header {
++      text-align: center;
++      margin-bottom: 2rem;
++    }
++    h1 {
++      font-size: 2.25rem;
++      font-weight: 800;
++      background: linear-gradient(to right, #38bdf8, #818cf8, #c084fc);
++      -webkit-background-clip: text;
++      -webkit-text-fill-color: transparent;
++      margin-bottom: 0.5rem;
++    }
++    .subtitle {
++      color: var(--text-muted);
++      font-size: 1.05rem;
++      max-width: 650px;
++      margin: 0 auto;
++      line-height: 1.5;
++    }
++    .badge {
++      display: inline-flex;
++      align-items: center;
++      gap: 0.4rem;
++      padding: 0.25rem 0.75rem;
++      border-radius: 9999px;
++      font-size: 0.8rem;
++      font-weight: 600;
++      background: rgba(56, 189, 248, 0.15);
++      color: var(--primary);
++      border: 1px solid rgba(56, 189, 248, 0.3);
++      margin-top: 0.75rem;
++    }
++    .badge .dot {
++      width: 8px;
++      height: 8px;
++      border-radius: 50%;
++      background: var(--success);
++      box-shadow: 0 0 8px var(--success);
++    }
++    .main-grid {
++      display: grid;
++      grid-template-columns: 1fr;
++      gap: 1.5rem;
++    }
++    @media (min-width: 840px) {
++      .main-grid {
++        grid-template-columns: 1fr 340px;
++      }
++    }
++    .card {
++      background: var(--card-bg);
++      border: 1px solid var(--border);
++      border-radius: 1rem;
++      padding: 1.5rem;
++      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5);
++    }
++    .viewport-card {
++      display: flex;
++      flex-direction: column;
++      align-items: center;
++    }
++    .canvas-wrapper {
++      position: relative;
++      background: #020617;
++      border: 2px solid var(--border);
++      border-radius: 0.75rem;
++      overflow: hidden;
++      display: flex;
++      justify-content: center;
++      align-items: center;
++      box-shadow: inset 0 2px 10px rgba(0,0,0,0.8), 0 0 20px rgba(56, 189, 248, 0.1);
++      width: 100%;
++      min-height: 280px;
++    }
++    canvas {
++      display: block;
++      max-width: 100%;
++      height: auto;
++      image-rendering: auto;
++    }
++    .progress-container {
++      width: 100%;
++      margin-top: 1rem;
++    }
++    .progress-bar-bg {
++      width: 100%;
++      height: 8px;
++      background: #334155;
++      border-radius: 9999px;
++      overflow: hidden;
++    }
++    .progress-bar-fill {
++      height: 100%;
++      width: 0%;
++      background: linear-gradient(90deg, var(--primary), var(--accent));
++      transition: width 0.1s linear;
++    }
++    .status-row {
++      display: flex;
++      justify-content: space-between;
++      margin-top: 0.5rem;
++      font-size: 0.85rem;
++      color: var(--text-muted);
++    }
++    .status-text {
++      color: var(--text);
++      font-weight: 500;
++    }
++    .sidebar {
++      display: flex;
++      flex-direction: column;
++      gap: 1.25rem;
++    }
++    .control-group {
++      display: flex;
++      flex-direction: column;
++      gap: 0.4rem;
++    }
++    label {
++      font-size: 0.85rem;
++      font-weight: 600;
++      color: var(--text-muted);
++      text-transform: uppercase;
++      letter-spacing: 0.05em;
++    }
++    select, button {
++      font-family: inherit;
++      border-radius: 0.5rem;
++      padding: 0.65rem 1rem;
++      font-size: 0.95rem;
++      transition: all 0.2s;
++    }
++    select {
++      background: #0f172a;
++      border: 1px solid var(--border);
++      color: var(--text);
++      outline: none;
++      cursor: pointer;
++    }
++    select:focus {
++      border-color: var(--primary);
++      box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.25);
++    }
++    .btn-primary {
++      background: linear-gradient(135deg, #0284c7 0%, #4f46e5 100%);
++      color: white;
++      border: none;
++      font-weight: 700;
++      cursor: pointer;
++      display: flex;
++      justify-content: center;
++      align-items: center;
++      gap: 0.5rem;
++      box-shadow: 0 4px 14px rgba(2, 132, 199, 0.4);
++    }
++    .btn-primary:hover:not(:disabled) {
++      filter: brightness(1.15);
++      transform: translateY(-1px);
++    }
++    .btn-primary:active:not(:disabled) {
++      transform: translateY(0);
++    }
++    .btn-secondary {
++      background: #0f172a;
++      border: 1px solid var(--border);
++      color: var(--text);
++      font-weight: 600;
++      cursor: pointer;
++    }
++    .btn-secondary:hover:not(:disabled) {
++      background: #1e293b;
++      border-color: var(--text-muted);
++    }
++    button:disabled {
++      opacity: 0.5;
++      cursor: not-allowed;
++    }
++    .sphere-swatches {
++      display: grid;
++      grid-template-columns: repeat(4, 1fr);
++      gap: 0.5rem;
++      margin-top: 0.25rem;
++    }
++    .swatch-item {
++      display: flex;
++      flex-direction: column;
++      align-items: center;
++      gap: 0.25rem;
++      font-size: 0.7rem;
++      color: var(--text-muted);
++    }
++    .swatch {
++      width: 100%;
++      height: 28px;
++      border-radius: 0.35rem;
++      border: 1px solid rgba(255, 255, 255, 0.2);
++      box-shadow: 0 2px 4px rgba(0,0,0,0.3);
++      transition: background-color 0.3s;
++    }
++    .info-card {
++      margin-top: 1.5rem;
++      background: rgba(30, 41, 59, 0.6);
++      border: 1px solid var(--border);
++      border-radius: 0.75rem;
++      padding: 1.25rem;
++      font-size: 0.9rem;
++      color: var(--text-muted);
++      line-height: 1.6;
++    }
++    .info-card h3 {
++      color: var(--text);
++      font-size: 1rem;
++      margin-bottom: 0.5rem;
++      display: flex;
++      align-items: center;
++      gap: 0.5rem;
++    }
++    .info-card a {
++      color: var(--primary);
++      text-decoration: none;
++    }
++    .info-card a:hover {
++      text-decoration: underline;
++    }
++    .info-grid {
++      display: grid;
++      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
++      gap: 0.75rem;
++      margin-top: 0.75rem;
++    }
++    .info-item {
++      background: #0f172a;
++      border: 1px solid var(--border);
++      padding: 0.5rem 0.75rem;
++      border-radius: 0.4rem;
++    }
++    .info-item span {
++      display: block;
++      font-size: 0.75rem;
++      color: var(--text-muted);
++    }
++    .info-item strong {
++      color: var(--text);
++      font-size: 0.85rem;
++    }
++  </style>
++</head>
++<body>
++  <div class="container">
++    <header>
++      <h1>smallpt WebAssembly Path Tracer</h1>
++      <p class="subtitle">
++        Kevin Beason's open-source 99-line C++ global illumination path tracer compiled to WebAssembly, running 100% client-side in your browser.
++      </p>
++      <div class="badge">
++        <span class="dot"></span>
++        <span id="wasm-badge">Initializing WebAssembly...</span>
++      </div>
++    </header>
++
++    <div class="main-grid">
++      <!-- Viewport / Canvas Area -->
++      <div class="card viewport-card">
++        <div class="canvas-wrapper">
++          <canvas id="pt-canvas" width="256" height="192"></canvas>
++        </div>
++
++        <div class="progress-container">
++          <div class="progress-bar-bg">
++            <div id="progress-fill" class="progress-bar-fill"></div>
++          </div>
++          <div class="status-row">
++            <span id="status-text" class="status-text">Ready</span>
++            <span id="timing-text">-- ms</span>
++          </div>
++        </div>
++      </div>
++
++      <!-- Controls Sidebar -->
++      <div class="card sidebar">
++        <div class="control-group">
++          <label>Actions</label>
++          <button id="btn-randomize" class="btn-primary" title="Randomize sphere & wall colors and re-render">
++            🎲 Randomize Sphere Colors
++          </button>
++        </div>
++
++        <div class="control-group" style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
++          <button id="btn-rerender" class="btn-secondary" title="Re-render with same colors and new random seed">
++            🔄 Re-render
++          </button>
++          <button id="btn-reset" class="btn-secondary" title="Reset to original Cornell Box colors">
++            ⏮️ Reset
++          </button>
++        </div>
++
++        <div class="control-group">
++          <label for="resolution-select">Resolution</label>
++          <select id="resolution-select">
++            <option value="160x120">160 × 120 (Fastest)</option>
++            <option value="256x192" selected>256 × 192 (Balanced)</option>
++            <option value="320x240">320 × 240 (Standard)</option>
++            <option value="400x300">400 × 300 (High Quality)</option>
++          </select>
++        </div>
++
++        <div class="control-group">
++          <label for="samples-select">Samples Per Pixel</label>
++          <select id="samples-select">
++            <option value="4">4 SPP (Fast preview)</option>
++            <option value="8" selected>8 SPP (Standard)</option>
++            <option value="16">16 SPP (Crisp)</option>
++            <option value="32">32 SPP (Smooth)</option>
++          </select>
++        </div>
++
++        <div class="control-group">
++          <label>Active Scene Colors</label>
++          <div class="sphere-swatches">
++            <div class="swatch-item">
++              <div id="swatch-left" class="swatch" style="background-color: rgb(191, 64, 64);"></div>
++              <span>Left Wall</span>
++            </div>
++            <div class="swatch-item">
++              <div id="swatch-right" class="swatch" style="background-color: rgb(64, 64, 191);"></div>
++              <span>Right Wall</span>
++            </div>
++            <div class="swatch-item">
++              <div id="swatch-mirror" class="swatch" style="background-color: rgb(255, 255, 255);"></div>
++              <span>Mirror</span>
++            </div>
++            <div class="swatch-item">
++              <div id="swatch-glass" class="swatch" style="background-color: rgb(255, 255, 255);"></div>
++              <span>Glass</span>
++            </div>
++          </div>
++        </div>
++
++        <div class="control-group">
++          <button id="btn-download" class="btn-secondary" title="Save current canvas image as PNG">
++            💾 Save PNG Image
++          </button>
++        </div>
++      </div>
++    </div>
++
++    <!-- Technical Details Card -->
++    <div class="info-card">
++      <h3>
++        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
++          <circle cx="12" cy="12" r="10"></circle>
++          <line x1="12" y1="16" x2="12" y2="12"></line>
++          <line x1="12" y1="8" x2="12.01" y2="8"></line>
++        </svg>
++        About This WebAssembly Port
++      </h3>
++      <p>
++        <strong>smallpt</strong> was created by <a href="http://www.kevinbeason.com/smallpt/" target="_blank" rel="noopener">Kevin Beason</a> as an educational C++ global illumination renderer supporting diffuse reflection, specular mirrors, Fresnel refraction (dielectric glass), and soft lighting via Monte Carlo path tracing.
++      </p>
++      <div class="info-grid">
++        <div class="info-item">
++          <span>Source Language</span>
++          <strong>C++ (smallpt.cpp)</strong>
++        </div>
++        <div class="info-item">
++          <span>Compiler</span>
++          <strong>LLVM Clang (wasm32)</strong>
++        </div>
++        <div class="info-item">
++          <span>Execution</span>
++          <strong>WebAssembly in Browser</strong>
++        </div>
++        <div class="info-item">
++          <span>Binary Size</span>
++          <strong>9.6 KB (.wasm)</strong>
++        </div>
++      </div>
++    </div>
++  </div>
++
++  <script>
++    // Embedded WASM bytecode fallback for file:// protocol or standalone environments
++    const WASM_FALLBACK_BASE64 = "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AAAAAAAAAAAAAAAAAAAAAAAAACuHFtnO9+8/K4cW2c737z8rhxbZzvfvPwIAAAAAAAAAAAAAAADAgkAAAAAAAABJQHE9CtejSoVAZmZmZmZmVEAAAAAAAAAoQAAAAAAAAChAAAAAAAAAKEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACIAgRuYW1lAA0Mc21hbGxwdC53YXNtAcoBCwAGanNfcG93ARFfX3dhc21fY2FsbF9jdG9ycwIqcmFkaWFuY2UoUmF5IGNvbnN0JiwgaW50LCB1bnNpZ25lZCBzaG9ydCopAxBnZXRfaW1hZ2VfYnVmZmVyBA9nZXRfbnVtX3NwaGVyZXMFEHNldF9zcGhlcmVfY29sb3IGEGdldF9zcGhlcmVfY29sb3IHE3Jlc2V0X3NwaGVyZV9jb2xvcnMIEHJhbmRvbWl6ZV9jb2xvcnMJCnJlbmRlcl9yb3cKBnJlbmRlcgcSAQAPX19zdGFja19wb2ludGVyCRECAAcucm9kYXRhAQUuZGF0YQB2CXByb2R1Y2VycwEMcHJvY2Vzc2VkLWJ5AQVjbGFuZ1YyMC4xLjMgKGh0dHBzOi8vZ2l0aHViLmNvbS9sbHZtL2xsdm0tcHJvamVjdCA5MjNhNWM0ZjgzZDJiMzY3NWJiODhlOWZlNDQxZGFlYWE0ZDY5NDg4KQCUAQ90YXJnZXRfZmVhdHVyZXMIKwtidWxrLW1lbW9yeSsPYnVsay1tZW1vcnktb3B0KxZjYWxsLWluZGlyZWN0LW92ZXJsb25nKwptdWx0aXZhbHVlKw9tdXRhYmxlLWdsb2JhbHMrE25vbnRyYXBwaW5nLWZwdG9pbnQrD3JlZmVyZW5jZS10eXBlcysIc2lnbi1leHQ=";
++
++    const canvas = document.getElementById("pt-canvas");
++    const ctx = canvas.getContext("2d");
++    const statusText = document.getElementById("status-text");
++    const timingText = document.getElementById("timing-text");
++    const progressFill = document.getElementById("progress-fill");
++    const wasmBadge = document.getElementById("wasm-badge");
++
++    const btnRandomize = document.getElementById("btn-randomize");
++    const btnRerender = document.getElementById("btn-rerender");
++    const btnReset = document.getElementById("btn-reset");
++    const btnDownload = document.getElementById("btn-download");
++    const resSelect = document.getElementById("resolution-select");
++    const sampsSelect = document.getElementById("samples-select");
++
++    const swatchLeft = document.getElementById("swatch-left");
++    const swatchRight = document.getElementById("swatch-right");
++    const swatchMirror = document.getElementById("swatch-mirror");
++    const swatchGlass = document.getElementById("swatch-glass");
++
++    let wasmInstance = null;
++    let isRendering = false;
++    let cancelRender = false;
++    let currentSeed = 1337;
++
++    // Load and instantiate WebAssembly
++    async function initWasm() {
++      const importObject = {
++        env: {
++          js_pow: Math.pow
++        }
++      };
++
++      try {
++        const resp = await fetch("smallpt.wasm");
++        if (resp.ok) {
++          const buf = await resp.arrayBuffer();
++          const { instance } = await WebAssembly.instantiate(buf, importObject);
++          wasmInstance = instance;
++          wasmBadge.textContent = "WebAssembly Ready (smallpt.wasm)";
++          return;
++        }
++      } catch (err) {
++        console.warn("fetch smallpt.wasm failed (likely file:// protocol), using embedded bytecode:", err);
++      }
++
++      // Decode base64
++      const binary = atob(WASM_FALLBACK_BASE64);
++      const bytes = new Uint8Array(binary.length);
++      for (let i = 0; i < binary.length; i++) {
++        bytes[i] = binary.charCodeAt(i);
++      }
++      const { instance } = await WebAssembly.instantiate(bytes.buffer, importObject);
++      wasmInstance = instance;
++      wasmBadge.textContent = "WebAssembly Ready (Client-Side WASM)";
++    }
++
++    function setSphereColor(id, r, g, b) {
++      if (!wasmInstance) return;
++      wasmInstance.exports.set_sphere_color(id, r, g, b);
++    }
++
++    function randomizeColors() {
++      if (!wasmInstance) return;
++      const rnd = () => Math.random();
++      
++      // Randomize Left Wall (0), Right Wall (1), Back Wall (2)
++      const lR = 0.2 + 0.7 * rnd(), lG = 0.1 + 0.6 * rnd(), lB = 0.1 + 0.6 * rnd();
++      const rR = 0.1 + 0.6 * rnd(), rG = 0.1 + 0.6 * rnd(), rB = 0.2 + 0.7 * rnd();
++      const bR = 0.3 + 0.6 * rnd(), bG = 0.3 + 0.6 * rnd(), bB = 0.3 + 0.6 * rnd();
++
++      // Mirror (6) and Glass (7) tints
++      const mR = 0.6 + 0.39 * rnd(), mG = 0.6 + 0.39 * rnd(), mB = 0.6 + 0.39 * rnd();
++      const gR = 0.6 + 0.39 * rnd(), gG = 0.6 + 0.39 * rnd(), gB = 0.6 + 0.39 * rnd();
++
++      setSphereColor(0, lR, lG, lB);
++      setSphereColor(1, rR, rG, rB);
++      setSphereColor(2, bR, bG, bB);
++      setSphereColor(6, mR, mG, mB);
++      setSphereColor(7, gR, gG, gB);
++
++      swatchLeft.style.backgroundColor = "rgb(" + Math.round(lR*255) + "," + Math.round(lG*255) + "," + Math.round(lB*255) + ")";
++      swatchRight.style.backgroundColor = "rgb(" + Math.round(rR*255) + "," + Math.round(rG*255) + "," + Math.round(rB*255) + ")";
++      swatchMirror.style.backgroundColor = "rgb(" + Math.round(mR*255) + "," + Math.round(mG*255) + "," + Math.round(mB*255) + ")";
++      swatchGlass.style.backgroundColor = "rgb(" + Math.round(gR*255) + "," + Math.round(gG*255) + "," + Math.round(gB*255) + ")";
++    }
++
++    function resetColors() {
++      if (!wasmInstance) return;
++      wasmInstance.exports.reset_sphere_colors();
++      swatchLeft.style.backgroundColor = "rgb(191, 64, 64)";
++      swatchRight.style.backgroundColor = "rgb(64, 64, 191)";
++      swatchMirror.style.backgroundColor = "rgb(255, 255, 255)";
++      swatchGlass.style.backgroundColor = "rgb(255, 255, 255)";
++    }
++
++    async function startRender() {
++      if (!wasmInstance || isRendering) return;
++      isRendering = true;
++      cancelRender = false;
++      btnRandomize.disabled = true;
++      btnRerender.disabled = true;
++      btnReset.disabled = true;
++
++      const [wStr, hStr] = resSelect.value.split("x");
++      const width = parseInt(wStr, 10);
++      const height = parseInt(hStr, 10);
++      const samps = parseInt(sampsSelect.value, 10);
++
++      canvas.width = width;
++      canvas.height = height;
++
++      statusText.textContent = "Rendering " + width + "×" + height + " (" + samps + " spp)...";
++      progressFill.style.width = "0%";
++      const startTime = performance.now();
++
++      currentSeed = (currentSeed * 1664525 + 1013904223) >>> 0;
++
++      const memPtr = wasmInstance.exports.get_image_buffer();
++      const linesPerFrame = Math.max(2, Math.floor(height / 24));
++      let currentY = 0;
++
++      function renderBatch() {
++        if (cancelRender) {
++          isRendering = false;
++          btnRandomize.disabled = false;
++          btnRerender.disabled = false;
++          btnReset.disabled = false;
++          statusText.textContent = "Cancelled";
++          return;
++        }
++
++        const endY = Math.min(currentY + linesPerFrame, height);
++        for (; currentY < endY; currentY++) {
++          wasmInstance.exports.render_row(currentY, width, height, samps, currentSeed);
++        }
++
++        // Blit to canvas
++        const pixelData = new Uint8ClampedArray(
++          wasmInstance.exports.memory.buffer,
++          memPtr,
++          width * height * 4
++        );
++        const imgData = new ImageData(pixelData, width, height);
++        ctx.putImageData(imgData, 0, 0);
++
++        const pct = Math.floor((currentY / height) * 100);
++        progressFill.style.width = pct + "%";
++        timingText.textContent = Math.round(performance.now() - startTime) + " ms";
++
++        if (currentY < height) {
++          requestAnimationFrame(renderBatch);
++        } else {
++          isRendering = false;
++          btnRandomize.disabled = false;
++          btnRerender.disabled = false;
++          btnReset.disabled = false;
++          const totalTime = Math.round(performance.now() - startTime);
++          statusText.textContent = "Done in " + totalTime + " ms (" + width + "×" + height + ", " + samps + " spp)";
++          progressFill.style.width = "100%";
++        }
++      }
++
++      requestAnimationFrame(renderBatch);
++    }
++
++    btnRandomize.addEventListener("click", () => {
++      randomizeColors();
++      startRender();
++    });
++
++    btnRerender.addEventListener("click", () => {
++      startRender();
++    });
++
++    btnReset.addEventListener("click", () => {
++      resetColors();
++      startRender();
++    });
++
++    resSelect.addEventListener("change", () => {
++      startRender();
++    });
++
++    sampsSelect.addEventListener("change", () => {
++      startRender();
++    });
++
++    btnDownload.addEventListener("click", () => {
++      const link = document.createElement("a");
++      link.download = "smallpt-" + canvas.width + "x" + canvas.height + ".png";
++      link.href = canvas.toDataURL("image/png");
++      link.click();
++    });
++
++    // Initialize and run initial render
++    initWasm().then(() => {
++      startRender();
++    });
++  </script>
++</body>
++</html>
+diff --git a/public/smallpt.wasm b/public/smallpt.wasm
+new file mode 100755
+index 0000000..f137b3f
+Binary files /dev/null and b/public/smallpt.wasm differ
+diff --git a/scripts/generate_html.cjs b/scripts/generate_html.cjs
+new file mode 100644
+index 0000000..955b63f
+--- /dev/null
++++ b/scripts/generate_html.cjs
+@@ -0,0 +1,636 @@
++const fs = require("fs");
++const path = require("path");
++
++const baseDir = "/tmp/ghh-antigravity-cli-c1ec2549/base_app";
++const wasmBase64 = fs.readFileSync("/tmp/smallpt.wasm.b64", "utf8").trim();
++
++const html = `<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="UTF-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <title>smallpt C++ Path Tracer in WebAssembly</title>
++  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>✨</text></svg>">
++  <style>
++    :root {
++      --bg: #0f172a;
++      --card-bg: #1e293b;
++      --border: #334155;
++      --text: #f8fafc;
++      --text-muted: #94a3b8;
++      --primary: #38bdf8;
++      --primary-hover: #0ea5e9;
++      --accent: #818cf8;
++      --success: #34d399;
++    }
++    * {
++      box-sizing: border-box;
++      margin: 0;
++      padding: 0;
++    }
++    body {
++      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
++      background: radial-gradient(circle at 50% 0%, #1e1b4b 0%, #0f172a 100%);
++      color: var(--text);
++      min-height: 100vh;
++      padding: 2rem 1rem;
++      display: flex;
++      flex-direction: column;
++      align-items: center;
++    }
++    .container {
++      max-width: 980px;
++      width: 100%;
++    }
++    header {
++      text-align: center;
++      margin-bottom: 2rem;
++    }
++    h1 {
++      font-size: 2.25rem;
++      font-weight: 800;
++      background: linear-gradient(to right, #38bdf8, #818cf8, #c084fc);
++      -webkit-background-clip: text;
++      -webkit-text-fill-color: transparent;
++      margin-bottom: 0.5rem;
++    }
++    .subtitle {
++      color: var(--text-muted);
++      font-size: 1.05rem;
++      max-width: 650px;
++      margin: 0 auto;
++      line-height: 1.5;
++    }
++    .badge {
++      display: inline-flex;
++      align-items: center;
++      gap: 0.4rem;
++      padding: 0.25rem 0.75rem;
++      border-radius: 9999px;
++      font-size: 0.8rem;
++      font-weight: 600;
++      background: rgba(56, 189, 248, 0.15);
++      color: var(--primary);
++      border: 1px solid rgba(56, 189, 248, 0.3);
++      margin-top: 0.75rem;
++    }
++    .badge .dot {
++      width: 8px;
++      height: 8px;
++      border-radius: 50%;
++      background: var(--success);
++      box-shadow: 0 0 8px var(--success);
++    }
++    .main-grid {
++      display: grid;
++      grid-template-columns: 1fr;
++      gap: 1.5rem;
++    }
++    @media (min-width: 840px) {
++      .main-grid {
++        grid-template-columns: 1fr 340px;
++      }
++    }
++    .card {
++      background: var(--card-bg);
++      border: 1px solid var(--border);
++      border-radius: 1rem;
++      padding: 1.5rem;
++      box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5);
++    }
++    .viewport-card {
++      display: flex;
++      flex-direction: column;
++      align-items: center;
++    }
++    .canvas-wrapper {
++      position: relative;
++      background: #020617;
++      border: 2px solid var(--border);
++      border-radius: 0.75rem;
++      overflow: hidden;
++      display: flex;
++      justify-content: center;
++      align-items: center;
++      box-shadow: inset 0 2px 10px rgba(0,0,0,0.8), 0 0 20px rgba(56, 189, 248, 0.1);
++      width: 100%;
++      min-height: 280px;
++    }
++    canvas {
++      display: block;
++      max-width: 100%;
++      height: auto;
++      image-rendering: auto;
++    }
++    .progress-container {
++      width: 100%;
++      margin-top: 1rem;
++    }
++    .progress-bar-bg {
++      width: 100%;
++      height: 8px;
++      background: #334155;
++      border-radius: 9999px;
++      overflow: hidden;
++    }
++    .progress-bar-fill {
++      height: 100%;
++      width: 0%;
++      background: linear-gradient(90deg, var(--primary), var(--accent));
++      transition: width 0.1s linear;
++    }
++    .status-row {
++      display: flex;
++      justify-content: space-between;
++      margin-top: 0.5rem;
++      font-size: 0.85rem;
++      color: var(--text-muted);
++    }
++    .status-text {
++      color: var(--text);
++      font-weight: 500;
++    }
++    .sidebar {
++      display: flex;
++      flex-direction: column;
++      gap: 1.25rem;
++    }
++    .control-group {
++      display: flex;
++      flex-direction: column;
++      gap: 0.4rem;
++    }
++    label {
++      font-size: 0.85rem;
++      font-weight: 600;
++      color: var(--text-muted);
++      text-transform: uppercase;
++      letter-spacing: 0.05em;
++    }
++    select, button {
++      font-family: inherit;
++      border-radius: 0.5rem;
++      padding: 0.65rem 1rem;
++      font-size: 0.95rem;
++      transition: all 0.2s;
++    }
++    select {
++      background: #0f172a;
++      border: 1px solid var(--border);
++      color: var(--text);
++      outline: none;
++      cursor: pointer;
++    }
++    select:focus {
++      border-color: var(--primary);
++      box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.25);
++    }
++    .btn-primary {
++      background: linear-gradient(135deg, #0284c7 0%, #4f46e5 100%);
++      color: white;
++      border: none;
++      font-weight: 700;
++      cursor: pointer;
++      display: flex;
++      justify-content: center;
++      align-items: center;
++      gap: 0.5rem;
++      box-shadow: 0 4px 14px rgba(2, 132, 199, 0.4);
++    }
++    .btn-primary:hover:not(:disabled) {
++      filter: brightness(1.15);
++      transform: translateY(-1px);
++    }
++    .btn-primary:active:not(:disabled) {
++      transform: translateY(0);
++    }
++    .btn-secondary {
++      background: #0f172a;
++      border: 1px solid var(--border);
++      color: var(--text);
++      font-weight: 600;
++      cursor: pointer;
++    }
++    .btn-secondary:hover:not(:disabled) {
++      background: #1e293b;
++      border-color: var(--text-muted);
++    }
++    button:disabled {
++      opacity: 0.5;
++      cursor: not-allowed;
++    }
++    .sphere-swatches {
++      display: grid;
++      grid-template-columns: repeat(4, 1fr);
++      gap: 0.5rem;
++      margin-top: 0.25rem;
++    }
++    .swatch-item {
++      display: flex;
++      flex-direction: column;
++      align-items: center;
++      gap: 0.25rem;
++      font-size: 0.7rem;
++      color: var(--text-muted);
++    }
++    .swatch {
++      width: 100%;
++      height: 28px;
++      border-radius: 0.35rem;
++      border: 1px solid rgba(255, 255, 255, 0.2);
++      box-shadow: 0 2px 4px rgba(0,0,0,0.3);
++      transition: background-color 0.3s;
++    }
++    .info-card {
++      margin-top: 1.5rem;
++      background: rgba(30, 41, 59, 0.6);
++      border: 1px solid var(--border);
++      border-radius: 0.75rem;
++      padding: 1.25rem;
++      font-size: 0.9rem;
++      color: var(--text-muted);
++      line-height: 1.6;
++    }
++    .info-card h3 {
++      color: var(--text);
++      font-size: 1rem;
++      margin-bottom: 0.5rem;
++      display: flex;
++      align-items: center;
++      gap: 0.5rem;
++    }
++    .info-card a {
++      color: var(--primary);
++      text-decoration: none;
++    }
++    .info-card a:hover {
++      text-decoration: underline;
++    }
++    .info-grid {
++      display: grid;
++      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
++      gap: 0.75rem;
++      margin-top: 0.75rem;
++    }
++    .info-item {
++      background: #0f172a;
++      border: 1px solid var(--border);
++      padding: 0.5rem 0.75rem;
++      border-radius: 0.4rem;
++    }
++    .info-item span {
++      display: block;
++      font-size: 0.75rem;
++      color: var(--text-muted);
++    }
++    .info-item strong {
++      color: var(--text);
++      font-size: 0.85rem;
++    }
++  </style>
++</head>
++<body>
++  <div class="container">
++    <header>
++      <h1>smallpt WebAssembly Path Tracer</h1>
++      <p class="subtitle">
++        Kevin Beason's open-source 99-line C++ global illumination path tracer compiled to WebAssembly, running 100% client-side in your browser.
++      </p>
++      <div class="badge">
++        <span class="dot"></span>
++        <span id="wasm-badge">Initializing WebAssembly...</span>
++      </div>
++    </header>
++
++    <div class="main-grid">
++      <!-- Viewport / Canvas Area -->
++      <div class="card viewport-card">
++        <div class="canvas-wrapper">
++          <canvas id="pt-canvas" width="256" height="192"></canvas>
++        </div>
++
++        <div class="progress-container">
++          <div class="progress-bar-bg">
++            <div id="progress-fill" class="progress-bar-fill"></div>
++          </div>
++          <div class="status-row">
++            <span id="status-text" class="status-text">Ready</span>
++            <span id="timing-text">-- ms</span>
++          </div>
++        </div>
++      </div>
++
++      <!-- Controls Sidebar -->
++      <div class="card sidebar">
++        <div class="control-group">
++          <label>Actions</label>
++          <button id="btn-randomize" class="btn-primary" title="Randomize sphere & wall colors and re-render">
++            🎲 Randomize Sphere Colors
++          </button>
++        </div>
++
++        <div class="control-group" style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
++          <button id="btn-rerender" class="btn-secondary" title="Re-render with same colors and new random seed">
++            🔄 Re-render
++          </button>
++          <button id="btn-reset" class="btn-secondary" title="Reset to original Cornell Box colors">
++            ⏮️ Reset
++          </button>
++        </div>
++
++        <div class="control-group">
++          <label for="resolution-select">Resolution</label>
++          <select id="resolution-select">
++            <option value="160x120">160 × 120 (Fastest)</option>
++            <option value="256x192" selected>256 × 192 (Balanced)</option>
++            <option value="320x240">320 × 240 (Standard)</option>
++            <option value="400x300">400 × 300 (High Quality)</option>
++          </select>
++        </div>
++
++        <div class="control-group">
++          <label for="samples-select">Samples Per Pixel</label>
++          <select id="samples-select">
++            <option value="4">4 SPP (Fast preview)</option>
++            <option value="8" selected>8 SPP (Standard)</option>
++            <option value="16">16 SPP (Crisp)</option>
++            <option value="32">32 SPP (Smooth)</option>
++          </select>
++        </div>
++
++        <div class="control-group">
++          <label>Active Scene Colors</label>
++          <div class="sphere-swatches">
++            <div class="swatch-item">
++              <div id="swatch-left" class="swatch" style="background-color: rgb(191, 64, 64);"></div>
++              <span>Left Wall</span>
++            </div>
++            <div class="swatch-item">
++              <div id="swatch-right" class="swatch" style="background-color: rgb(64, 64, 191);"></div>
++              <span>Right Wall</span>
++            </div>
++            <div class="swatch-item">
++              <div id="swatch-mirror" class="swatch" style="background-color: rgb(255, 255, 255);"></div>
++              <span>Mirror</span>
++            </div>
++            <div class="swatch-item">
++              <div id="swatch-glass" class="swatch" style="background-color: rgb(255, 255, 255);"></div>
++              <span>Glass</span>
++            </div>
++          </div>
++        </div>
++
++        <div class="control-group">
++          <button id="btn-download" class="btn-secondary" title="Save current canvas image as PNG">
++            💾 Save PNG Image
++          </button>
++        </div>
++      </div>
++    </div>
++
++    <!-- Technical Details Card -->
++    <div class="info-card">
++      <h3>
++        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
++          <circle cx="12" cy="12" r="10"></circle>
++          <line x1="12" y1="16" x2="12" y2="12"></line>
++          <line x1="12" y1="8" x2="12.01" y2="8"></line>
++        </svg>
++        About This WebAssembly Port
++      </h3>
++      <p>
++        <strong>smallpt</strong> was created by <a href="http://www.kevinbeason.com/smallpt/" target="_blank" rel="noopener">Kevin Beason</a> as an educational C++ global illumination renderer supporting diffuse reflection, specular mirrors, Fresnel refraction (dielectric glass), and soft lighting via Monte Carlo path tracing.
++      </p>
++      <div class="info-grid">
++        <div class="info-item">
++          <span>Source Language</span>
++          <strong>C++ (smallpt.cpp)</strong>
++        </div>
++        <div class="info-item">
++          <span>Compiler</span>
++          <strong>LLVM Clang (wasm32)</strong>
++        </div>
++        <div class="info-item">
++          <span>Execution</span>
++          <strong>WebAssembly in Browser</strong>
++        </div>
++        <div class="info-item">
++          <span>Binary Size</span>
++          <strong>9.6 KB (.wasm)</strong>
++        </div>
++      </div>
++    </div>
++  </div>
++
++  <script>
++    // Embedded WASM bytecode fallback for file:// protocol or standalone environments
++    const WASM_FALLBACK_BASE64 = "${wasmBase64}";
++
++    const canvas = document.getElementById("pt-canvas");
++    const ctx = canvas.getContext("2d");
++    const statusText = document.getElementById("status-text");
++    const timingText = document.getElementById("timing-text");
++    const progressFill = document.getElementById("progress-fill");
++    const wasmBadge = document.getElementById("wasm-badge");
++
++    const btnRandomize = document.getElementById("btn-randomize");
++    const btnRerender = document.getElementById("btn-rerender");
++    const btnReset = document.getElementById("btn-reset");
++    const btnDownload = document.getElementById("btn-download");
++    const resSelect = document.getElementById("resolution-select");
++    const sampsSelect = document.getElementById("samples-select");
++
++    const swatchLeft = document.getElementById("swatch-left");
++    const swatchRight = document.getElementById("swatch-right");
++    const swatchMirror = document.getElementById("swatch-mirror");
++    const swatchGlass = document.getElementById("swatch-glass");
++
++    let wasmInstance = null;
++    let isRendering = false;
++    let cancelRender = false;
++    let currentSeed = 1337;
++
++    // Load and instantiate WebAssembly
++    async function initWasm() {
++      const importObject = {
++        env: {
++          js_pow: Math.pow
++        }
++      };
++
++      try {
++        const resp = await fetch("smallpt.wasm");
++        if (resp.ok) {
++          const buf = await resp.arrayBuffer();
++          const { instance } = await WebAssembly.instantiate(buf, importObject);
++          wasmInstance = instance;
++          wasmBadge.textContent = "WebAssembly Ready (smallpt.wasm)";
++          return;
++        }
++      } catch (err) {
++        console.warn("fetch smallpt.wasm failed (likely file:// protocol), using embedded bytecode:", err);
++      }
++
++      // Decode base64
++      const binary = atob(WASM_FALLBACK_BASE64);
++      const bytes = new Uint8Array(binary.length);
++      for (let i = 0; i < binary.length; i++) {
++        bytes[i] = binary.charCodeAt(i);
++      }
++      const { instance } = await WebAssembly.instantiate(bytes.buffer, importObject);
++      wasmInstance = instance;
++      wasmBadge.textContent = "WebAssembly Ready (Client-Side WASM)";
++    }
++
++    function setSphereColor(id, r, g, b) {
++      if (!wasmInstance) return;
++      wasmInstance.exports.set_sphere_color(id, r, g, b);
++    }
++
++    function randomizeColors() {
++      if (!wasmInstance) return;
++      const rnd = () => Math.random();
++      
++      // Randomize Left Wall (0), Right Wall (1), Back Wall (2)
++      const lR = 0.2 + 0.7 * rnd(), lG = 0.1 + 0.6 * rnd(), lB = 0.1 + 0.6 * rnd();
++      const rR = 0.1 + 0.6 * rnd(), rG = 0.1 + 0.6 * rnd(), rB = 0.2 + 0.7 * rnd();
++      const bR = 0.3 + 0.6 * rnd(), bG = 0.3 + 0.6 * rnd(), bB = 0.3 + 0.6 * rnd();
++
++      // Mirror (6) and Glass (7) tints
++      const mR = 0.6 + 0.39 * rnd(), mG = 0.6 + 0.39 * rnd(), mB = 0.6 + 0.39 * rnd();
++      const gR = 0.6 + 0.39 * rnd(), gG = 0.6 + 0.39 * rnd(), gB = 0.6 + 0.39 * rnd();
++
++      setSphereColor(0, lR, lG, lB);
++      setSphereColor(1, rR, rG, rB);
++      setSphereColor(2, bR, bG, bB);
++      setSphereColor(6, mR, mG, mB);
++      setSphereColor(7, gR, gG, gB);
++
++      swatchLeft.style.backgroundColor = "rgb(" + Math.round(lR*255) + "," + Math.round(lG*255) + "," + Math.round(lB*255) + ")";
++      swatchRight.style.backgroundColor = "rgb(" + Math.round(rR*255) + "," + Math.round(rG*255) + "," + Math.round(rB*255) + ")";
++      swatchMirror.style.backgroundColor = "rgb(" + Math.round(mR*255) + "," + Math.round(mG*255) + "," + Math.round(mB*255) + ")";
++      swatchGlass.style.backgroundColor = "rgb(" + Math.round(gR*255) + "," + Math.round(gG*255) + "," + Math.round(gB*255) + ")";
++    }
++
++    function resetColors() {
++      if (!wasmInstance) return;
++      wasmInstance.exports.reset_sphere_colors();
++      swatchLeft.style.backgroundColor = "rgb(191, 64, 64)";
++      swatchRight.style.backgroundColor = "rgb(64, 64, 191)";
++      swatchMirror.style.backgroundColor = "rgb(255, 255, 255)";
++      swatchGlass.style.backgroundColor = "rgb(255, 255, 255)";
++    }
++
++    async function startRender() {
++      if (!wasmInstance || isRendering) return;
++      isRendering = true;
++      cancelRender = false;
++      btnRandomize.disabled = true;
++      btnRerender.disabled = true;
++      btnReset.disabled = true;
++
++      const [wStr, hStr] = resSelect.value.split("x");
++      const width = parseInt(wStr, 10);
++      const height = parseInt(hStr, 10);
++      const samps = parseInt(sampsSelect.value, 10);
++
++      canvas.width = width;
++      canvas.height = height;
++
++      statusText.textContent = "Rendering " + width + "×" + height + " (" + samps + " spp)...";
++      progressFill.style.width = "0%";
++      const startTime = performance.now();
++
++      currentSeed = (currentSeed * 1664525 + 1013904223) >>> 0;
++
++      const memPtr = wasmInstance.exports.get_image_buffer();
++      const linesPerFrame = Math.max(2, Math.floor(height / 24));
++      let currentY = 0;
++
++      function renderBatch() {
++        if (cancelRender) {
++          isRendering = false;
++          btnRandomize.disabled = false;
++          btnRerender.disabled = false;
++          btnReset.disabled = false;
++          statusText.textContent = "Cancelled";
++          return;
++        }
++
++        const endY = Math.min(currentY + linesPerFrame, height);
++        for (; currentY < endY; currentY++) {
++          wasmInstance.exports.render_row(currentY, width, height, samps, currentSeed);
++        }
++
++        // Blit to canvas
++        const pixelData = new Uint8ClampedArray(
++          wasmInstance.exports.memory.buffer,
++          memPtr,
++          width * height * 4
++        );
++        const imgData = new ImageData(pixelData, width, height);
++        ctx.putImageData(imgData, 0, 0);
++
++        const pct = Math.floor((currentY / height) * 100);
++        progressFill.style.width = pct + "%";
++        timingText.textContent = Math.round(performance.now() - startTime) + " ms";
++
++        if (currentY < height) {
++          requestAnimationFrame(renderBatch);
++        } else {
++          isRendering = false;
++          btnRandomize.disabled = false;
++          btnRerender.disabled = false;
++          btnReset.disabled = false;
++          const totalTime = Math.round(performance.now() - startTime);
++          statusText.textContent = "Done in " + totalTime + " ms (" + width + "×" + height + ", " + samps + " spp)";
++          progressFill.style.width = "100%";
++        }
++      }
++
++      requestAnimationFrame(renderBatch);
++    }
++
++    btnRandomize.addEventListener("click", () => {
++      randomizeColors();
++      startRender();
++    });
++
++    btnRerender.addEventListener("click", () => {
++      startRender();
++    });
++
++    btnReset.addEventListener("click", () => {
++      resetColors();
++      startRender();
++    });
++
++    resSelect.addEventListener("change", () => {
++      startRender();
++    });
++
++    sampsSelect.addEventListener("change", () => {
++      startRender();
++    });
++
++    btnDownload.addEventListener("click", () => {
++      const link = document.createElement("a");
++      link.download = "smallpt-" + canvas.width + "x" + canvas.height + ".png";
++      link.href = canvas.toDataURL("image/png");
++      link.click();
++    });
++
++    // Initialize and run initial render
++    initWasm().then(() => {
++      startRender();
++    });
++  </script>
++</body>
++</html>
++`;
++
++fs.writeFileSync(path.join(baseDir, "index.html"), html);
++if (fs.existsSync(path.join(baseDir, "public"))) {
++  fs.writeFileSync(path.join(baseDir, "public/index.html"), html);
++}
++console.log("Successfully generated index.html!");
+diff --git a/smallpt.cpp b/smallpt.cpp
+new file mode 100644
+index 0000000..397accb
+--- /dev/null
++++ b/smallpt.cpp
+@@ -0,0 +1,289 @@
++// smallpt WebAssembly path tracer
++// Based on Kevin Beason's smallpt (http://www.kevinbeason.com/smallpt/)
++// Adapted for WebAssembly compilation without standard C library dependencies.
++
++#define M_PI 3.14159265358979323846
++
++extern "C" {
++    double js_pow(double b, double e);
++}
++
++// Math functions mapped to WebAssembly intrinsics and efficient implementations
++static inline double my_sqrt(double x) {
++    return __builtin_sqrt(x);
++}
++
++static inline double my_fabs(double x) {
++    return __builtin_fabs(x);
++}
++
++static inline double my_sin(double x) {
++    const double PI = 3.14159265358979323846;
++    const double TWO_PI = 6.28318530717958647692;
++    while (x > PI) x -= TWO_PI;
++    while (x < -PI) x += TWO_PI;
++    double x2 = x * x;
++    return x * (1.0 + x2 * (-1.0/6.0 + x2 * (1.0/120.0 + x2 * (-1.0/5040.0 + x2 * (1.0/362880.0)))));
++}
++
++static inline double my_cos(double x) {
++    return my_sin(x + 1.57079632679489661923);
++}
++
++// Pseudo-random generator (erand48 equivalent)
++static inline double erand48_step(unsigned short Xi[3]) {
++    unsigned long long x = ((unsigned long long)Xi[0]) |
++                           (((unsigned long long)Xi[1]) << 16) |
++                           (((unsigned long long)Xi[2]) << 32);
++    x = (x * 0x5DEECE66DULL + 0xBULL) & 0xFFFFFFFFFFFFULL;
++    Xi[0] = (unsigned short)(x & 0xFFFF);
++    Xi[1] = (unsigned short)((x >> 16) & 0xFFFF);
++    Xi[2] = (unsigned short)((x >> 32) & 0xFFFF);
++    return (double)x / (double)(1ULL << 48);
++}
++
++struct Vec {
++    double x, y, z;
++    Vec(double x_=0, double y_=0, double z_=0) : x(x_), y(y_), z(z_) {}
++    Vec operator+(const Vec &b) const { return Vec(x+b.x, y+b.y, z+b.z); }
++    Vec operator-(const Vec &b) const { return Vec(x-b.x, y-b.y, z-b.z); }
++    Vec operator*(double b) const { return Vec(x*b, y*b, z*b); }
++    Vec mult(const Vec &b) const { return Vec(x*b.x, y*b.y, z*b.z); }
++    Vec& norm() {
++        double d = my_sqrt(x*x + y*y + z*z);
++        double inv = d > 0 ? 1.0 / d : 1.0;
++        return *this = *this * inv;
++    }
++    double dot(const Vec &b) const { return x*b.x + y*b.y + z*b.z; }
++    Vec operator%(const Vec &b) const {
++        return Vec(y*b.z - z*b.y, z*b.x - x*b.z, x*b.y - y*b.x);
++    }
++};
++
++struct Ray {
++    Vec o, d;
++    Ray(Vec o_, Vec d_) : o(o_), d(d_) {}
++};
++
++enum Refl_t { DIFF, SPEC, REFR };
++
++struct Sphere {
++    double rad;
++    Vec p, e, c;
++    Refl_t refl;
++    Sphere() : rad(0), p(), e(), c(), refl(DIFF) {}
++    Sphere(double rad_, Vec p_, Vec e_, Vec c_, Refl_t refl_) :
++        rad(rad_), p(p_), e(e_), c(c_), refl(refl_) {}
++
++    double intersect(const Ray &r) const {
++        Vec op = p - r.o;
++        double t, eps = 1e-4, b = op.dot(r.d);
++        double det = b*b - op.dot(op) + rad*rad;
++        if (det < 0) return 0;
++        else det = my_sqrt(det);
++        return (t = b - det) > eps ? t : ((t = b + det) > eps ? t : 0);
++    }
++};
++
++// Scene definition (Cornell box)
++static Sphere spheres[] = {
++    Sphere(1e5, Vec( 1e5+1,40.8,81.6), Vec(),Vec(.75,.25,.25),DIFF), // 0: Left wall
++    Sphere(1e5, Vec(-1e5+99,40.8,81.6),Vec(),Vec(.25,.25,.75),DIFF), // 1: Right wall
++    Sphere(1e5, Vec(50,40.8, 1e5),     Vec(),Vec(.75,.75,.75),DIFF), // 2: Back wall
++    Sphere(1e5, Vec(50,40.8,-1e5+170), Vec(),Vec(),           DIFF), // 3: Front wall
++    Sphere(1e5, Vec(50, 1e5, 81.6),    Vec(),Vec(.75,.75,.75),DIFF), // 4: Bottom / Floor
++    Sphere(1e5, Vec(50,-1e5+81.6,81.6),Vec(),Vec(.75,.75,.75),DIFF), // 5: Top / Ceiling
++    Sphere(16.5,Vec(27,16.5,47),       Vec(),Vec(1,1,1)*.999, SPEC), // 6: Mirror sphere
++    Sphere(16.5,Vec(73,16.5,78),       Vec(),Vec(1,1,1)*.999, REFR), // 7: Glass sphere
++    Sphere(600, Vec(50,681.6-.27,81.6),Vec(12,12,12),  Vec(), DIFF)  // 8: Light source
++};
++
++static const Vec default_colors[] = {
++    Vec(.75,.25,.25),
++    Vec(.25,.25,.75),
++    Vec(.75,.75,.75),
++    Vec(0,0,0),
++    Vec(.75,.75,.75),
++    Vec(.75,.75,.75),
++    Vec(.999,.999,.999),
++    Vec(.999,.999,.999),
++    Vec(0,0,0)
++};
++
++static inline double clamp(double x) { return x < 0 ? 0 : (x > 1 ? 1 : x); }
++
++static inline int toInt(double x) {
++    // Gamma 2.2 correction
++    return (int)(js_pow(clamp(x), 1.0 / 2.2) * 255.0 + 0.5);
++}
++
++static inline bool intersect(const Ray &r, double &t, int &id) {
++    int n = sizeof(spheres) / sizeof(Sphere);
++    double d, inf = 1e20;
++    t = inf;
++    for (int i = n; i--;) {
++        if ((d = spheres[i].intersect(r)) && d < t) {
++            t = d;
++            id = i;
++        }
++    }
++    return t < inf;
++}
++
++Vec radiance(const Ray &r, int depth, unsigned short *Xi) {
++    double t;
++    int id = 0;
++    if (!intersect(r, t, id)) return Vec();
++    const Sphere &obj = spheres[id];
++    Vec x = r.o + r.d * t;
++    Vec n = (x - obj.p).norm();
++    Vec nl = n.dot(r.d) < 0 ? n : n * -1;
++    Vec f = obj.c;
++    double p = f.x > f.y && f.x > f.z ? f.x : (f.y > f.z ? f.y : f.z);
++    if (++depth > 5) {
++        if (erand48_step(Xi) < p) f = f * (1.0 / p);
++        else return obj.e;
++    }
++    if (obj.refl == DIFF) {
++        double r1 = 2 * M_PI * erand48_step(Xi);
++        double r2 = erand48_step(Xi);
++        double r2s = my_sqrt(r2);
++        Vec w = nl;
++        Vec u = ((my_fabs(w.x) > 0.1 ? Vec(0, 1, 0) : Vec(1, 0, 0)) % w).norm();
++        Vec v = w % u;
++        Vec d = (u * my_cos(r1) * r2s + v * my_sin(r1) * r2s + w * my_sqrt(1 - r2)).norm();
++        return obj.e + f.mult(radiance(Ray(x, d), depth, Xi));
++    } else if (obj.refl == SPEC) {
++        return obj.e + f.mult(radiance(Ray(x, r.d - n * 2.0 * n.dot(r.d)), depth, Xi));
++    }
++    Ray reflRay(x, r.d - n * 2.0 * n.dot(r.d));
++    bool into = n.dot(nl) > 0;
++    double nc = 1.0, nt = 1.5;
++    double nnt = into ? nc / nt : nt / nc;
++    double ddn = r.d.dot(nl);
++    double cos2t = 1.0 - nnt * nnt * (1.0 - ddn * ddn);
++    if (cos2t < 0) {
++        return obj.e + f.mult(radiance(reflRay, depth, Xi));
++    }
++    Vec tdir = (r.d * nnt - n * ((into ? 1.0 : -1.0) * (ddn * nnt + my_sqrt(cos2t)))).norm();
++    double a = nt - nc, b = nt + nc;
++    double R0 = (a * a) / (b * b);
++    double c = 1.0 - (into ? -ddn : tdir.dot(n));
++    double Re = R0 + (1.0 - R0) * c * c * c * c * c;
++    double Tr = 1.0 - Re;
++    double P = 0.25 + 0.5 * Re;
++    double RP = Re / P;
++    double TP = Tr / (1.0 - P);
++    return obj.e + f.mult(depth > 2 ? (erand48_step(Xi) < P ?
++        radiance(reflRay, depth, Xi) * RP : radiance(Ray(x, tdir), depth, Xi) * TP) :
++        radiance(reflRay, depth, Xi) * Re + radiance(Ray(x, tdir), depth, Xi) * Tr);
++}
++
++// Memory buffer for rendered RGBA pixels: max 1024x768 * 4 bytes
++#define MAX_W 1024
++#define MAX_H 768
++static unsigned char image_pixels[MAX_W * MAX_H * 4];
++
++extern "C" {
++
++unsigned char* get_image_buffer() {
++    return image_pixels;
++}
++
++int get_num_spheres() {
++    return sizeof(spheres) / sizeof(Sphere);
++}
++
++void set_sphere_color(int id, double r, double g, double b) {
++    int n = sizeof(spheres) / sizeof(Sphere);
++    if (id >= 0 && id < n) {
++        spheres[id].c = Vec(r, g, b);
++    }
++}
++
++void get_sphere_color(int id, double* rgb) {
++    int n = sizeof(spheres) / sizeof(Sphere);
++    if (id >= 0 && id < n) {
++        rgb[0] = spheres[id].c.x;
++        rgb[1] = spheres[id].c.y;
++        rgb[2] = spheres[id].c.z;
++    }
++}
++
++void reset_sphere_colors() {
++    int n = sizeof(spheres) / sizeof(Sphere);
++    for (int i = 0; i < n; i++) {
++        spheres[i].c = default_colors[i];
++    }
++}
++
++// Simple LCG random generator for color randomization
++void randomize_colors(unsigned int seed) {
++    unsigned int state = seed ? seed : 123456789;
++    auto rnd = [&state]() -> double {
++        state = state * 1664525u + 1013904223u;
++        return (double)(state >> 8) / (double)(1u << 24);
++    };
++
++    // Randomize Left Wall (0), Right Wall (1), Back Wall (2)
++    spheres[0].c = Vec(0.2 + 0.7 * rnd(), 0.1 + 0.6 * rnd(), 0.1 + 0.6 * rnd());
++    spheres[1].c = Vec(0.1 + 0.6 * rnd(), 0.1 + 0.6 * rnd(), 0.2 + 0.7 * rnd());
++    spheres[2].c = Vec(0.4 + 0.5 * rnd(), 0.4 + 0.5 * rnd(), 0.4 + 0.5 * rnd());
++
++    // Randomize Mirror sphere tint (6) and Glass sphere tint (7)
++    spheres[6].c = Vec(0.7 + 0.299 * rnd(), 0.7 + 0.299 * rnd(), 0.7 + 0.299 * rnd());
++    spheres[7].c = Vec(0.7 + 0.299 * rnd(), 0.7 + 0.299 * rnd(), 0.7 + 0.299 * rnd());
++
++    // Floor (4) and Ceiling (5)
++    spheres[4].c = Vec(0.3 + 0.6 * rnd(), 0.3 + 0.6 * rnd(), 0.3 + 0.6 * rnd());
++    spheres[5].c = Vec(0.3 + 0.6 * rnd(), 0.3 + 0.6 * rnd(), 0.3 + 0.6 * rnd());
++}
++
++void render_row(int y, int w, int h, int samps, int seed) {
++    if (w > MAX_W) w = MAX_W;
++    if (h > MAX_H) h = MAX_H;
++    Ray cam(Vec(50, 52, 295.6), Vec(0, -0.042612, -1).norm());
++    Vec cx = Vec(w * 0.5135 / h);
++    Vec cy = (cx % cam.d).norm() * 0.5135;
++
++    unsigned short Xi[3] = {
++        (unsigned short)(seed & 0xFFFF),
++        (unsigned short)((seed >> 16) ^ (y * 33)),
++        (unsigned short)(y * y * y + seed)
++    };
++
++    for (int x = 0; x < w; x++) {
++        int i = (h - y - 1) * w + x;
++        Vec r(0, 0, 0);
++        for (int sy = 0; sy < 2; sy++) {
++            for (int sx = 0; sx < 2; sx++) {
++                Vec sub_r(0, 0, 0);
++                for (int s = 0; s < samps; s++) {
++                    double r1 = 2.0 * erand48_step(Xi);
++                    double dx = r1 < 1.0 ? my_sqrt(r1) - 1.0 : 1.0 - my_sqrt(2.0 - r1);
++                    double r2 = 2.0 * erand48_step(Xi);
++                    double dy = r2 < 1.0 ? my_sqrt(r2) - 1.0 : 1.0 - my_sqrt(2.0 - r2);
++                    Vec d = cx * ((((sx + 0.5 + dx) / 2.0 + x) / w) - 0.5) +
++                            cy * ((((sy + 0.5 + dy) / 2.0 + y) / h) - 0.5) + cam.d;
++                    sub_r = sub_r + radiance(Ray(cam.o + d * 140.0, d.norm()), 0, Xi) * (1.0 / samps);
++                }
++                r = r + Vec(clamp(sub_r.x), clamp(sub_r.y), clamp(sub_r.z)) * 0.25;
++            }
++        }
++        int p = i * 4;
++        image_pixels[p + 0] = (unsigned char)toInt(r.x);
++        image_pixels[p + 1] = (unsigned char)toInt(r.y);
++        image_pixels[p + 2] = (unsigned char)toInt(r.z);
++        image_pixels[p + 3] = 255;
++    }
++}
++
++void render(int w, int h, int samps, int seed) {
++    if (w > MAX_W) w = MAX_W;
++    if (h > MAX_H) h = MAX_H;
++    for (int y = 0; y < h; y++) {
++        render_row(y, w, h, samps, seed);
++    }
++}
++
++}
+diff --git a/smallpt.wasm b/smallpt.wasm
+new file mode 100755
+index 0000000..f137b3f
+Binary files /dev/null and b/smallpt.wasm differ

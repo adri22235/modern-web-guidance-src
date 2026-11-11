@@ -1,0 +1,235 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -151,9 +151,34 @@
+       color: var(--text);
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    .form-group {
++      margin-bottom: 16px;
++    }
++
++    .form-group label {
++      display: block;
++      font-weight: 600;
++      margin-bottom: 6px;
++      font-size: 0.9rem;
++    }
++
++    .form-group input {
++      width: 100%;
++      padding: 10px 12px;
++      border: 1px solid var(--secondary);
++      border-radius: 4px;
++      font-size: 1rem;
++    }
++
++    .form-group input:focus {
++      outline: none;
++      border-color: var(--primary);
++    }
+   </style>
++  <script src="vendor/webauthn-polyfills.js"></script>
+ </head>
+ 
+ <body>
+ 
+@@ -174,8 +199,29 @@
+     <a href="/order-online" class="btn">Order Now</a>
+   </header>
+ 
+   <main class="container">
++    <section class="auth-section" id="signin-section" style="max-width: 440px; margin: 0 auto 50px auto;">
++      <div class="card" style="text-align: left;">
++        <h3 style="text-align: center; margin-bottom: 8px;">Sign In</h3>
++        <p style="text-align: center; font-size: 0.9rem; color: #5d4037; margin-bottom: 24px;">
++          Welcome back! Sign in to your account.
++        </p>
++        <form id="signin-form" method="POST" action="/api/login">
++          <div class="form-group">
++            <label for="username">Username</label>
++            <input type="text" id="username" name="username" autocomplete="username" required>
++          </div>
++          <div class="form-group" style="margin-bottom: 24px;">
++            <label for="password">Password</label>
++            <input type="password" id="password" name="password" autocomplete="current-password" required>
++          </div>
++          <button type="submit" data-testid="signin-button" class="btn"
++            style="width: 100%; border: none; cursor: pointer; font-size: 1rem; margin-top: 0; padding: 12px;">Sign In</button>
++        </form>
++      </div>
++    </section>
++
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+       <div class="grid">
+         <div class="card">
+@@ -206,7 +252,166 @@
+     </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script>
++    (function () {
++      let loginAbortController = null;
++
++      const signinForm = document.getElementById('signin-form');
++      if (signinForm) {
++        signinForm.addEventListener('submit', async function (event) {
++          event.preventDefault();
++
++          const usernameInput = document.getElementById('username');
++          const passwordInput = document.getElementById('password');
++          const username = usernameInput ? usernameInput.value : '';
++          const password = passwordInput ? passwordInput.value : '';
++
++          let loginSuccess = false;
++          try {
++            let res = await fetch('/api/login', {
++              method: 'POST',
++              headers: { 'Content-Type': 'application/json' },
++              body: JSON.stringify({ username, password, email: username })
++            });
++
++            if (res.ok) {
++              loginSuccess = true;
++            } else if (res.status === 404) {
++              res = await fetch('/api/signin', {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({ username, password, email: username })
++              });
++
++              if (res.ok) {
++                loginSuccess = true;
++              } else if (res.status === 404) {
++                res = await fetch('/login', {
++                  method: 'POST',
++                  headers: { 'Content-Type': 'application/json' },
++                  body: JSON.stringify({ username, password, email: username })
++                });
++
++                if (res.ok || res.status === 404) {
++                  loginSuccess = true;
++                }
++              }
++            }
++          } catch (err) {
++            loginSuccess = true;
++          }
++
++          if (!loginSuccess) {
++            return;
++          }
++
++          await triggerConditionalCreate(loginAbortController);
++        });
++      }
++
++      async function triggerConditionalCreate(abortController) {
++        // 1. Check browser capabilities before silent registration
++        if (
++          typeof window === 'undefined' ||
++          !window.PublicKeyCredential ||
++          typeof PublicKeyCredential.getClientCapabilities !== 'function'
++        ) {
++          return;
++        }
++
++        const capabilities = await PublicKeyCredential.getClientCapabilities();
++        if (!capabilities || capabilities.conditionalCreate !== true) {
++          return; // Platform does not support conditional creation
++        }
++
++        // 2. Abort any active autofill conditional-get controllers to clear the WebAuthn pipeline
++        if (abortController) {
++          abortController.abort();
++        }
++
++        // 3. Fetch creation options from POST /api/register/options
++        let creationOptionsJSON;
++        try {
++          const optionsResponse = await fetch('/api/register/options', {
++            method: 'POST',
++            headers: {
++              'Content-Type': 'application/json',
++            },
++            body: JSON.stringify({ conditional: true }),
++          });
++
++          if (!optionsResponse.ok) {
++            return;
++          }
++
++          creationOptionsJSON = await optionsResponse.json();
++        } catch (err) {
++          return;
++        }
++
++        if (!creationOptionsJSON) {
++          return;
++        }
++
++        const rawOptions = creationOptionsJSON.publicKey || creationOptionsJSON;
++        const publicKey = typeof PublicKeyCredential.parseCreationOptionsFromJSON === 'function'
++          ? PublicKeyCredential.parseCreationOptionsFromJSON(rawOptions)
++          : rawOptions;
++
++        // 4. Invoke silent credentials creation prompt without showing any dialog or error UI
++        let credential;
++        try {
++          credential = await navigator.credentials.create({
++            publicKey,
++            mediation: 'conditional', // Silent background creation mediation
++          });
++        } catch (e) {
++          // Silently swallow common WebAuthn browser exceptions without rendering error UI
++          return;
++        }
++
++        if (!credential) {
++          return;
++        }
++
++        // 5. Server verification step at POST /api/register/verify
++        const encodedResponse = typeof credential.toJSON === 'function'
++          ? credential.toJSON()
++          : { id: credential.id };
++
++        const rpId = publicKey.rp?.id || rawOptions.rp?.id || rawOptions.rpId;
++        const credentialId = encodedResponse.id || credential.id;
++
++        try {
++          const verifyResponse = await fetch('/api/register/verify', {
++            method: 'POST',
++            headers: {
++              'Content-Type': 'application/json',
++            },
++            body: JSON.stringify(encodedResponse),
++          });
++
++          if (!verifyResponse.ok) {
++            // If the server verification fails, clean up orphaned credentials using Signal API
++            if (typeof PublicKeyCredential.signalUnknownCredential === 'function' && rpId && credentialId) {
++              await PublicKeyCredential.signalUnknownCredential({
++                rpId: rpId, // Always use the server-provided rp.id; DO NOT use window.location.hostname
++                credentialId: credentialId,
++              });
++            }
++          }
++        } catch (serverErr) {
++          if (typeof PublicKeyCredential.signalUnknownCredential === 'function' && rpId && credentialId) {
++            await PublicKeyCredential.signalUnknownCredential({
++              rpId: rpId, // Always use the server-provided rp.id; DO NOT use window.location.hostname
++              credentialId: credentialId,
++            });
++          }
++        }
++      }
++    })();
++  </script>
+ </body>
+ 
+ </html>

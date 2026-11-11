@@ -1,0 +1,679 @@
+diff --git a/app.js b/app.js
+new file mode 100644
+index 0000000..7da9f69
+--- /dev/null
++++ b/app.js
+@@ -0,0 +1,352 @@
++'use strict';
++
++// Static-site demonstration only. A production relying party must issue challenges,
++// verify WebAuthn responses, persist credentials, and manage sessions on a server.
++const $ = (selector) => document.querySelector(selector);
++const icon = (name, cls = '') => `<svg class="${cls}" aria-hidden="true"><use href="#i-${name}"/></svg>`;
++const escapeHTML = (value) => String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
++const storageKey = 'daily-grind.accounts.v1';
++let accounts = [];
++let currentId = null;
++let currentView = 'welcome';
++let authMode = 'signin';
++let busy = false;
++let storageRevision = 0;
++let operationAbort = null;
++let toastTimer;
++let storageAvailable = true;
++try {
++  const stored = JSON.parse(localStorage.getItem(storageKey) || '[]');
++  if (!Array.isArray(stored) || stored.some(a => !a.id || typeof a.name !== 'string' || typeof a.email !== 'string' || !Array.isArray(a.passkeys))) throw new Error('Invalid account data');
++  accounts = stored;
++  localStorage.setItem('daily-grind.storage-test', '1');
++  localStorage.removeItem('daily-grind.storage-test');
++} catch {
++  storageAvailable = false;
++}
++const currentAccount = () => accounts.find(a => a.id === currentId);
++const toBase64 = (buffer) => btoa(String.fromCharCode(...new Uint8Array(buffer))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
++const fromBase64 = (value) => Uint8Array.from(atob(value.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
++const challengeBytes = () => crypto.getRandomValues(new Uint8Array(32));
++const formatDate = value => new Date(value).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
++
++function toast(message, error = false) {
++  clearTimeout(toastTimer);
++  $('#status').textContent = message;
++  $('#status').classList.toggle('error', error);
++  $('#status').hidden = false;
++  toastTimer = setTimeout(() => { $('#status').hidden = true; }, error ? 11000 : 6500);
++}
++function commit(next) {
++  if (!storageAvailable) throw new Error('Local storage is unavailable. Allow site storage in this browser to save your account.');
++  try { localStorage.setItem(storageKey, JSON.stringify(next)); }
++  catch { throw new Error('Your browser could not save this change. Free up site storage and try again.'); }
++  accounts = next;
++}
++function updateAccount(next) { commit(accounts.map(a => a.id === next.id ? next : a)); }
++function requireWebAuthn() {
++  if (!window.isSecureContext || !window.PublicKeyCredential || !navigator.credentials || !crypto.subtle) {
++    throw new Error('Passkeys need a supported browser and a secure connection (HTTPS or localhost). Please open this page in a current browser on a secure address.');
++  }
++  if (!storageAvailable) throw new Error('Please allow local site storage in this browser before creating or using a demo account.');
++}
++function readableError(error) {
++  if (error.name === 'NotAllowedError' || error.name === 'AbortError') return 'The passkey request was canceled or timed out. Nothing changed. Try again when you’re ready.';
++  if (error.name === 'InvalidStateError') return 'This passkey is already registered. Try another device or passkey provider.';
++  if (error.name === 'NotSupportedError') return 'This device cannot create the required passkey. Try another browser or a security key.';
++  if (error.name === 'SecurityError') return 'Your browser blocked passkeys for this address or embedded page. Open this site directly over HTTPS or localhost.';
++  return error.message || 'We couldn’t complete that request. Please try again.';
++}
++async function action(callback) {
++  if (busy) return;
++  busy = true;
++  operationAbort = new AbortController();
++  const buttons = Array.from(document.querySelectorAll('button')).filter(b => !b.disabled);
++  buttons.forEach(b => { b.disabled = true; });
++  document.body.setAttribute('aria-busy', 'true');
++  try { await callback(); }
++  catch (error) { toast(readableError(error), true); }
++  finally {
++    busy = false;
++    operationAbort = null;
++    buttons.forEach(b => { b.disabled = false; });
++    document.body.removeAttribute('aria-busy');
++  }
++}
++async function verifyClientData(response, challenge, type) {
++  const data = JSON.parse(new TextDecoder().decode(response.clientDataJSON));
++  if (data.type !== type || data.challenge !== toBase64(challenge) || data.origin !== location.origin || data.crossOrigin) throw new Error('The passkey response could not be verified. Please open the site directly and try again.');
++}
++async function verifyAuthenticatorData(buffer) {
++  const data = new Uint8Array(buffer);
++  if (data.length < 37) throw new Error('Incomplete passkey response.');
++  const rpHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(location.hostname)));
++  if (!rpHash.every((v, i) => v === data[i]) || (data[32] & 5) !== 5) throw new Error('Device verification was not completed. Please confirm with your face, fingerprint, or PIN.');
++  return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(33);
++}
++// Authenticators use ASN.1 DER ECDSA signatures; Web Crypto expects 32-byte r and s.
++function rawSignature(signature) {
++  const bytes = new Uint8Array(signature);
++  if (bytes[0] !== 0x30 || bytes[2] !== 0x02) throw new Error('Invalid passkey signature.');
++  const rLength = bytes[3];
++  const sStart = 4 + rLength;
++  if (bytes[sStart] !== 0x02) throw new Error('Invalid passkey signature.');
++  const sLength = bytes[sStart + 1];
++  const r = bytes.slice(4, sStart);
++  const s = bytes.slice(sStart + 2, sStart + 2 + sLength);
++  const result = new Uint8Array(64);
++  [r, s].forEach((part, index) => {
++    const trimmed = part.length > 32 && part[0] === 0 ? part.slice(1) : part;
++    if (trimmed.length > 32 || !trimmed.length) throw new Error('Invalid passkey signature.');
++    result.set(trimmed, index * 32 + 32 - trimmed.length);
++  });
++  return result;
++}
++async function authenticate(account = null) {
++  requireWebAuthn();
++  const revision = storageRevision;
++  const candidates = account ? [account] : accounts;
++  const passkeys = candidates.flatMap(a => a.passkeys);
++  if (!passkeys.length) throw new Error('No passkeys saved in this browser yet. Create an account to get started.');
++  const challenge = challengeBytes();
++  const credential = await navigator.credentials.get({ signal: operationAbort?.signal, publicKey: {
++    challenge, rpId: location.hostname, userVerification: 'required', timeout: 60000,
++    allowCredentials: passkeys.map(key => ({ type: 'public-key', id: fromBase64(key.id), ...(key.transports?.length ? { transports: key.transports } : {}) }))
++  }});
++  if (!credential) throw new Error('No passkey was selected. Please try again.');
++  const owner = candidates.find(a => a.passkeys.some(k => k.id === credential.id));
++  if (!owner) throw new Error('This passkey is not linked to a profile in this browser.');
++  const key = owner.passkeys.find(k => k.id === credential.id);
++  if (credential.response.userHandle && toBase64(credential.response.userHandle) !== owner.id) throw new Error('This passkey does not match the account.');
++  await verifyClientData(credential.response, challenge, 'webauthn.get');
++  const counter = await verifyAuthenticatorData(credential.response.authenticatorData);
++  if (key.counter && counter && counter <= key.counter) throw new Error('The passkey security counter could not be verified. Try another saved passkey.');
++  const publicKey = await crypto.subtle.importKey('spki', fromBase64(key.publicKey), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
++  const clientHash = new Uint8Array(await crypto.subtle.digest('SHA-256', credential.response.clientDataJSON));
++  const authData = new Uint8Array(credential.response.authenticatorData);
++  const signedData = new Uint8Array(authData.length + clientHash.length);
++  signedData.set(authData); signedData.set(clientHash, authData.length);
++  const valid = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, publicKey, rawSignature(credential.response.signature), signedData);
++  if (!valid) throw new Error('We couldn’t verify that passkey. No account changes were made.');
++  if (revision !== storageRevision) throw new Error('Account data changed in another tab. Please sign in again.');
++  updateAccount({ ...owner, passkeys: owner.passkeys.map(k => k.id === key.id ? { ...k, counter, lastUsed: Date.now() } : k) });
++  return owner.id;
++}
++async function enroll(account) {
++  requireWebAuthn();
++  const revision = storageRevision;
++  const challenge = challengeBytes();
++  const credential = await navigator.credentials.create({ signal: operationAbort?.signal, publicKey: {
++    challenge, rp: { name: 'The Daily Grind', id: location.hostname },
++    user: { id: fromBase64(account.id), name: account.email, displayName: account.name },
++    pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
++    authenticatorSelection: { residentKey: 'required', userVerification: 'required' },
++    attestation: 'none', timeout: 60000,
++    excludeCredentials: account.passkeys.map(k => ({ type: 'public-key', id: fromBase64(k.id) }))
++  }});
++  if (!credential) throw new Error('No passkey was created. Please try again.');
++  await verifyClientData(credential.response, challenge, 'webauthn.create');
++  const publicKey = credential.response.getPublicKey?.();
++  const authData = credential.response.getAuthenticatorData?.();
++  if (!publicKey || !authData) throw new Error('This browser cannot save passkeys for this demo. Please use a current browser.');
++  const counter = await verifyAuthenticatorData(authData);
++  if (revision !== storageRevision) throw new Error('Account data changed in another tab. Please try again.');
++  const device = /iPhone|iPad|iPod/.test(navigator.userAgent) ? 'Apple device' : /Android/.test(navigator.userAgent) ? 'Android device' : /Mac/.test(navigator.userAgent) ? 'Mac' : /Windows/.test(navigator.userAgent) ? 'Windows device' : 'This device';
++  return { id: credential.id, publicKey: toBase64(publicKey), name: `${device} passkey`, created: Date.now(), lastUsed: null, counter, transports: credential.response.getTransports?.() || [] };
++}
++function setAuthMode(mode) {
++  authMode = mode;
++  const registering = mode === 'register';
++  document.body.classList.toggle('registering', registering);
++  document.querySelectorAll('[role="tab"]').forEach(tab => {
++    const selected = tab.dataset.auth === mode;
++    tab.classList.toggle('active', selected);
++    tab.setAttribute('aria-selected', selected);
++    tab.tabIndex = selected ? 0 : -1;
++  });
++  $('#auth-form-panel').setAttribute('aria-labelledby', registering ? 'register-tab' : 'signin-tab');
++  $('#register-fields').hidden = !registering;
++  $('#register-name').required = registering;
++  $('#register-email').required = registering;
++  $('#register-name').disabled = !registering;
++  $('#register-email').disabled = !registering;
++  $('#auth-title').innerHTML = registering ? 'Your next chapter.<br>Your favorite coffee.' : 'Your usual.<br>Without the password.';
++  $('#auth-description').textContent = registering ? 'Make yourself at home. Create your profile and a passkey in one simple step.' : 'A familiar face. A simple touch. Sign in securely with a passkey and get back to the good stuff.';
++  $('#auth-submit span').textContent = registering ? 'Create account with a passkey' : 'Sign in with a passkey';
++  $('#auth-switch').innerHTML = registering ? 'Already a regular? <button data-auth="signin">Welcome back <span>↗</span></button>' : 'New around here? <button data-auth="register">Pull up a chair <span>↗</span></button>';
++}
++function updateMember() {
++  const account = currentAccount();
++  $('#member-name').textContent = account ? `Hey, ${account.name.split(' ')[0]}.` : 'Hey, coffee lover.';
++  $('#member-status').textContent = account ? 'Your local demo account' : 'Make yourself at home';
++  $('#avatar').innerHTML = account ? escapeHTML(account.name.charAt(0).toUpperCase()) : icon('user');
++  $('#signout').hidden = !account;
++}
++function renderView(view = currentView) {
++  currentView = view;
++  const account = currentAccount();
++  updateMember();
++  document.querySelectorAll('[data-view]').forEach(button => {
++    button.classList.toggle('active', button.dataset.view === view);
++    if (button.dataset.view === view) button.setAttribute('aria-current', 'page');
++    else button.removeAttribute('aria-current');
++  });
++  const showWelcome = view === 'welcome' && !account;
++  $('#welcome-panel').hidden = !showWelcome;
++  $('#settings-panel').hidden = showWelcome;
++  document.body.classList.toggle('registering', showWelcome && authMode === 'register');
++  if (showWelcome) return;
++  const panel = $('#settings-panel');
++  if (!account) {
++    panel.innerHTML = `<div class="locked-state"><div class="fingerprint-tile">${icon(view === 'profile' ? 'user' : 'shield')}</div><p class="eyebrow orange">YOUR LITTLE CORNER</p><h2>${view === 'profile' ? 'Let’s make it personal.' : 'A safer way to say hello.'}</h2><p class="description">${view === 'profile' ? 'Sign in to update your name and email address. Your daily ritual, made a little more you.' : 'Sign in to see your saved passkeys, add a new one, and keep your account feeling like home.'}</p><button class="button primary" data-access="signin">${icon('key')} Sign in with a passkey</button><p class="auth-switch" style="margin-top:20px">New around here? <button data-access="register">Create an account ↗</button></p></div>`;
++    return;
++  }
++  if (view === 'welcome') {
++    panel.innerHTML = `<p class="eyebrow orange">GOOD TO HAVE YOU BACK</p><h2>Your usual looks good on you, ${escapeHTML(account.name.split(' ')[0])}.</h2><p class="description">A familiar place for your details, your security, and your next favorite sip.</p><div class="welcome-summary">${icon('cup')}<h3>Make yourself at home.</h3><p>You’re signed in with a passkey. Your profile and ${account.passkeys.length === 1 ? 'saved passkey are' : 'saved passkeys are'} ready whenever you need them.</p><span class="status-badge">${icon('check')} Passkey protected</span></div><div class="summary-actions"><button class="button primary" data-goto="profile">Personal details ${icon('arrow')}</button><button class="button" data-goto="passkeys">${icon('key')} Manage passkeys</button><button class="button" data-signout>Sign out ${icon('out')}</button></div>`;
++  } else if (view === 'profile') {
++    panel.innerHTML = `<p class="eyebrow orange">THE PERSON BEHIND THE ORDER</p><h2>Personal details</h2><p class="description">A few little details that make this place yours.</p><form id="profile-form"><label for="profile-name">Your name</label><input id="profile-name" name="name" autocomplete="name" value="${escapeHTML(account.name)}" required maxlength="80"><label for="profile-email">Email address</label><input id="profile-email" name="email" type="email" autocomplete="email" value="${escapeHTML(account.email)}" required maxlength="254"><p class="profile-meta">We’ll verify your passkey before saving any changes.</p><button class="button primary" type="submit">Save changes ${icon('arrow')}</button></form>`;
++  } else {
++    panel.innerHTML = `<div class="settings-header"><div><p class="eyebrow orange">A LITTLE PEACE OF MIND</p><h2>Passkeys & security</h2></div><button class="button primary" data-add-passkey>${icon('plus')} Add a passkey</button></div><p class="description">Your saved passkeys. A simple, secure way to come back.</p><div class="security-note">${icon('shield')}<span>Your fingerprint, face, and device PIN stay on your device. Keep at least one passkey to stay connected to your account.</span></div>${account.passkeys.map(key => `<div class="passkey-row">${icon('device')}<div class="key-detail"><strong>${escapeHTML(key.name)}</strong><p>Added ${formatDate(key.created)} · ${key.lastUsed ? `Used ${formatDate(key.lastUsed)}` : 'Ready to use'}</p></div><button class="row-action" data-rename="${escapeHTML(key.id)}" aria-label="Rename ${escapeHTML(key.name)}">Rename</button><button class="row-action" data-remove="${escapeHTML(key.id)}" aria-label="Remove ${escapeHTML(key.name)}">Remove</button></div>`).join('')}<p class="profile-meta">Passkey changes require a fresh device verification.</p><button class="learn-link" data-reauth style="margin-top:16px">${icon('shield')} Verify my identity again ↗</button>`;
++  }
++}
++function openModal(content) {
++  $('#modal-content').innerHTML = content;
++  if (!$('#modal').open) $('#modal').showModal();
++}
++function infoModal(type) {
++  const information = {
++    passkeys: ['key', 'A familiar way to sign in.', 'A passkey replaces a password with your device’s fingerprint, face recognition, or PIN. Your device keeps the private key; this demo stores only the public key and profile in this browser. You can use a synced passkey provider or a compatible security key.', 'A production account needs a server to verify credentials and keep your profile available across browsers. Clearing this browser’s site data removes access to your local demo profile.'],
++    help: ['cup', 'A little help, on the house.', 'To start, choose “Create an account,” enter your details, and follow your device’s passkey prompt. Already registered here? Choose “Sign in with a passkey.”', 'Use a current browser over HTTPS or localhost. This local demo cannot recover profiles after browser data is cleared. Your device or passkey provider manages the passkey itself.'],
++    rewards: ['star', 'Being a regular feels good.', 'Good coffee is even better with a little something extra. Grind Rewards is our idea for giving your everyday ritual a little more back.', 'Rewards enrollment and points are coming soon. Creating a demo profile does not enroll you in a live rewards program.'],
++    story: ['leaf', 'Rooted in good coffee.', 'The Daily Grind is a place for slow mornings, familiar faces, and a really good cup of coffee. Ethically sourced. Thoughtfully roasted. Always served with heart.', 'From the first espresso to the last catch-up of the day, we believe good coffee brings us together.'],
++    locations: ['cup', 'Find your little corner.', 'Your neighborhood café is always worth the walk. Café locations and opening hours will appear here when they’re available.', 'In the meantime, browse our seasonal favorites below and find your next usual.'],
++    privacy: ['shield', 'Your details stay close.', 'This demo stores your name, email, and passkey public keys in this browser’s local storage. It does not send account data to a server. Your biometric data and private key stay with your device or passkey provider.', 'Coffee images load from Unsplash and fonts load from Google Fonts. Removing site data removes local profiles; remove passkeys separately through your device or provider settings.'],
++    terms: ['cup', 'A small note before your sip.', 'This website is an interactive local demonstration. It does not place orders, take payments, provide live rewards, or create a production customer account.', 'Passkeys created here are real device credentials. Local profiles are limited to this browser and this site address.']
++  };
++  const [symbol, title, body, extra] = information[type] || information.help;
++  openModal(`${icon(symbol, 'modal-icon')}<h2 id="modal-title">${title}</h2><p>${body}</p><p>${extra}</p><div class="modal-buttons"><button class="button primary" data-close>Got it ${icon('check')}</button></div>`);
++}
++function signout() { currentId = null; setAuthMode('signin'); renderView('welcome'); toast('You’re signed out. See you for your next cup.'); }
++
++$('#auth-form').addEventListener('submit', event => {
++  event.preventDefault();
++  if (authMode === 'signin') {
++    action(async () => { currentId = await authenticate(); renderView('welcome'); toast('Welcome back. Your passkey has been verified.'); });
++  } else {
++    const name = $('#register-name').value.trim();
++    const email = $('#register-email').value.trim().toLowerCase();
++    if (!name || !email) return toast('Add your name and a valid email address to get started.', true);
++    if (accounts.some(a => a.email.toLowerCase() === email)) return toast('There’s already a profile for this email in this browser. Sign in with your passkey.', true);
++    action(async () => {
++      requireWebAuthn();
++      const account = { id: toBase64(challengeBytes()), name, email, created: Date.now(), passkeys: [] };
++      const key = await enroll(account);
++      commit([...accounts, { ...account, passkeys: [key] }]);
++      currentId = account.id;
++      $('#auth-form').reset();
++      setAuthMode('signin');
++      renderView('welcome');
++      toast('You’re part of the daily ritual. Your account and passkey are ready.');
++    });
++  }
++});
++
++document.addEventListener('submit', event => {
++  if (event.target.id === 'profile-form') {
++    event.preventDefault();
++    const name = $('#profile-name').value.trim();
++    const email = $('#profile-email').value.trim().toLowerCase();
++    const account = currentAccount();
++    if (!account || !name || !email) return toast('Please enter a name and a valid email address.', true);
++    if (accounts.some(a => a.id !== account.id && a.email.toLowerCase() === email)) return toast('This email is already used by another profile in this browser.', true);
++    if (name === account.name && email === account.email) return toast('Your details are already up to date.');
++    action(async () => { await authenticate(account); updateAccount({ ...currentAccount(), name, email }); renderView('profile'); toast('Identity verified. Your personal details are updated.'); });
++  }
++  if (event.target.id === 'rename-form') {
++    event.preventDefault();
++    const id = event.target.dataset.key;
++    const name = $('#passkey-name').value.trim();
++    if (!name) return;
++    action(async () => {
++      await authenticate(currentAccount());
++      const account = currentAccount();
++      updateAccount({ ...account, passkeys: account.passkeys.map(key => key.id === id ? { ...key, name } : key) });
++      $('#modal').close(); renderView('passkeys'); toast('Passkey renamed. Looking familiar already.');
++    });
++  }
++});
++document.addEventListener('click', event => {
++  const button = event.target.closest('button');
++  if (!button || busy) return;
++  if (button.dataset.auth) setAuthMode(button.dataset.auth);
++  if (button.dataset.view) renderView(button.dataset.view);
++  if (button.dataset.goto) renderView(button.dataset.goto);
++  if (button.dataset.access) { renderView('welcome'); setAuthMode(button.dataset.access); }
++  if (button.dataset.info) infoModal(button.dataset.info);
++  if (button.hasAttribute('data-close') || button.classList.contains('modal-close')) $('#modal').close();
++  if (button.id === 'signout' || button.hasAttribute('data-signout')) signout();
++  if (button.hasAttribute('data-add-passkey')) action(async () => {
++    await authenticate(currentAccount());
++    const key = await enroll(currentAccount());
++    updateAccount({ ...currentAccount(), passkeys: [...currentAccount().passkeys, key] });
++    renderView('passkeys'); toast('Another way back to your favorite place. Passkey added.');
++  });
++  if (button.hasAttribute('data-reauth')) action(async () => { await authenticate(currentAccount()); renderView('passkeys'); toast('Identity confirmed with your passkey. You’re all set.'); });
++  if (button.dataset.rename) {
++    const key = currentAccount()?.passkeys.find(k => k.id === button.dataset.rename);
++    if (!key) return;
++    openModal(`${icon('key', 'modal-icon')}<h2 id="modal-title">A name you’ll recognize.</h2><p>Give this passkey a familiar name. You’ll verify your identity before we save it.</p><form id="rename-form" data-key="${escapeHTML(key.id)}" class="modal-form"><label for="passkey-name">Passkey name</label><input id="passkey-name" value="${escapeHTML(key.name)}" maxlength="60" required autofocus><div class="modal-buttons"><button class="button" type="button" data-close>Cancel</button><button class="button primary" type="submit">Verify & save</button></div></form>`);
++  }
++  if (button.dataset.remove) {
++    const account = currentAccount();
++    if (account.passkeys.length < 2) {
++      openModal(`${icon('shield', 'modal-icon')}<h2 id="modal-title">Keep a way back in.</h2><p>This is your last saved passkey. Add another passkey before removing it so you can always get back to your account.</p><div class="modal-buttons"><button class="button primary" data-close>Got it</button></div>`);
++      return;
++    }
++    const key = account.passkeys.find(k => k.id === button.dataset.remove);
++    if (!key) return;
++    openModal(`${icon('key', 'modal-icon')}<h2 id="modal-title">Remove this passkey?</h2><p>“${escapeHTML(key.name)}” will no longer sign you in to this local profile. Your other passkeys will keep working.</p><p>You’ll need to remove the credential from your device or passkey provider separately.</p><div class="modal-buttons"><button class="button" data-close>Keep it</button><button class="button primary" data-confirm-remove="${escapeHTML(key.id)}">Verify & remove</button></div>`);
++  }
++  if (button.dataset.confirmRemove) action(async () => {
++    await authenticate(currentAccount());
++    const account = currentAccount();
++    if (account.passkeys.length < 2) throw new Error('Add another passkey before removing your last one.');
++    updateAccount({ ...account, passkeys: account.passkeys.filter(k => k.id !== button.dataset.confirmRemove) });
++    $('#modal').close(); renderView('passkeys'); toast('Passkey removed from your local account.');
++  });
++  if (button.dataset.drink) {
++    const drinks = {
++      maple: ['Maple Oat Latte', 'Creamy oat milk, a double shot of espresso, and a little Vermont maple syrup. A cozy sip, served hot or over ice.'],
++      espresso: ['Dark Roast Espresso', 'A bold, beautifully balanced double espresso with rich cocoa notes and a smooth, smoky finish.'],
++      cold: ['Signature Cold Brew', 'Our signature beans, slowly steeped for 18 hours. Smooth, full-bodied, and poured over ice.']
++    };
++    const [title, description] = drinks[button.dataset.drink];
++    openModal(`${icon('cup', 'modal-icon')}<p class="eyebrow orange">FIND YOUR NEXT USUAL</p><h2 id="modal-title">${title}</h2><p>${description}</p><p>Ask your barista about availability and allergens. Online ordering is not available in this demo.</p><div class="modal-buttons"><button class="button primary" data-close>Sounds like my usual ${icon('heart')}</button></div>`);
++  }
++});
++$('#modal').addEventListener('click', event => {
++  if (busy) return;
++  const rect = $('#modal').getBoundingClientRect();
++  if (event.target === $('#modal') && (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom)) $('#modal').close();
++});
++$('#modal').addEventListener('cancel', event => { if (busy) event.preventDefault(); });
++document.querySelector('.auth-tabs').addEventListener('keydown', event => {
++  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key) || busy) return;
++  event.preventDefault();
++  const mode = event.key === 'Home' ? 'signin' : event.key === 'End' ? 'register' : authMode === 'signin' ? 'register' : 'signin';
++  setAuthMode(mode);
++  $(`#${mode}-tab`).focus();
++});
++// Do not retain an authenticated UI when another tab changes this browser's records.
++window.addEventListener('storage', event => {
++  if (event.key !== storageKey && event.key !== null) return;
++  currentId = null;
++  storageRevision += 1;
++  operationAbort?.abort();
++  try { const next = JSON.parse(localStorage.getItem(storageKey) || '[]'); if (!Array.isArray(next)) throw new Error(); accounts = next; }
++  catch { accounts = []; }
++  $('#modal').close(); renderView('welcome'); toast('Account data changed in another tab. Sign in again to continue.');
++});
++setAuthMode('signin');
++renderView('welcome');
++if (!storageAvailable) toast('Local account storage is unavailable. Please enable site storage in your browser.', true);
+diff --git a/index.html b/index.html
+index 66c9173..936ca2b 100644
+--- a/index.html
++++ b/index.html
+@@ -1,212 +1,90 @@
+ <!DOCTYPE html>
+ <html lang="en">
+-
+ <head>
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+-  <title>The Daily Grind | Artisanal Coffee</title>
+-  <style>
+-    :root {
+-      --primary: #4e342e;
+-      --secondary: #d7ccc8;
+-      --accent: #ffab40;
+-      --text: #3e2723;
+-      --light: #fafafa;
+-    }
+-
+-    * {
+-      box-sizing: border-box;
+-      margin: 0;
+-      padding: 0;
+-    }
+-
+-    body {
+-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+-      line-height: 1.6;
+-      color: var(--text);
+-      background-color: var(--light);
+-    }
+-
+-    /* Navigation */
+-    nav {
+-      background: var(--primary);
+-      color: white;
+-      padding: 1rem 5%;
+-      display: flex;
+-      justify-content: space-between;
+-      align-items: center;
+-      position: sticky;
+-      top: 0;
+-      z-index: 1000;
+-    }
+-
+-    .logo {
+-      font-size: 1.5rem;
+-      font-weight: bold;
+-      letter-spacing: 1px;
+-    }
+-
+-    nav ul {
+-      display: flex;
+-      list-style: none;
+-    }
+-
+-    nav ul li {
+-      margin-left: 20px;
+-    }
+-
+-    nav a {
+-      color: white;
+-      text-decoration: none;
+-      font-size: 0.9rem;
+-      transition: color 0.3s;
+-    }
+-
+-    nav a:hover {
+-      color: var(--accent);
+-    }
+-
+-    .logout-link {
+-      border: 1px solid var(--accent);
+-      padding: 5px 12px;
+-      border-radius: 4px;
+-    }
+-
+-    /* Hero Section */
+-    .hero {
+-      height: 60vh;
+-      background: linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)),
+-        url('https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?auto=format&fit=crop&w=1350&q=80');
+-      background-size: cover;
+-      background-position: center;
+-      display: flex;
+-      flex-direction: column;
+-      justify-content: center;
+-      align-items: center;
+-      color: white;
+-      text-align: center;
+-      padding: 0 20px;
+-    }
+-
+-    .hero h1 {
+-      font-size: 3rem;
+-      margin-bottom: 1rem;
+-    }
+-
+-    /* Content Sections */
+-    .container {
+-      max-width: 1100px;
+-      margin: 40px auto;
+-      padding: 0 20px;
+-    }
+-
+-    .grid {
+-      display: grid;
+-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+-      gap: 20px;
+-      margin-top: 20px;
+-    }
+-
+-    .card {
+-      background: white;
+-      padding: 20px;
+-      border-radius: 8px;
+-      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+-      text-align: center;
+-    }
+-
+-    .card h3 {
+-      margin-bottom: 10px;
+-      color: var(--primary);
+-    }
+-
+-    .btn {
+-      display: inline-block;
+-      background: var(--primary);
+-      color: white;
+-      padding: 10px 20px;
+-      text-decoration: none;
+-      border-radius: 5px;
+-      margin-top: 15px;
+-      transition: background 0.3s;
+-    }
+-
+-    .btn:hover {
+-      background: #3e2723;
+-    }
+-
+-    footer {
+-      background: var(--secondary);
+-      text-align: center;
+-      padding: 40px 20px;
+-      margin-top: 40px;
+-    }
+-
+-    .footer-links {
+-      margin-bottom: 20px;
+-    }
+-
+-    .footer-links a {
+-      margin: 0 10px;
+-      color: var(--text);
+-      text-decoration: none;
+-      font-size: 0.85rem;
+-    }
+-  </style>
++  <meta name="theme-color" content="#f7f5ef">
++  <meta name="description" content="Your daily ritual, made personal. Sign in to The Daily Grind with a secure passkey.">
++  <title>My Account | The Daily Grind</title>
++  <link rel="preconnect" href="https://fonts.googleapis.com">
++  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
++  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;450;500;550;600;650;700&family=Manrope:wght@400;500;600;650;700;750;800&display=swap" rel="stylesheet">
++  <link rel="stylesheet" href="styles.css">
++  <script src="app.js" defer></script>
+ </head>
+-
+ <body>
+-
+-  <nav>
+-    <div class="logo">THE DAILY GRIND</div>
+-    <ul>
+-      <li><a href="/menu">Menu</a></li>
+-      <li><a href="/locations">Locations</a></li>
+-      <li><a href="/rewards">Rewards</a></li>
+-      <li><a href="/account">My Account</a></li>
+-      <li><a href="/logout" class="logout-link">Logout</a></li>
+-    </ul>
+-  </nav>
+-
+-  <header class="hero">
+-    <h1>Wake Up Your Senses</h1>
+-    <p>Ethically sourced, locally roasted, delivered to your cup.</p>
+-    <a href="/order-online" class="btn">Order Now</a>
++  <svg class="svg-defs" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
++    <symbol id="i-cup" viewBox="0 0 24 24"><path d="M4 8h13v7a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5V8Zm13 1h2a3 3 0 0 1 0 6h-2M7 2v3m4-3v3m4-3v3M2 22h19"/></symbol>
++    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M5 12h14m-6-6 6 6-6 6"/></symbol>
++    <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 21v-2a8 8 0 0 1 16 0v2"/></symbol>
++    <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="9" r="5"/><path d="m12 12 9 9m-5-5 3-3m-6 0 3-3"/></symbol>
++    <symbol id="i-shield" viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6l8-3Z"/><path d="m8 12 3 3 5-6"/></symbol>
++    <symbol id="i-out" viewBox="0 0 24 24"><path d="M9 4H4v16h5m0-8h12m-5-5 5 5-5 5"/></symbol>
++    <symbol id="i-fingerprint" viewBox="0 0 48 48"><path d="M11 25v-2a13 13 0 0 1 26 0v5m-31-4v-1a18 18 0 0 1 36 0v4M16 33a34 34 0 0 0 3-12 5 5 0 0 1 10 1c0 8-2 15-5 20M11 34c3-6 3-8 3-12a10 10 0 0 1 20 0c0 7-1 14-4 20M24 22c0 7-2 14-5 19m18-8-2 7M6 30l-1 3"/></symbol>
++    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
++    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
++    <symbol id="i-device" viewBox="0 0 24 24"><rect x="5" y="2" width="14" height="20" rx="3"/><path d="M10 18h4"/></symbol>
++    <symbol id="i-heart" viewBox="0 0 24 24"><path d="M20 5c-3-3-6-1-8 1-2-2-5-4-8-1-5 5 2 11 8 15 6-4 13-10 8-15Z"/></symbol>
++    <symbol id="i-star" viewBox="0 0 24 24"><path d="m12 3 3 6 7 1-5 5 1 7-6-3-6 3 1-7-5-5 7-1 3-6Z"/></symbol>
++    <symbol id="i-help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9 9a3 3 0 0 1 6 0c0 3-3 2-3 5m0 3h.01"/></symbol>
++    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2"/></symbol>
++    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
++    <symbol id="i-leaf" viewBox="0 0 24 24"><path d="M20 3C8 2 2 8 5 15s15 5 15-12ZM4 21 15 10"/></symbol>
++  </defs></svg>
++  <div class="announcement">Good coffee. Good company. A little something for you. <a href="#seasonal">Meet your next favorite <span aria-hidden="true">↗</span></a></div>
++  <header class="site-header">
++    <a class="brand" href="#" aria-label="The Daily Grind home"><span class="brand-icon"><svg aria-hidden="true"><use href="#i-cup"/></svg></span><span>THE DAILY GRIND<span class="brand-sub">COFFEE & COMMUNITY</span></span><span class="brand-period">®</span></a>
++    <nav aria-label="Main navigation"><a href="#seasonal">Our Menu</a><button data-info="story">Our Story</button><button data-info="locations">Find a Café</button><button data-info="rewards">Grind Rewards</button></nav>
++    <a class="account-link" href="#account"><svg aria-hidden="true"><use href="#i-user"/></svg> My Account</a>
+   </header>
+-
+-  <main class="container">
+-    <section>
+-      <h2 style="text-align: center;">Seasonal Favorites</h2>
+-      <div class="grid">
+-        <div class="card">
+-          <h3>Maple Oat Latte</h3>
+-          <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+-          <a href="/menu/seasonal" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Dark Roast Espresso</h3>
+-          <p>Bold, smokey, and perfect for a morning boost.</p>
+-          <a href="/menu/espresso" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Cold Brew</h3>
+-          <p>Steeped for 18 hours for maximum smoothness.</p>
+-          <a href="/menu/cold-brew" class="btn">View Details</a>
++  <main>
++    <section class="account-section" id="account">
++      <div class="breadcrumb"><a href="#">Home</a><span>/</span><span>My Account</span></div>
++      <div class="page-heading"><div><p class="eyebrow">YOUR DAILY GRIND</p><h1>A little more you.</h1><p>Your coffee. Your perks. Your little corner of the café.</p></div><span class="heading-note"><svg aria-hidden="true"><use href="#i-cup"/></svg> Made for your everyday.</span></div>
++      <div class="account-layout">
++        <aside class="account-sidebar">
++          <div class="member"><div class="avatar" id="avatar"><svg aria-hidden="true"><use href="#i-user"/></svg></div><div><strong id="member-name">Hey, coffee lover.</strong><span id="member-status">Make yourself at home</span></div></div>
++          <div class="sidebar-rule"></div>
++          <nav class="account-nav" aria-label="Account settings">
++            <button class="active" data-view="welcome"><svg aria-hidden="true"><use href="#i-user"/></svg>My account<svg class="nav-arrow" aria-hidden="true"><use href="#i-arrow"/></svg></button>
++            <button data-view="profile"><svg aria-hidden="true"><use href="#i-heart"/></svg>Personal details</button>
++            <button data-view="passkeys"><svg aria-hidden="true"><use href="#i-key"/></svg>Passkeys & security</button>
++          </nav>
++          <div class="sidebar-bottom"><div class="small-reward"><svg aria-hidden="true"><use href="#i-star"/></svg><h3>A regular has its rewards.</h3><p>A little closer to your next<br>on-the-house moment.</p><button data-info="rewards">Meet Grind Rewards <span>↗</span></button></div><button class="help-link" data-info="help"><svg aria-hidden="true"><use href="#i-help"/></svg> A little help?</button><button class="help-link" id="signout" hidden><svg aria-hidden="true"><use href="#i-out"/></svg> Sign out</button></div>
++        </aside>
++        <div class="account-content">
++          <section class="welcome-card" id="welcome-panel">
++            <div class="auth-side">
++              <div class="auth-tabs" role="tablist" aria-label="Account access"><button id="signin-tab" role="tab" aria-selected="true" aria-controls="auth-form-panel" class="active" data-auth="signin">Sign in</button><button id="register-tab" role="tab" aria-selected="false" aria-controls="auth-form-panel" data-auth="register">Create an account</button></div>
++              <div id="auth-form-panel" role="tabpanel" aria-labelledby="signin-tab">
++                <div class="fingerprint-tile"><svg aria-hidden="true"><use href="#i-fingerprint"/></svg><span><svg aria-hidden="true"><use href="#i-check"/></svg></span></div>
++                <p class="eyebrow orange">LESS FRICTION. MORE COFFEE.</p>
++                <h2 id="auth-title">Your usual.<br>Without the password.</h2>
++                <p class="auth-description" id="auth-description">A familiar face. A simple touch. Sign in securely<br class="desktop-break"> with a passkey and get back to the good stuff.</p>
++                <form id="auth-form">
++                  <div id="register-fields" hidden><label for="register-name">Your name</label><input id="register-name" name="name" autocomplete="name" placeholder="Alex Morgan" maxlength="80"><label for="register-email">Email address</label><input id="register-email" name="email" type="email" autocomplete="email" placeholder="you@example.com" maxlength="254"></div>
++                  <button type="submit" class="button primary" id="auth-submit"><svg aria-hidden="true"><use href="#i-key"/></svg><span>Sign in with a passkey</span><svg class="button-arrow" aria-hidden="true"><use href="#i-arrow"/></svg></button>
++                </form>
++                <p class="device-note"><svg aria-hidden="true"><use href="#i-lock"/></svg> Your face, fingerprint, or device PIN. Always yours.</p>
++                <div class="auth-divider"></div><p class="auth-switch" id="auth-switch">New around here? <button data-auth="register">Pull up a chair <span>↗</span></button></p>
++              </div>
++            </div>
++            <div class="coffee-side"><div class="photo-shade"></div><div class="photo-top"><span class="little-star">✳</span><span>A GOOD DAY STARTS HERE.</span></div><div class="photo-copy"><span class="photo-tag">YOUR DAILY MOMENT</span><h2>Great coffee.<br>Even better<br>to see you.</h2><p>For the first sip, the familiar faces,<br>and everything in between.</p><div class="photo-footer"><span>Roasted with care. Served with heart.</span><svg aria-hidden="true"><use href="#i-heart"/></svg></div></div></div>
++          </section>
++          <section class="settings-card" id="settings-panel" hidden></section>
++          <div class="benefits"><div class="benefit"><span class="benefit-icon"><svg aria-hidden="true"><use href="#i-shield"/></svg></span><div><h3>More secure. Less to remember.</h3><p>No passwords to forget or reset.</p></div></div><div class="benefit"><span class="benefit-icon"><svg aria-hidden="true"><use href="#i-device"/></svg></span><div><h3>Your device. Your key.</h3><p>Built-in protection, wherever you go.</p></div></div><button class="learn-link" data-info="passkeys">What’s a passkey? <span>↗</span></button></div>
++          <p class="local-note">A little heads-up: this is a local account demo. Your profile stays in this browser; passkeys are managed by your device.</p>
+         </div>
+       </div>
+     </section>
++    <section class="seasonal-section" id="seasonal"><div class="section-heading"><div><p class="eyebrow orange">FIND YOUR NEXT USUAL</p><h2>Good things are brewing.</h2></div><span>Crafted for slow mornings & everything after.</span></div><div class="coffee-grid">
++      <button class="coffee-card" data-drink="maple"><img src="https://images.unsplash.com/photo-1461023058943-07fcbe16d735?auto=format&fit=crop&w=700&q=85" alt="Iced latte with creamy milk and espresso" loading="lazy"><div><span>THE SEASONAL SIP</span><h3>Maple Oat Latte <span>↗</span></h3><p>A cozy little twist on your everyday.</p></div></button>
++      <button class="coffee-card" data-drink="espresso"><img src="https://images.unsplash.com/photo-1510707577719-ae7c14805e3a?auto=format&fit=crop&w=700&q=85" alt="Freshly pulled espresso in a ceramic cup" loading="lazy"><div><span>THE BOLD CLASSIC</span><h3>Dark Roast Espresso <span>↗</span></h3><p>Small cup. A whole lot of character.</p></div></button>
++      <button class="coffee-card" data-drink="cold"><img src="https://images.unsplash.com/photo-1517701604599-bb29b565090c?auto=format&fit=crop&w=700&q=85" alt="Cold brew coffee served over ice" loading="lazy"><div><span>THE SLOW & SMOOTH ONE</span><h3>Signature Cold Brew <span>↗</span></h3><p>Steeped for 18 hours. Worth every one.</p></div></button>
++    </div></section>
+   </main>
+-
+-  <footer>
+-    <div class="footer-links">
+-      <a href="/about">Our Story</a> |
+-      <a href="/careers">Join the Team</a> |
+-      <a href="/contact">Contact Us</a> |
+-      <a href="/privacy-policy">Privacy</a>
+-    </div>
+-    <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+-  </footer>
+-
++  <footer><a class="footer-brand" href="#">THE DAILY GRIND<span>Good coffee brings us together.</span></a><p>© 2026 The Daily Grind Coffee Co.</p><div><button data-info="privacy">Privacy</button><button data-info="terms">Terms</button><button data-info="help">Get in touch <span>↗</span></button></div></footer>
++  <div id="status" class="toast" role="status" aria-live="polite" hidden></div>
++  <dialog id="modal" aria-labelledby="modal-title"><button class="modal-close" aria-label="Close dialog"><svg aria-hidden="true"><use href="#i-close"/></svg></button><div id="modal-content"></div></dialog>
+ </body>
+-
+ </html>
+diff --git a/package.json b/package.json
+index 2bd4d77..d36c7c9 100644
+--- a/package.json
++++ b/package.json
+@@ -2,7 +2,8 @@
+   "name": "daily-grind",
+   "version": "1.0.0",
+   "scripts": {
+-    "start": "pnpm dlx statikk --port ${PORT:-11222}"
++    "start": "pnpm dlx statikk --port ${PORT:-11222}",
++    "build": "node --check app.js"
+   },
+   "pnpm": {
+     "onlyBuiltDependencies": []
+diff --git a/styles.css b/styles.css
+new file mode 100644
+index 0000000..04a046c
+--- /dev/null
++++ b/styles.css
+@@ -0,0 +1,8 @@
++:root{--paper:#f7f6f2;--white:#fff;--ink:#282b25;--muted:#7b7d75;--orange:#bd512f;--line:#e7e7df;--sage:#eef0e7;--font:'DM Sans',sans-serif}*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:25px}body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--font);font-size:14px;-webkit-font-smoothing:antialiased}button,input{font:inherit}button,a{-webkit-tap-highlight-color:transparent}button{cursor:pointer}button{color:inherit}a{color:inherit;text-decoration:none}button:disabled{cursor:wait;opacity:.6}button:focus-visible,a:focus-visible,input:focus-visible{outline:3px solid #bd512f77;outline-offset:4px}svg{width:21px;height:21px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}.svg-defs{position:absolute;width:0;height:0;overflow:hidden}[hidden]{display:none!important}.announcement{height:34px;background:#eaede3;display:flex;justify-content:center;align-items:center;gap:13px;font-size:10px;letter-spacing:.2px}.announcement a{font-weight:650;text-decoration:underline;text-underline-offset:3px}.announcement a span{margin-left:4px}.site-header{height:103px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;max-width:1440px;margin:auto;padding:0 5.55%;gap:25px}.brand{display:flex;align-items:center;gap:10px;font-size:17px;font-weight:800;letter-spacing:-.7px;line-height:1.3}.brand-icon{height:42px;width:42px;border:1.5px solid var(--ink);border-radius:50%;display:grid;place-items:center}.brand-icon svg{width:26px;height:26px;stroke-width:1.5}.brand-sub{display:block;font-size:8px;letter-spacing:2.1px;font-weight:600;margin-top:4px}.brand-period{font-size:10px;align-self:flex-start;margin-left:-5px;margin-top:5px}.site-header nav{display:flex;gap:31px;font-size:12px;font-weight:550;margin-left:40px}.site-header nav button,footer button{border:0;background:none;padding:0}.site-header nav a:hover,.site-header nav button:hover,footer button:hover{color:var(--orange)}.account-link{display:flex;align-items:center;gap:9px;border:1px solid #dcded3;border-radius:6px;padding:11px 16px;font-weight:600;font-size:12px}.account-link svg{width:17px;height:17px}.account-section,.seasonal-section{max-width:1280px;margin:auto;padding:0 5.1%}.breadcrumb{display:flex;align-items:center;gap:12px;font-size:10px;padding-top:27px;color:#87887f}.breadcrumb span:last-child{color:#4c5046}.page-heading{display:flex;justify-content:space-between;align-items:flex-end;margin:30px 0 30px}.eyebrow{font-size:9px;font-weight:700;letter-spacing:1.9px;margin:0 0 11px}.page-heading h1{font-family:Manrope,sans-serif;font-size:36px;line-height:1.2;letter-spacing:-1.7px;font-weight:650;margin:0 0 10px}.page-heading>div>p:last-child{font-size:12px;color:var(--muted);margin:0}.heading-note{font-size:11px;color:#797c70;display:flex;align-items:center;gap:9px;padding-bottom:3px}.heading-note svg{width:18px;height:18px}.account-layout{display:grid;grid-template-columns:211px minmax(0,1fr);gap:31px}.account-sidebar{display:flex;flex-direction:column;padding-top:7px}.member{display:flex;gap:11px;align-items:center}.avatar{width:40px;height:40px;border-radius:50%;background:#e9ecdf;color:#6a7455;display:grid;place-items:center;font-weight:700}.avatar svg{width:19px;height:19px}.member strong{font-size:12px;display:block;max-width:155px;overflow-wrap:anywhere}.member>div>span{font-size:10px;display:block;color:var(--muted);margin-top:4px}.sidebar-rule{height:1px;background:var(--line);margin:24px 0 18px}.account-nav{display:flex;flex-direction:column;gap:6px}.account-nav button{border:0;background:none;display:flex;align-items:center;text-align:left;gap:12px;padding:13px 12px;border-radius:5px;font-size:11px;font-weight:500;white-space:nowrap}.account-nav button>svg{width:17px;height:17px}.account-nav button.active{background:#e9ecdf;color:#48583a;font-weight:650}.account-nav button:hover{background:#e9ecdf88}.account-nav .nav-arrow{width:14px;margin-left:auto}.sidebar-bottom{margin-top:auto;padding-top:35px}.small-reward{padding:20px 17px 18px;background:#efeee8;border:1px solid #e6e5dd;border-radius:7px}.small-reward>svg{color:#788363;width:22px;height:22px;margin-bottom:9px}.small-reward h3{font-size:11px;margin:0 0 7px}.small-reward p{font-size:10px;line-height:1.7;color:#85857c;margin:0 0 12px}.small-reward button{background:none;border:0;padding:0;font-size:10px;font-weight:650}.small-reward button span{margin-left:13px}.help-link{display:flex;align-items:center;gap:9px;font-size:11px;background:none;border:0;color:#73766b;margin-top:19px;padding:0 10px}.help-link svg{width:16px;height:16px}.welcome-card{border:1px solid #e2e3da;border-radius:10px;overflow:hidden;display:grid;grid-template-columns:1.1fr 1fr;background:var(--white);min-height:493px;box-shadow:0 4px 14px #222a1d03}.auth-side{padding:0 32px 27px}.auth-tabs{display:flex;gap:27px;border-bottom:1px solid var(--line);margin-bottom:28px}.auth-tabs button{padding:20px 0 15px;background:none;border:0;border-bottom:2px solid transparent;font-size:11px;color:#8a8b81;margin-bottom:-1px;white-space:nowrap}.auth-tabs button.active{border-color:var(--orange);font-weight:650;color:var(--ink)}.fingerprint-tile{height:60px;width:60px;border:1px solid #efdcd2;border-radius:15px;background:#faf0e9;color:var(--orange);display:grid;place-items:center;margin-bottom:24px;position:relative}.fingerprint-tile>svg{height:39px;width:39px;stroke-width:1.65}.fingerprint-tile>span{position:absolute;bottom:-4px;right:-5px;background:#f8f9f4;border:2px solid white;border-radius:50%;width:22px;height:22px;display:grid;place-items:center;color:#657452}.fingerprint-tile>span svg{width:13px;height:13px;stroke-width:2.5}.orange{color:var(--orange)}.auth-side .eyebrow{font-size:8px;letter-spacing:1.45px;margin-bottom:10px}.auth-side h2{font-family:Manrope,sans-serif;font-size:29px;line-height:1.25;letter-spacing:-1.2px;font-weight:650;margin:0 0 13px}.auth-description{font-size:11px;line-height:1.85;color:var(--muted);margin:0 0 24px}.button{border:1px solid var(--line);border-radius:5px;padding:13px 16px;font-size:11px;font-weight:600;display:inline-flex;align-items:center;justify-content:center;gap:10px;transition:background .2s,transform .2s;background:white}.button:hover{background:#f0f0e8}.button.primary{background:var(--orange);border-color:var(--orange);color:#fff}.button.primary:hover{background:#a64225}.button svg{width:17px;height:17px}.auth-side .button{width:100%;justify-content:flex-start}.button-arrow{margin-left:auto}.device-note{display:flex;align-items:center;justify-content:center;gap:6px;font-size:8px;color:#919286;margin:11px 0 0;white-space:nowrap}.device-note svg{width:11px;height:11px}.auth-divider{height:1px;background:var(--line);margin:24px 0 17px}.auth-switch{font-size:10px;color:#86877c;text-align:center;margin:0}.auth-switch button{border:0;background:none;padding:0 0 0 4px;font-size:10px;font-weight:650;color:var(--ink)}.auth-switch span{margin-left:5px}.coffee-side{position:relative;background:#463f31 url('https://images.unsplash.com/photo-1442512595331-e89e73853f31?auto=format&fit=crop&w=1000&q=90') center 45%/cover;min-height:493px;color:white;display:flex;flex-direction:column;justify-content:space-between;padding:30px 28px 22px;overflow:hidden}.photo-shade{position:absolute;inset:0;background:linear-gradient(180deg,#181d1560 0%,#1720170a 25%,#171c13a6 63%,#171c13e6 100%)}.photo-top,.photo-copy{position:relative}.photo-top{display:flex;align-items:center;gap:9px;font-size:8px;font-weight:500;letter-spacing:1.3px}.little-star{font-size:25px;line-height:1}.photo-tag{font-size:8px;letter-spacing:1.7px;color:#e0e0ca}.photo-copy h2{font-family:Manrope,sans-serif;font-weight:500;font-size:36px;letter-spacing:-1.5px;line-height:1.13;margin:15px 0 14px}.photo-copy p{font-size:10px;line-height:1.9;color:#e7e6dc;margin:0 0 27px}.photo-footer{display:flex;justify-content:space-between;align-items:center;font-size:7px;color:#d3d4c9;border-top:1px solid #ffffff30;padding-top:16px}.photo-footer svg{width:15px;height:15px}.benefits{display:flex;align-items:center;gap:24px;padding:24px 0 0}.benefit{display:flex;gap:10px;align-items:center}.benefit-icon{background:#eeefe7;color:#778067;height:32px;width:32px;border-radius:50%;display:grid;place-items:center;flex-shrink:0}.benefit-icon svg{height:17px;width:17px}.benefit h3{font-size:9px;font-weight:600;margin:0 0 5px}.benefit p{font-size:8px;color:#85887c;margin:0}.learn-link{margin-left:auto;background:none;border:0;font-size:9px;white-space:nowrap;padding:0;color:#6f7364}.learn-link span{margin-left:5px}.local-note{font-size:8px;color:#909186;margin:20px 0 0}.seasonal-section{margin-top:62px;padding-bottom:51px}.section-heading{display:flex;align-items:flex-end;justify-content:space-between;border-top:1px solid var(--line);padding-top:31px;margin-bottom:23px}.section-heading .eyebrow{font-size:8px;letter-spacing:1.5px}.section-heading h2{font-family:Manrope,sans-serif;font-size:25px;letter-spacing:-1px;font-weight:600;margin:0}.section-heading>span{font-size:10px;color:var(--muted);padding-bottom:3px}.coffee-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}.coffee-card{text-align:left;padding:0;overflow:hidden;border:1px solid var(--line);border-radius:7px;background:#fff;transition:transform .2s}.coffee-card:hover{transform:translateY(-4px)}.coffee-card img{width:100%;height:180px;object-fit:cover;display:block}.coffee-card:nth-child(1) img{object-position:center 55%}.coffee-card:nth-child(2) img{object-position:center 60%}.coffee-card>div{padding:19px}.coffee-card>div>span{font-size:8px;letter-spacing:1.3px;color:#8a8b7c}.coffee-card h3{font-size:15px;font-weight:550;margin:9px 0 6px}.coffee-card h3 span{float:right;font-size:18px;font-weight:400}.coffee-card p{font-size:10px;color:var(--muted);margin:0}footer{border-top:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:20px;padding:29px max(5.55%,calc((100vw - 1138px)/2));background:#eeefe7}.footer-brand{font-size:13px;font-weight:750;letter-spacing:-.4px}.footer-brand span{display:block;font-size:9px;font-weight:400;letter-spacing:0;margin-top:5px;color:#818473}footer>p,footer button{font-size:9px;color:#787d6e}footer>div{display:flex;gap:23px}.settings-card{background:#fff;border:1px solid var(--line);border-radius:10px;padding:32px;min-height:493px}.settings-card h2{font-family:Manrope,sans-serif;font-size:25px;letter-spacing:-.8px;margin:8px 0 10px}.settings-card .description{color:var(--muted);line-height:1.8;font-size:12px;margin-bottom:25px}.settings-header{display:flex;justify-content:space-between;align-items:center;gap:15px}.settings-card form{max-width:460px}.settings-card label,#register-fields label,.modal-form label{font-size:11px;font-weight:600;display:block;margin:17px 0 7px}input{width:100%;background:#fff;border:1px solid #dcded3;border-radius:5px;padding:12px;font-size:12px;color:var(--ink)}.settings-card form .button{margin-top:22px}.profile-meta{font-size:10px;color:var(--muted);margin-top:15px}.security-note{padding:15px;background:#f1f3eb;border-radius:6px;display:flex;align-items:flex-start;gap:11px;font-size:11px;line-height:1.7;margin:22px 0}.security-note svg{color:#6d7d55}.passkey-row{border:1px solid var(--line);padding:18px 15px;display:flex;align-items:center;gap:12px;border-radius:6px;margin-bottom:12px}.passkey-row .key-detail{flex:1;min-width:0}.key-detail strong{font-size:12px;overflow-wrap:anywhere}.key-detail p{font-size:10px;color:var(--muted);margin:5px 0 0}.row-action{background:none;border:0;font-size:10px;color:#777c6e;padding:6px}.row-action:hover{color:var(--orange)}.welcome-summary{padding:22px;border-radius:8px;background:var(--sage);margin:25px 0}.welcome-summary p{font-size:12px;line-height:1.8;color:#6c7460}.summary-actions{display:flex;flex-wrap:wrap;gap:10px}.locked-state{text-align:center;padding:35px 0}.locked-state>.fingerprint-tile{margin:0 auto 24px}.locked-state .description{max-width:330px;margin:15px auto 25px}.toast{position:fixed;bottom:25px;left:50%;transform:translateX(-50%);background:#2f3c2d;color:#fff;border-radius:7px;padding:14px 21px;font-size:12px;max-width:min(90vw,540px);z-index:50;box-shadow:0 5px 30px #0002;line-height:1.7}.toast.error{background:#813d2c}dialog{border:1px solid var(--line);border-radius:12px;padding:36px;max-width:460px;width:calc(100% - 32px);color:var(--ink);box-shadow:0 20px 90px #0003}dialog::backdrop{background:#222a2066;backdrop-filter:blur(4px)}.modal-close{position:absolute;right:13px;top:13px;border:0;background:none;padding:5px;color:var(--muted)}.modal-close svg{width:18px;height:18px}dialog h2{font-family:Manrope,sans-serif;letter-spacing:-.8px;font-size:25px;margin:7px 0 14px}dialog p{font-size:12px;line-height:1.9;color:#777c6e}.modal-icon{color:var(--orange);width:35px;height:35px;margin-bottom:17px}.modal-buttons{display:flex;justify-content:flex-end;gap:10px;margin-top:24px}.modal-error{color:#a3422e;font-size:11px;line-height:1.7;margin-top:12px}.status-badge{font-size:9px;background:#eaf0e3;color:#64754f;border-radius:20px;padding:5px 9px;white-space:nowrap}.modal-form .button{margin-top:20px}.inline-alert{font-size:11px;line-height:1.8;background:#fbefe8;color:#a4482a;padding:12px;border-radius:5px;margin-top:16px}#register-fields{margin-top:-8px;margin-bottom:18px}#register-fields label{margin-top:12px}#register-fields input{padding:10px}body.registering .fingerprint-tile{height:45px;width:45px;margin-bottom:18px}body.registering .fingerprint-tile>svg{width:29px;height:29px}body.registering .auth-description{margin-bottom:18px}body.registering .auth-side h2{font-size:26px}body.registering .auth-divider{margin-top:18px}body.registering .welcome-card{min-height:610px}
++@media(min-width:1440px){.account-section,.seasonal-section{padding-left:65px;padding-right:65px}.welcome-card{min-height:515px}.coffee-side{min-height:515px}.auth-side{padding-top:4px}.auth-tabs{margin-bottom:34px}.fingerprint-tile{margin-bottom:27px}.auth-description{margin-bottom:28px}}
++@media(max-width:1100px){.site-header{padding:0 4%;gap:15px}.site-header nav{gap:20px;margin-left:0}.account-section,.seasonal-section{padding-left:4%;padding-right:4%}.account-layout{grid-template-columns:185px minmax(0,1fr);gap:23px}.auth-side{padding-left:24px;padding-right:24px}.auth-side h2{font-size:25px}.auth-description{font-size:10px}.coffee-side{padding-left:24px;padding-right:24px}.photo-copy h2{font-size:32px}.benefits{gap:15px}.benefit h3{font-size:8px}.benefit p{font-size:7px}.learn-link{font-size:8px}.device-note{font-size:7px}.desktop-break{display:none}}
++@media(min-width:1250px){.account-section,.seasonal-section{max-width:1280px}.account-layout{grid-template-columns:220px minmax(0,1fr);gap:35px}.auth-side{padding-left:36px;padding-right:36px}.auth-side h2{font-size:31px}.auth-description{font-size:12px}.auth-tabs button{font-size:12px}.auth-side .button{font-size:12px}.coffee-side{padding-left:31px;padding-right:31px}.photo-copy h2{font-size:39px}.welcome-card,.coffee-side{min-height:520px}.auth-tabs{margin-bottom:30px}.auth-divider{margin-top:27px}}
++@media(max-width:850px){.site-header{height:85px}.site-header nav{gap:17px;font-size:11px}.brand{font-size:14px}.brand-icon{height:35px;width:35px}.brand-sub{font-size:6px;letter-spacing:1.6px}.account-link{font-size:11px;padding:10px}.account-layout{grid-template-columns:155px minmax(0,1fr);gap:20px}.member{gap:8px}.avatar{width:32px;height:32px;flex-shrink:0}.member strong{font-size:10px}.member>div>span{font-size:8px}.account-nav button{font-size:10px;gap:8px;padding-left:8px}.account-nav .nav-arrow{display:none}.small-reward{padding:15px 12px}.small-reward h3{font-size:10px}.small-reward p,.small-reward button{font-size:9px}.welcome-card{grid-template-columns:1fr .8fr}.auth-side{padding-left:20px;padding-right:20px}.auth-tabs{gap:15px}.auth-tabs button{font-size:10px}.auth-side h2{font-size:23px}.auth-side .eyebrow{font-size:6px}.coffee-side{padding-left:18px;padding-right:18px}.photo-copy h2{font-size:29px}.photo-copy p{font-size:9px}.photo-top{font-size:6px}.photo-footer{font-size:6px}.device-note{font-size:6px;gap:4px}.benefits{flex-wrap:wrap;gap:16px}.learn-link{margin-left:0}.section-heading>span{font-size:8px}.coffee-card>div{padding:15px}.coffee-card h3{font-size:13px}.coffee-card p{font-size:9px}.coffee-card img{height:150px}.heading-note{font-size:10px}.settings-card{padding:25px}.passkey-row{flex-wrap:wrap}}
++@media(max-width:650px){.announcement{font-size:8px;gap:7px;height:31px}.announcement a{font-size:8px}.site-header{height:78px;padding:0 5%}.site-header nav{display:none}.brand{font-size:14px}.account-link{font-size:10px}.account-section,.seasonal-section{padding-left:5%;padding-right:5%}.breadcrumb{padding-top:22px;font-size:9px}.page-heading{margin:25px 0}.page-heading h1{font-size:32px}.page-heading>div>p:last-child{font-size:11px}.heading-note{display:none}.account-layout{display:flex;flex-direction:column;gap:19px}.account-sidebar{padding-top:0}.member,.sidebar-rule,.sidebar-bottom{display:none}.account-nav{flex-direction:row;gap:4px;border-bottom:1px solid var(--line);padding-bottom:12px}.account-nav button{font-size:10px;padding:10px 8px;gap:6px;flex:1;justify-content:center}.account-nav button svg{width:14px;height:14px}.welcome-card{grid-template-columns:1.1fr .85fr;min-height:470px}.auth-side{padding-left:19px;padding-right:19px;padding-bottom:24px}.auth-tabs{gap:14px;margin-bottom:25px}.auth-tabs button{font-size:9px;padding-top:17px}.fingerprint-tile{height:50px;width:50px;margin-bottom:23px}.fingerprint-tile>svg{height:33px;width:33px}.auth-side h2{font-size:23px}.auth-side .eyebrow{font-size:6px;letter-spacing:1px}.auth-description{font-size:10px}.auth-side .button{font-size:9px;padding:12px 10px;gap:6px}.button svg{width:14px;height:14px}.device-note{font-size:6px;white-space:normal;line-height:1.7;text-align:center;align-items:flex-start}.auth-divider{margin-top:22px}.auth-switch,.auth-switch button{font-size:8px}.coffee-side{padding:23px 16px 20px;min-height:470px}.photo-copy h2{font-size:28px}.photo-tag{font-size:6px;letter-spacing:1.2px}.photo-top{font-size:5px;gap:5px;letter-spacing:1px}.little-star{font-size:21px}.photo-copy p{font-size:8px;line-height:1.9}.photo-footer{font-size:5px;gap:5px;line-height:1.7}.photo-footer svg{width:12px;height:12px}.benefits{gap:19px 15px;padding-top:21px}.benefit{flex:1;gap:8px;min-width:130px}.benefit-icon{width:28px;height:28px}.benefit h3{font-size:8px;line-height:1.5}.benefit p{font-size:7px;line-height:1.7}.learn-link{font-size:9px}.local-note{font-size:7px;line-height:1.8;margin-top:15px}.seasonal-section{margin-top:34px;padding-bottom:30px}.section-heading{padding-top:25px;margin-bottom:20px}.section-heading h2{font-size:22px}.section-heading>span{display:none}.coffee-grid{gap:12px;grid-template-columns:1fr}.coffee-card{display:flex;align-items:center}.coffee-card img{width:105px;height:120px;flex-shrink:0}.coffee-card>div{flex:1;padding:15px}.coffee-card h3{font-size:14px}.coffee-card>div>span{font-size:7px}.coffee-card p{font-size:9px}footer{padding:25px 5%;flex-wrap:wrap;gap:20px}.footer-brand{font-size:12px}footer>p{font-size:8px}footer>div{width:100%;gap:25px}.settings-card{padding:24px 20px;min-height:420px}.settings-header{align-items:flex-start}.settings-header h2{font-size:21px}.settings-header .button{font-size:9px;padding:10px;white-space:nowrap}.passkey-row{gap:8px}.row-action{font-size:9px}.key-detail strong{font-size:11px}.key-detail p{font-size:8px}.settings-card .description{font-size:11px}.status-badge{font-size:8px}}
++@media(max-width:380px){.welcome-card{grid-template-columns:1fr}.coffee-side{display:none}.auth-side{padding:0 25px 25px}.auth-tabs button{font-size:11px}.auth-side h2{font-size:29px}.auth-side .eyebrow{font-size:8px}.auth-description{font-size:12px}.auth-side .button{font-size:12px}.device-note{font-size:8px}.auth-switch,.auth-switch button{font-size:10px}.account-nav button{font-size:9px}.announcement{font-size:7px}.announcement a{font-size:7px}}
++@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*::before,*::after{transition:none!important}}

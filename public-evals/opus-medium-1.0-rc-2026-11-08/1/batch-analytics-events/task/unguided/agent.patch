@@ -1,0 +1,208 @@
+diff --git a/analytics.js b/analytics.js
+new file mode 100644
+--- a/analytics.js
++++ b/analytics.js
+@@ -0,0 +1,203 @@
++/*
++ * Daily Grind client-side analytics.
++ *
++ * Records page views and click interactions, queues them in memory, and
++ * flushes them to the collector as a single batched request. Rapid
++ * interactions coalesce: each new event resets a debounce timer, a max-wait
++ * cap guarantees delivery during sustained activity, and the send itself is
++ * deferred to browser idle time. Pending events are flushed via
++ * navigator.sendBeacon when the page is hidden or unloaded so clicks on
++ * navigation links are not lost.
++ *
++ * Configuration (attributes on the <script> tag):
++ *   data-endpoint     Collector URL (default: /api/analytics)
++ *   data-debounce-ms  Quiet period before flushing (default: 2000)
++ *   data-max-wait-ms  Longest an event may wait during constant activity (default: 10000)
++ *   data-max-batch    Flush immediately once this many events are queued (default: 20)
++ */
++(function () {
++  'use strict';
++
++  var script = document.currentScript;
++  function config(name, fallback) {
++    var value = script && script.getAttribute('data-' + name);
++    return value == null || value === '' ? fallback : value;
++  }
++
++  var ENDPOINT = config('endpoint', '/api/analytics');
++  var DEBOUNCE_MS = Number(config('debounce-ms', 2000));
++  var MAX_WAIT_MS = Number(config('max-wait-ms', 10000));
++  var MAX_BATCH = Number(config('max-batch', 20));
++  var MAX_QUEUE = 500; // hard cap so a failing collector can't grow memory unbounded
++  var MAX_TEXT = 80;
++
++  // Respect explicit user privacy signals.
++  if (navigator.doNotTrack === '1' || window.doNotTrack === '1' || navigator.globalPrivacyControl === true) {
++    return;
++  }
++
++  var queue = [];
++  var debounceTimer = null;
++  var maxWaitTimer = null;
++  var idleHandle = null;
++  var sessionId = getSessionId();
++
++  function getSessionId() {
++    var key = 'dg_analytics_sid';
++    try {
++      var existing = sessionStorage.getItem(key);
++      if (existing) return existing;
++      var id = randomId();
++      sessionStorage.setItem(key, id);
++      return id;
++    } catch (e) {
++      return randomId();
++    }
++  }
++
++  function randomId() {
++    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
++    return Date.now().toString(36) + Math.random().toString(36).slice(2);
++  }
++
++  // Path only: query strings and fragments can carry tokens or PII.
++  function safePath(href) {
++    try {
++      var url = new URL(href, location.href);
++      return url.origin === location.origin ? url.pathname : url.origin + url.pathname;
++    } catch (e) {
++      return null;
++    }
++  }
++
++  function track(type, data) {
++    if (queue.length >= MAX_QUEUE) queue.shift();
++    queue.push({
++      type: type,
++      ts: Date.now(),
++      path: location.pathname,
++      data: data || {}
++    });
++    schedule();
++  }
++
++  function schedule() {
++    if (queue.length >= MAX_BATCH) {
++      flush();
++      return;
++    }
++    clearTimeout(debounceTimer);
++    debounceTimer = setTimeout(deferredFlush, DEBOUNCE_MS);
++    if (!maxWaitTimer) {
++      maxWaitTimer = setTimeout(deferredFlush, MAX_WAIT_MS);
++    }
++  }
++
++  function clearTimers() {
++    clearTimeout(debounceTimer);
++    clearTimeout(maxWaitTimer);
++    debounceTimer = maxWaitTimer = null;
++    if (idleHandle != null) {
++      if (window.cancelIdleCallback) cancelIdleCallback(idleHandle);
++      else clearTimeout(idleHandle);
++      idleHandle = null;
++    }
++  }
++
++  // Send in the background when the main thread is idle.
++  function deferredFlush() {
++    clearTimeout(debounceTimer);
++    clearTimeout(maxWaitTimer);
++    debounceTimer = maxWaitTimer = null;
++    if (idleHandle != null) return;
++    var run = function () {
++      idleHandle = null;
++      flush();
++    };
++    idleHandle = window.requestIdleCallback
++      ? requestIdleCallback(run, { timeout: 2000 })
++      : setTimeout(run, 0);
++  }
++
++  function flush(useBeacon) {
++    clearTimers();
++    if (!queue.length) return;
++
++    var events = queue;
++    queue = [];
++    var body = JSON.stringify({
++      sessionId: sessionId,
++      sentAt: Date.now(),
++      events: events
++    });
++
++    if (useBeacon && navigator.sendBeacon) {
++      var blob = new Blob([body], { type: 'application/json' });
++      if (navigator.sendBeacon(ENDPOINT, blob)) return;
++    }
++
++    if (window.fetch) {
++      fetch(ENDPOINT, {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: body,
++        keepalive: body.length < 60000,
++        credentials: 'same-origin'
++      }).then(function (res) {
++        if (!res.ok && !useBeacon) requeue(events);
++      }).catch(function () {
++        if (!useBeacon) requeue(events);
++      });
++    }
++  }
++
++  // Put failed events back for the next batch, without retrying immediately
++  // (the next tracked event or page hide triggers the retry).
++  function requeue(events) {
++    queue = events.concat(queue).slice(-MAX_QUEUE);
++  }
++
++  function describeTarget(el) {
++    var text = (el.getAttribute('aria-label') || el.textContent || '').replace(/\s+/g, ' ').trim();
++    var info = {
++      tag: el.tagName.toLowerCase(),
++      text: text.slice(0, MAX_TEXT)
++    };
++    if (el.id) info.id = el.id;
++    if (typeof el.className === 'string' && el.className.trim()) info.classes = el.className.trim();
++    if (el.dataset && el.dataset.analytics) info.label = el.dataset.analytics;
++    if (el.href) info.href = safePath(el.href);
++    var section = el.closest('nav, header, main, footer, section');
++    if (section) info.section = section.tagName.toLowerCase();
++    return info;
++  }
++
++  // Delegate clicks; attribute to the nearest interactive ancestor if any.
++  document.addEventListener('click', function (event) {
++    var target = event.target instanceof Element ? event.target : null;
++    if (!target) return;
++    var el = target.closest('a, button, [role="button"], input[type="submit"], input[type="button"], [data-analytics]') || target;
++    var info = describeTarget(el);
++    info.x = event.clientX;
++    info.y = event.clientY;
++    track('click', info);
++  }, { capture: true, passive: true });
++
++  // Flush with sendBeacon as the page goes away (navigation, tab close, backgrounding).
++  document.addEventListener('visibilitychange', function () {
++    if (document.visibilityState === 'hidden') flush(true);
++  });
++  window.addEventListener('pagehide', function () {
++    flush(true);
++  });
++
++  track('page_view', {
++    title: document.title,
++    referrer: document.referrer ? safePath(document.referrer) : null,
++    viewport: window.innerWidth + 'x' + window.innerHeight,
++    language: navigator.language
++  });
++
++  // Small public API for custom events.
++  window.dailyGrindAnalytics = { track: track, flush: flush };
++})();

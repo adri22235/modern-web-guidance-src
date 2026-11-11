@@ -1,0 +1,723 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..23a7019
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,5 @@
++node_modules/
++dist/
++.env
++data/
++*.sqlite*
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..75118fd
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,22 @@
++# Daily Grind rewards
++
++The homepage now includes a two-step rewards registration form. It uses Google Identity Services in a popup to confirm email ownership without sending a code or email link. There is no password field, client-side verification flag, or simulated success path.
++
++## Configuration
++
++Requires Node.js 22.13+ and `npm install` (or `npm ci`). Copy `.env.example` to `.env`, set `GOOGLE_CLIENT_ID` to a Google OAuth **Web application** client ID, and set `APP_ORIGIN` to the exact website origin. Add the same origin to the client's **Authorized JavaScript origins** in Google Cloud. No Google client secret is required. Use HTTPS in production, set `NODE_ENV=production`, and keep `DATA_DIR` on persistent storage with restricted access and backups.
++
++`npm run build` checks syntax, runs isolated cryptographic verification and storage tests, and packages the application in `dist/`. It does not start a server or import the server entrypoint. When explicitly ready to serve the application, `npm start` runs the Node HTTP server; a static file host alone cannot support registration. A packaged deployment needs Node dependencies installed and the same runtime environment variables. Both source and packaged versions use the same start command.
++
++## Verification contract
++
++- `POST /api/rewards/challenge` accepts JSON `{}` from `APP_ORIGIN`. It returns a public Google client ID and random nonce, and sets an HttpOnly, SameSite registration cookie (Secure over HTTPS). Challenges expire after ten minutes and are single-use after a successful registration.
++- The browser passes the nonce to Google, then sends `POST /api/rewards/register` with `{ name, email, credential, termsAccepted: true, marketingConsent: false }`. `credential` must be a Google-signed ID token, not a Google access token.
++- The server validates Google's signature against its rotating public keys, the issuer, audience, expiry, token age, subject, optional authorized party, nonce, verified-email claim, and matching form email. Only Gmail and Google Workspace accounts with a signed hosted-domain claim qualify. Google is not authoritative for third-party emails attached to personal Google accounts, even when their `email_verified` claim is true. See [Google's verification guidance](https://developers.google.com/identity/gsi/web/guides/verify-google-id-token).
++- Success returns HTTP 201 and `{ account: { id, name, email, emailVerified: true } }` only after the account is stored. Missing configuration returns 503; invalid identity/challenge returns 401; duplicates return 409; excessive attempts return 429. Failed responses never claim that an email is verified.
++
++Accounts persist in SQLite at `DATA_DIR/rewards.sqlite`. Email and provider subject have unique constraints. Consent choices, terms version and timestamps are stored; ID tokens are not. Registration does not establish an authenticated account session or implement reward balances/redemption. Existing homepage navigation destinations remain outside this change.
++
++The challenge and request-rate maps are process-local. Deploy as one persistent Node process; multi-instance deployments need a shared challenge/rate store. The limiter uses the direct socket address, ignoring untrusted forwarding headers; configure a trusted proxy strategy and edge rate limiting when deploying behind a reverse proxy. Restarting the process invalidates pending challenges, and customers can start again.
++
++No development/preview server or browser verification was used during implementation. A real end-to-end Google sign-up requires configured credentials and an authorized origin.
+diff --git a/index.html b/index.html
+index 66c9173..d505a2c 100644
+--- a/index.html
++++ b/index.html
+@@ -152,6 +152,74 @@
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    html { scroll-behavior: smooth; scroll-padding-top: 90px; }
++    .rewards {
++      display: grid;
++      grid-template-columns: 1fr 1.05fr;
++      margin: 44px 0 56px;
++      border-radius: 16px;
++      overflow: hidden;
++      border: 1px solid #e8ddd5;
++      box-shadow: 0 8px 28px #4e342e0a;
++    }
++    .rewards-story { padding: 42px 36px; background: #4e342e; color: #fffaf4; }
++    .eyebrow { font-size: .75rem; letter-spacing: .16em; font-weight: 700; text-transform: uppercase; }
++    .rewards-story .eyebrow { color: #ffcc80; }
++    .rewards h2 { font-size: 2.3rem; line-height: 1.2; margin: 18px 0; letter-spacing: -.035em; }
++    .rewards-story > p:not(.eyebrow) { color: #e4d7cf; }
++    .perks { list-style: none; margin: 30px 0; display: grid; gap: 20px; }
++    .perks li { display: flex; gap: 14px; align-items: center; }
++    .perk-icon { display: grid; place-items: center; border: 1px solid #ffffff35; border-radius: 50%; width: 38px; height: 38px; color: #ffcc80; flex-shrink: 0; }
++    .perks strong { display: block; font-size: .95rem; }
++    .perks small { color: #e4d7cf; }
++    .rewards-note { padding-top: 22px; border-top: 1px solid #ffffff25; font-size: .82rem; }
++    .rewards-panel { background: #fff; padding: 36px; }
++    .rewards-panel h3 { font-size: 1.4rem; margin-bottom: 4px; }
++    .form-intro { font-size: .9rem; color: #725d53; margin-bottom: 24px; }
++    .steps { display: flex; gap: 8px; color: #725d53; font-size: .75rem; margin-bottom: 22px; }
++    .steps span { flex: 1; border-top: 3px solid #e8ddd5; padding-top: 8px; }
++    .steps .active { border-color: #98612a; color: #4e342e; font-weight: 700; }
++    #rewards-form fieldset { border: 0; min-width: 0; }
++    .field { margin: 15px 0; }
++    .field label { display: block; font-weight: 600; font-size: .85rem; margin-bottom: 6px; }
++    .field input { width: 100%; padding: 12px 14px; font: inherit; border: 1px solid #cbbfb7; border-radius: 6px; color: var(--text); background: #fffcf9; }
++    .field input:disabled { opacity: .7; }
++    .field small { display: block; margin-top: 5px; font-size: .75rem; color: #725d53; }
++    .check { display: flex; gap: 10px; align-items: start; margin-top: 16px; font-size: .8rem; }
++    .check input { margin-top: 4px; accent-color: var(--primary); width: 16px; height: 16px; flex-shrink: 0; }
++    .rewards a { color: inherit; text-underline-offset: 3px; }
++    .rewards button { cursor: pointer; font: inherit; }
++    .signup-button { width: 100%; border: 0; background: var(--primary); color: white; font-weight: 600 !important; border-radius: 6px; padding: 13px; margin-top: 24px; }
++    .signup-button:hover { background: #35231f; }
++    .signup-button:disabled { opacity: .6; cursor: wait; }
++    .privacy-note { text-align: center; font-size: .75rem; color: #725d53; margin-top: 12px; }
++    .form-message { padding: 12px 14px; margin-top: 16px; background: #fff2e7; border-left: 3px solid #aa4d21; font-size: .85rem; }
++    #verification-step { margin-top: 22px; padding-top: 20px; border-top: 1px solid #e8ddd5; }
++    #verification-step p { margin: 8px 0 16px; font-size: .85rem; }
++    .text-button { background: none; border: 0; color: var(--primary); text-decoration: underline; padding: 8px 0; font-size: .8rem !important; }
++    #google-button { min-height: 44px; }
++    #signup-success { padding: 36px 0; }
++    .success-mark { display: grid; place-items: center; width: 52px; height: 52px; border-radius: 50%; color: #315a3b; background: #e9f2e7; font-size: 1.6rem; margin-bottom: 20px; }
++    #signup-success p { margin-top: 14px; }
++    #success-email { overflow-wrap: anywhere; font-weight: 600; }
++    #rewards-terms { margin-top: 36px; padding: 22px; background: #f3eeea; border-radius: 8px; font-size: .85rem; }
++    #rewards-terms summary { cursor: pointer; font-weight: 600; }
++    #rewards-terms p { margin-top: 12px; }
++    :focus-visible { outline: 3px solid #c8863d; outline-offset: 4px; }
++    [hidden] { display: none !important; }
++    @media (max-width: 700px) {
++      nav { flex-wrap: wrap; gap: 12px; padding: 14px 20px; }
++      nav ul { flex-wrap: wrap; gap: 10px 16px; }
++      nav ul li { margin: 0; }
++      .logo { font-size: 1.15rem; }
++      .hero { min-height: 360px; height: 50vh; }
++      .hero h1 { font-size: 2.3rem; }
++      .rewards { grid-template-columns: 1fr; }
++      .rewards-story, .rewards-panel { padding: 28px 24px; }
++      .rewards h2 { font-size: 2rem; }
++    }
++    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+   </style>
+ </head>
+ 
+@@ -162,7 +230,7 @@
+     <ul>
+       <li><a href="/menu">Menu</a></li>
+       <li><a href="/locations">Locations</a></li>
+-      <li><a href="/rewards">Rewards</a></li>
++      <li><a href="#rewards">Rewards</a></li>
+       <li><a href="/account">My Account</a></li>
+       <li><a href="/logout" class="logout-link">Logout</a></li>
+     </ul>
+@@ -175,6 +243,52 @@
+   </header>
+ 
+   <main class="container">
++    <section class="rewards" id="rewards" aria-labelledby="rewards-heading">
++      <div class="rewards-story">
++        <p class="eyebrow">The Daily Grind Rewards</p>
++        <h2 id="rewards-heading">Your daily ritual.<br>A little more rewarding.</h2>
++        <p>Make yourself a regular. Join our coffee-loving community and make every visit count.</p>
++        <ul class="perks">
++          <li><span class="perk-icon" aria-hidden="true">☕</span><div><strong>Good coffee. Great perks.</strong><small>Collect rewards on your café visits.</small></div></li>
++          <li><span class="perk-icon" aria-hidden="true">✦</span><div><strong>A little something special</strong><small>Discover member treats and seasonal offers.</small></div></li>
++          <li><span class="perk-icon" aria-hidden="true">♡</span><div><strong>Always free to join</strong><small>No membership fee. Just your next favorite cup.</small></div></li>
++        </ul>
++        <p class="rewards-note">Less inbox, more coffee. Confirm your email with Google — no code to copy or email link to hunt down.</p>
++      </div>
++      <div class="rewards-panel">
++        <div id="signup-content">
++          <div class="steps" aria-label="Registration progress"><span id="details-progress" class="active">01 · Your details</span><span id="verify-progress">02 · Verify & join</span></div>
++          <h3>Create your rewards account</h3>
++          <p class="form-intro">A few details, then you're one step closer to your next perk.</p>
++          <form id="rewards-form" method="post" action="/api/rewards/register">
++            <fieldset id="signup-fields">
++              <div class="field"><label for="rewards-name">Your name</label><input id="rewards-name" name="name" autocomplete="name" maxlength="80" placeholder="Alex Morgan" required></div>
++              <div class="field"><label for="rewards-email">Email address</label><input id="rewards-email" name="email" type="email" autocomplete="email" maxlength="254" placeholder="you@gmail.com" aria-describedby="email-help" required><small id="email-help">Use your Gmail or Google Workspace email.</small></div>
++              <label class="check"><input id="rewards-terms-check" name="terms" type="checkbox" required><span>I agree to the <a href="#rewards-terms" id="terms-link">Rewards Terms & Privacy</a>.</span></label>
++              <label class="check"><input id="rewards-marketing" name="marketing" type="checkbox"><span>Send me occasional coffee news and member offers. <em>Optional.</em></span></label>
++            </fieldset>
++            <button class="signup-button" id="signup-continue" type="submit">Continue to email verification <span aria-hidden="true">→</span></button>
++            <p class="privacy-note" id="signup-note">Free to join. No password to remember.</p>
++          </form>
++          <div id="verification-step" hidden>
++            <strong>One last sip. Verify your email.</strong>
++            <p>Choose the Google account matching your email to verify it and create your rewards account.</p>
++            <div id="google-button"></div>
++            <button type="button" class="text-button" id="edit-details">Edit your details or try again</button>
++          </div>
++          <p class="form-message" id="signup-message" role="status" aria-live="polite" hidden></p>
++          <noscript><p class="form-message">JavaScript is needed for secure Google email verification. Please enable it to join.</p></noscript>
++        </div>
++        <div id="signup-success" tabindex="-1" hidden>
++          <span class="success-mark" aria-hidden="true">✓</span>
++          <p class="eyebrow">You're part of the daily grind</p>
++          <h3>Welcome to the club, <span id="success-name"></span>.</h3>
++          <p>Your rewards account is ready, and <span id="success-email"></span> is verified.</p>
++          <p>Stop by the café and use your email to start collecting rewards.</p>
++          <a href="/menu" class="btn">Find your next favorite</a>
++        </div>
++      </div>
++    </section>
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+       <div class="grid">
+@@ -195,6 +309,12 @@
+         </div>
+       </div>
+     </section>
++    <details id="rewards-terms">
++      <summary>Rewards Terms & Privacy</summary>
++      <p>Daily Grind Rewards is free to join. Rewards and offers are subject to availability and café participation; ask in store for current earning and redemption details.</p>
++      <p>By joining, you ask Daily Grind to create an account using your name, email and Google account identifier. We store your verified email, registration date and consent choices to manage your membership. We do not receive your Google password. Marketing emails are optional and you may unsubscribe at any time.</p>
++      <p>For account access, correction or deletion, <a href="/contact">contact the café</a>. Read our <a href="/privacy-policy">Privacy Policy</a> for more information.</p>
++    </details>
+   </main>
+ 
+   <footer>
+@@ -207,6 +327,7 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script src="/rewards.js" defer></script>
+ </body>
+ 
+ </html>
+diff --git a/package.json b/package.json
+index 2bd4d77..f60e26f 100644
+--- a/package.json
++++ b/package.json
+@@ -1,10 +1,16 @@
+ {
+   "name": "daily-grind",
+   "version": "1.0.0",
++  "type": "module",
++  "engines": { "node": ">=22.13.0" },
+   "scripts": {
+-    "start": "pnpm dlx statikk --port ${PORT:-11222}"
++    "start": "node --env-file-if-exists=.env server/index.js",
++    "build": "node scripts/build.js"
+   },
+   "pnpm": {
+     "onlyBuiltDependencies": []
++  },
++  "dependencies": {
++    "jose": "^6.2.16"
+   }
+ }
+diff --git a/rewards.js b/rewards.js
+new file mode 100644
+index 0000000..6872be2
+--- /dev/null
++++ b/rewards.js
+@@ -0,0 +1,147 @@
++const form = document.querySelector('#rewards-form');
++const fields = document.querySelector('#signup-fields');
++const nextButton = document.querySelector('#signup-continue');
++const message = document.querySelector('#signup-message');
++const verification = document.querySelector('#verification-step');
++const editButton = document.querySelector('#edit-details');
++let registration;
++let working = false;
++let googleScript;
++let generation = 0;
++
++function showMessage(text) {
++  message.textContent = text;
++  message.hidden = !text;
++}
++
++function loadGoogle() {
++  if (window.google?.accounts?.id) return Promise.resolve();
++  if (googleScript) return googleScript;
++  googleScript = new Promise((resolve, reject) => {
++    const script = document.createElement('script');
++    const timer = setTimeout(() => {
++      script.remove();
++      googleScript = undefined;
++      reject(new Error('Google took too long to respond. Please try again.'));
++    }, 15000);
++    script.src = 'https://accounts.google.com/gsi/client';
++    script.async = true;
++    script.onload = () => { clearTimeout(timer); resolve(); };
++    script.onerror = () => {
++      clearTimeout(timer);
++      script.remove();
++      googleScript = undefined;
++      reject(new Error('Google could not load. Check your connection or content blocker and try again.'));
++    };
++    document.head.append(script);
++  });
++  return googleScript;
++}
++
++async function post(path, body) {
++  const response = await fetch(path, {
++    method: 'POST',
++    headers: { 'Content-Type': 'application/json' },
++    credentials: 'same-origin',
++    body: JSON.stringify(body),
++    signal: AbortSignal.timeout(20000),
++  });
++  let result;
++  try { result = await response.json(); }
++  catch { throw new Error('Email verification is unavailable. Please try again later.'); }
++  if (!response.ok) throw new Error(result.error || 'Registration failed. Please try again.');
++  return result;
++}
++
++function resetDetails() {
++  generation++;
++  registration = undefined;
++  fields.disabled = false;
++  nextButton.hidden = false;
++  nextButton.disabled = false;
++  verification.hidden = true;
++  document.querySelector('#signup-note').hidden = false;
++  document.querySelector('#verify-progress').classList.remove('active');
++  document.querySelector('#google-button').replaceChildren();
++  showMessage('');
++}
++
++form.addEventListener('submit', async (event) => {
++  event.preventDefault();
++  if (working || !form.reportValidity()) return;
++  if (!document.querySelector('#rewards-name').value.trim()) {
++    showMessage('Please enter your name.');
++    document.querySelector('#rewards-name').focus();
++    return;
++  }
++  working = true;
++  nextButton.disabled = true;
++  fields.disabled = true;
++  showMessage('Preparing secure email verification…');
++  try {
++    registration = {
++      name: document.querySelector('#rewards-name').value.trim(),
++      email: document.querySelector('#rewards-email').value.trim().toLowerCase(),
++      termsAccepted: document.querySelector('#rewards-terms-check').checked,
++      marketingConsent: document.querySelector('#rewards-marketing').checked,
++    };
++    const challenge = await post('/api/rewards/challenge', {});
++    await loadGoogle();
++    const attempt = ++generation;
++    window.google.accounts.id.initialize({
++      client_id: challenge.clientId,
++      nonce: challenge.nonce,
++      auto_select: false,
++      callback: (response) => completeRegistration(response, attempt),
++    });
++    verification.hidden = false;
++    nextButton.hidden = true;
++    document.querySelector('#signup-note').hidden = true;
++    document.querySelector('#verify-progress').classList.add('active');
++    window.google.accounts.id.renderButton(document.querySelector('#google-button'), {
++      type: 'standard', theme: 'outline', size: 'large', text: 'signup_with', shape: 'rectangular',
++    });
++    showMessage('');
++    document.querySelector('#google-button [tabindex]')?.focus();
++  } catch (error) {
++    resetDetails();
++    showMessage(error.name === 'TimeoutError' || error instanceof TypeError ? 'Could not connect. Check your connection and try again.' : error.message);
++  } finally {
++    working = false;
++    nextButton.disabled = false;
++  }
++});
++
++async function completeRegistration(response, attempt) {
++  if (working || !registration || attempt !== generation) return;
++  working = true;
++  editButton.disabled = true;
++  document.querySelector('#google-button').hidden = true;
++  showMessage('Verifying your email and creating your account…');
++  try {
++    const { account } = await post('/api/rewards/register', { ...registration, credential: response.credential });
++    document.querySelector('#success-name').textContent = account.name;
++    document.querySelector('#success-email').textContent = account.email;
++    document.querySelector('#signup-content').hidden = true;
++    const success = document.querySelector('#signup-success');
++    success.hidden = false;
++    success.focus();
++    registration = undefined;
++  } catch (error) {
++    resetDetails();
++    showMessage(error.name === 'TimeoutError' || error instanceof TypeError ? 'Could not confirm registration. Try again; if your account was created, we will let you know.' : error.message);
++  } finally {
++    working = false;
++    editButton.disabled = false;
++    document.querySelector('#google-button').hidden = false;
++  }
++}
++
++editButton.addEventListener('click', () => {
++  if (working) return;
++  resetDetails();
++  document.querySelector('#rewards-email').focus();
++});
++document.querySelector('#terms-link').addEventListener('click', () => {
++  document.querySelector('#rewards-terms').open = true;
++});
+diff --git a/scripts/build.js b/scripts/build.js
+new file mode 100644
+index 0000000..5c782d9
+--- /dev/null
++++ b/scripts/build.js
+@@ -0,0 +1,16 @@
++import { spawnSync } from 'node:child_process';
++import { cp, mkdir, rm } from 'node:fs/promises';
++
++// Static checks and isolated module tests only; never imports or starts the HTTP server.
++for (const file of ['server/index.js', 'server/verification.js', 'server/store.js', 'rewards.js']) {
++  const result = spawnSync(process.execPath, ['--check', file], { stdio: 'inherit' });
++  if (result.status !== 0) process.exit(result.status || 1);
++}
++const tests = spawnSync(process.execPath, ['--test', 'tests/registration.test.js'], { stdio: 'inherit' });
++if (tests.status !== 0) process.exit(tests.status || 1);
++await rm('dist', { recursive: true, force: true });
++await mkdir('dist', { recursive: true });
++for (const path of ['index.html', 'rewards.js', 'server', 'package.json', 'package-lock.json', '.env.example']) {
++  await cp(path, `dist/${path}`, { recursive: true });
++}
++console.log('Build complete. Server and homepage packaged in dist/. No server was started.');
+diff --git a/server/index.js b/server/index.js
+new file mode 100644
+index 0000000..5e8bd6b
+--- /dev/null
++++ b/server/index.js
+@@ -0,0 +1,122 @@
++import { createServer } from 'node:http';
++import { readFile } from 'node:fs/promises';
++import { randomBytes } from 'node:crypto';
++import { fileURLToPath } from 'node:url';
++import { resolve } from 'node:path';
++import { openStore } from './store.js';
++import { RegistrationError, validateRegistration, verifyGoogleEmail } from './verification.js';
++
++const clientId = process.env.GOOGLE_CLIENT_ID || '';
++const origin = new URL(process.env.APP_ORIGIN || 'http://localhost:11222').origin;
++if (process.env.NODE_ENV === 'production' && !origin.startsWith('https://')) {
++  throw new Error('APP_ORIGIN must use HTTPS in production.');
++}
++const secureCookie = origin.startsWith('https://') ? '; Secure' : '';
++const root = fileURLToPath(new URL('../', import.meta.url));
++const store = openStore(resolve(process.env.DATA_DIR || resolve(root, 'data')));
++const challenges = new Map();
++const rateLimits = new Map();
++const ttl = 10 * 60 * 1000;
++
++function reply(res, status, data, headers = {}) {
++  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...headers });
++  res.end(JSON.stringify(data));
++}
++
++async function readBody(req) {
++  if (!req.headers['content-type']?.startsWith('application/json')) {
++    throw new RegistrationError('Send a JSON registration request.', 415);
++  }
++  let size = 0;
++  const chunks = [];
++  for await (const chunk of req) {
++    size += chunk.length;
++    if (size > 16384) throw new RegistrationError('Registration request is too large.', 413);
++    chunks.push(chunk);
++  }
++  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
++  catch { throw new RegistrationError('Invalid registration request.'); }
++}
++
++function cookie(req) {
++  return req.headers.cookie?.split(';').map(v => v.trim()).find(v => v.startsWith('dg_registration='))?.slice(16);
++}
++
++const server = createServer(async (req, res) => {
++  res.setHeader('X-Content-Type-Options', 'nosniff');
++  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
++  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
++  const pathname = new URL(req.url, origin).pathname;
++  try {
++    if (pathname.startsWith('/api/')) {
++      if (req.method !== 'POST') return reply(res, 405, { error: 'Use POST.' }, { Allow: 'POST' });
++      if (req.headers.origin !== origin) throw new RegistrationError('Please register from the Daily Grind website.', 403);
++      const now = Date.now();
++      const ip = req.socket.remoteAddress;
++      // Deliberately ignore client-supplied forwarding headers.
++      const bucket = rateLimits.get(ip) || { expires: now + ttl, count: 0 };
++      if (bucket.expires < now) { bucket.count = 0; bucket.expires = now + ttl; }
++      bucket.count++;
++      rateLimits.set(ip, bucket);
++      if (bucket.count > 30) return reply(res, 429, { error: 'Too many attempts. Please try again in 10 minutes.' }, { 'Retry-After': '600' });
++      if (!clientId || clientId.startsWith('your-client-id')) {
++        throw new RegistrationError('Email verification is temporarily unavailable. Please try again later.', 503);
++      }
++      if (pathname === '/api/rewards/challenge') {
++        await readBody(req);
++        if (challenges.size >= 10000) throw new RegistrationError('Please try again shortly.', 503);
++        const previous = cookie(req);
++        if (previous) challenges.delete(previous);
++        const session = randomBytes(32).toString('base64url');
++        const nonce = randomBytes(32).toString('base64url');
++        challenges.set(session, { nonce, expires: now + ttl, inProgress: false });
++        return reply(res, 200, { clientId, nonce }, {
++          'Set-Cookie': `dg_registration=${session}; HttpOnly; SameSite=Strict; Path=/api/rewards; Max-Age=600${secureCookie}`,
++        });
++      }
++      if (pathname === '/api/rewards/register') {
++        const input = validateRegistration(await readBody(req));
++        const session = cookie(req);
++        const challenge = challenges.get(session);
++        if (!challenge || challenge.expires < Date.now() || challenge.inProgress) {
++          throw new RegistrationError('This verification has expired. Please start again.', 401);
++        }
++        challenge.inProgress = true;
++        try {
++          const identity = await verifyGoogleEmail(input.credential, { clientId, nonce: challenge.nonce, email: input.email });
++          if (challenge.expires < Date.now() || challenges.get(session) !== challenge) {
++            throw new RegistrationError('This verification has expired. Please start again.', 401);
++          }
++          const account = store.create({ ...input, ...identity });
++          challenges.delete(session);
++          return reply(res, 201, { account }, {
++            'Set-Cookie': `dg_registration=; HttpOnly; SameSite=Strict; Path=/api/rewards; Max-Age=0${secureCookie}`,
++          });
++        } finally { challenge.inProgress = false; }
++      }
++      return reply(res, 404, { error: 'Endpoint not found.' });
++    }
++    if (!['GET', 'HEAD'].includes(req.method)) return reply(res, 405, { error: 'Method not allowed.' }, { Allow: 'GET, HEAD' });
++    const files = { '/': ['index.html', 'text/html'], '/index.html': ['index.html', 'text/html'], '/rewards.js': ['rewards.js', 'text/javascript'] };
++    const file = files[pathname];
++    if (!file) return reply(res, 404, { error: 'Page not found.' });
++    const contents = await readFile(resolve(root, file[0]));
++    res.writeHead(200, { 'Content-Type': `${file[1]}; charset=utf-8`, 'Cache-Control': 'no-cache' });
++    res.end(req.method === 'HEAD' ? undefined : contents);
++  } catch (error) {
++    if (!(error instanceof RegistrationError)) console.error('Registration service failure:', error.name);
++    reply(res, error instanceof RegistrationError ? error.status : 500, {
++      error: error instanceof RegistrationError ? error.message : 'Something went wrong. Please try again later.',
++    });
++  }
++});
++
++const cleanup = setInterval(() => {
++  const now = Date.now();
++  for (const [key, value] of challenges) if (value.expires < now) challenges.delete(key);
++  for (const [key, value] of rateLimits) if (value.expires < now) rateLimits.delete(key);
++}, 60000);
++cleanup.unref();
++server.requestTimeout = 15000;
++server.headersTimeout = 10000;
++server.listen(Number(process.env.PORT || 11222));
+diff --git a/server/store.js b/server/store.js
+new file mode 100644
+index 0000000..0bb91f6
+--- /dev/null
++++ b/server/store.js
+@@ -0,0 +1,34 @@
++import { DatabaseSync } from 'node:sqlite';
++import { mkdirSync } from 'node:fs';
++import { join } from 'node:path';
++import { randomUUID } from 'node:crypto';
++import { RegistrationError } from './verification.js';
++
++export function openStore(directory) {
++  mkdirSync(directory, { recursive: true, mode: 0o700 });
++  const db = new DatabaseSync(join(directory, 'rewards.sqlite'));
++  db.exec(`PRAGMA journal_mode=WAL;
++    CREATE TABLE IF NOT EXISTS rewards_accounts (
++      id TEXT PRIMARY KEY,
++      google_subject TEXT NOT NULL UNIQUE,
++      email TEXT NOT NULL UNIQUE,
++      name TEXT NOT NULL,
++      email_verified_at TEXT NOT NULL,
++      terms_version TEXT NOT NULL,
++      terms_accepted_at TEXT NOT NULL,
++      marketing_consent INTEGER NOT NULL,
++      created_at TEXT NOT NULL
++    );`);
++  const insert = db.prepare(`INSERT INTO rewards_accounts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
++    ON CONFLICT DO NOTHING`);
++  return {
++    create({ subject, email, name, marketingConsent }) {
++      const id = randomUUID();
++      const now = new Date().toISOString();
++      const result = insert.run(id, subject, email, name, now, '2026-11-08', now, marketingConsent ? 1 : 0, now);
++      if (result.changes !== 1) throw new RegistrationError('An account already exists. Visit the café for help with your rewards.', 409);
++      return { id, name, email, emailVerified: true };
++    },
++    close() { db.close(); },
++  };
++}
+diff --git a/server/verification.js b/server/verification.js
+new file mode 100644
+index 0000000..6c687d3
+--- /dev/null
++++ b/server/verification.js
+@@ -0,0 +1,64 @@
++import { createRemoteJWKSet, jwtVerify } from 'jose';
++
++const googleKeys = createRemoteJWKSet(new URL('https://www.googleapis.com/oauth2/v3/certs'));
++
++export class RegistrationError extends Error {
++  constructor(message, status = 400) {
++    super(message);
++    this.status = status;
++  }
++}
++
++export function validateRegistration(body) {
++  if (!body || typeof body !== 'object' || Array.isArray(body)) {
++    throw new RegistrationError('Please complete the registration form.');
++  }
++  const { name, email, credential, termsAccepted, marketingConsent } = body;
++  if (typeof name !== 'string' || !name.trim() || name.trim().length > 80) {
++    throw new RegistrationError('Enter a name of up to 80 characters.');
++  }
++  if (typeof email !== 'string' || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
++    throw new RegistrationError('Enter a valid email address.');
++  }
++  if (termsAccepted !== true) throw new RegistrationError('Please agree to the rewards terms.');
++  if (typeof credential !== 'string' || credential.length > 12000 || !credential) {
++    throw new RegistrationError('Verify your email with Google to continue.');
++  }
++  if (marketingConsent !== undefined && typeof marketingConsent !== 'boolean') {
++    throw new RegistrationError('Invalid email preferences.');
++  }
++  return { name: name.trim(), email: email.trim().toLowerCase(), credential, marketingConsent: marketingConsent === true };
++}
++
++export async function verifyGoogleEmail(credential, { clientId, nonce, email, keys = googleKeys }) {
++  let payload;
++  try {
++    ({ payload } = await jwtVerify(credential, keys, {
++      algorithms: ['RS256'],
++      issuer: ['https://accounts.google.com', 'accounts.google.com'],
++      audience: clientId,
++      requiredClaims: ['exp', 'iat', 'sub', 'email', 'email_verified', 'nonce'],
++      maxTokenAge: '10 minutes',
++    }));
++  } catch {
++    throw new RegistrationError('Google verification could not be confirmed. Please try again.', 401);
++  }
++  if (!nonce || payload.nonce !== nonce || typeof payload.sub !== 'string' || !payload.sub) {
++    throw new RegistrationError('This verification has expired. Please start again.', 401);
++  }
++  if (payload.azp !== undefined && payload.azp !== clientId) {
++    throw new RegistrationError('Google verification could not be confirmed.', 401);
++  }
++  if (payload.email_verified !== true || typeof payload.email !== 'string') {
++    throw new RegistrationError('Google has not verified this email address.', 401);
++  }
++  const verifiedEmail = payload.email.toLowerCase();
++  // A third-party address on a personal Google account is not proof of current ownership.
++  if (!verifiedEmail.endsWith('@gmail.com') && !(typeof payload.hd === 'string' && payload.hd.length > 0)) {
++    throw new RegistrationError('Use a Gmail or Google Workspace email so Google can confirm ownership.', 401);
++  }
++  if (verifiedEmail !== email) {
++    throw new RegistrationError('Choose the Google account that matches the email you entered.', 401);
++  }
++  return { subject: payload.sub, email: verifiedEmail };
++}
+diff --git a/tests/registration.test.js b/tests/registration.test.js
+new file mode 100644
+index 0000000..a34fabb
+--- /dev/null
++++ b/tests/registration.test.js
+@@ -0,0 +1,81 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { generateKeyPair, SignJWT } from 'jose';
++import { mkdtempSync, rmSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join } from 'node:path';
++import { validateRegistration, verifyGoogleEmail } from '../server/verification.js';
++import { openStore } from '../server/store.js';
++
++const { publicKey, privateKey } = await generateKeyPair('RS256');
++const clientId = 'test.apps.googleusercontent.com';
++const email = 'alex@gmail.com';
++const nonce = 'unpredictable-test-nonce';
++const options = { clientId, email, nonce, keys: publicKey };
++async function token(claims = {}, settings = {}) {
++  return new SignJWT({ email, email_verified: true, nonce, ...claims })
++    .setProtectedHeader({ alg: 'RS256' })
++    .setIssuer(settings.issuer || 'https://accounts.google.com')
++    .setAudience(settings.audience || clientId)
++    .setSubject('google-subject-123')
++    .setIssuedAt(settings.issuedAt || Math.floor(Date.now() / 1000))
++    .setExpirationTime(settings.expires || '5m')
++    .sign(privateKey);
++}
++
++test('accepts a signed, verified Gmail identity with the correct audience and nonce', async () => {
++  assert.deepEqual(await verifyGoogleEmail(await token(), options), { subject: 'google-subject-123', email });
++});
++test('accepts verified Workspace identity with signed hosted-domain claim', async () => {
++  const credential = await token({ email: 'alex@example.org', hd: 'example.org' });
++  assert.equal((await verifyGoogleEmail(credential, { ...options, email: 'alex@example.org' })).email, 'alex@example.org');
++});
++for (const [name, claims, settings] of [
++  ['unverified email', { email_verified: false }, {}],
++  ['string instead of verified boolean', { email_verified: 'true' }, {}],
++  ['wrong nonce', { nonce: 'different-browser' }, {}],
++  ['missing nonce', { nonce: undefined }, {}],
++  ['mismatched form email', { email: 'other@gmail.com' }, {}],
++  ['third-party email without Google authority', { email: 'alex@example.org' }, {}],
++  ['wrong authorized party', { azp: 'other-client' }, {}],
++  ['wrong audience', {}, { audience: 'attacker-client' }],
++  ['wrong issuer', {}, { issuer: 'https://attacker.example' }],
++  ['expired token', {}, { expires: Math.floor(Date.now() / 1000) - 60 }],
++  ['old token', {}, { issuedAt: Math.floor(Date.now() / 1000) - 1200 }],
++]) {
++  test(`rejects ${name}`, async () => {
++    await assert.rejects(verifyGoogleEmail(await token(claims, settings), options));
++  });
++}
++test('rejects forged signature and unsigned claims', async () => {
++  const { privateKey: attacker } = await generateKeyPair('RS256');
++  const forged = await new SignJWT({ email, email_verified: true, nonce })
++    .setProtectedHeader({ alg: 'RS256' }).setSubject('attacker').setIssuer('https://accounts.google.com')
++    .setAudience(clientId).setIssuedAt().setExpirationTime('5m').sign(attacker);
++  await assert.rejects(verifyGoogleEmail(forged, options));
++  await assert.rejects(verifyGoogleEmail('not-a-signed-token', options));
++});
++test('normalizes registration details and requires explicit consent', () => {
++  const body = { name: ' Alex ', email: ' ALEX@gmail.com ', termsAccepted: true, credential: 'token' };
++  assert.deepEqual(validateRegistration(body), { name: 'Alex', email, credential: 'token', marketingConsent: false });
++  for (const invalid of [null, [], { ...body, name: ' ' }, { ...body, email: 'bad-address' },
++    { ...body, termsAccepted: 'true' }, { ...body, credential: '' }, { ...body, marketingConsent: 'true' }]) {
++    assert.throws(() => validateRegistration(invalid));
++  }
++});
++test('persists verified accounts and prevents duplicate email or identity', () => {
++  const directory = mkdtempSync(join(tmpdir(), 'daily-grind-test-'));
++  let store = openStore(directory);
++  try {
++    const input = { subject: 'subject-one', email, name: 'Alex', marketingConsent: false };
++    assert.equal(store.create(input).emailVerified, true);
++    assert.throws(() => store.create({ ...input, subject: 'subject-two' }), { status: 409 });
++    assert.throws(() => store.create({ ...input, email: 'other@gmail.com' }), { status: 409 });
++    store.close();
++    store = openStore(directory);
++    assert.throws(() => store.create(input), { status: 409 });
++  } finally {
++    store.close();
++    rmSync(directory, { recursive: true, force: true });
++  }
++});

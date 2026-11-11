@@ -1,0 +1,264 @@
+diff --git a/src/components/Header.astro b/src/components/Header.astro
+index 980b279..b52a795 100644
+--- a/src/components/Header.astro
++++ b/src/components/Header.astro
+@@ -32,6 +32,13 @@ const todaysDate = new Date().toLocaleDateString('en-US', { weekday: 'long', yea
+         >
+           Sign up
+         </a>
++        <a
++          href={`${baseUrl}account`}
++          data-skip-tracking="true"
++          class="text-xs font-semibold py-2 px-3 text-gray-700 hover:underline"
++        >
++          Account
++        </a>
+         <a
+           href={`${baseUrl}signin`}
+           data-skip-tracking="true"
+diff --git a/src/components/PasskeyManager.tsx b/src/components/PasskeyManager.tsx
+new file mode 100644
+index 0000000..4ae7163
+--- /dev/null
++++ b/src/components/PasskeyManager.tsx
+@@ -0,0 +1,208 @@
++import React, { useCallback, useEffect, useState } from 'react';
++
++const API_BASE = 'https://us-central1-web-devrel-apps.cloudfunctions.net/times_cdn/api';
++export const TOKEN_KEY = 'devtools-times-token';
++
++interface Passkey {
++  id: string; // base64url credential ID
++  name: string;
++  createdAt?: string;
++  lastUsedAt?: string | null;
++}
++
++interface PasskeyList {
++  userId?: string; // base64url WebAuthn user handle
++  rpId?: string;
++  passkeys: Passkey[];
++}
++
++// Tell the browser/authenticator which credentials the server still accepts, so
++// removed passkeys disappear from autofill and the credential manager.
++async function syncAuthenticator(list: PasskeyList) {
++  const PKC = (window as any).PublicKeyCredential;
++  if (!PKC?.signalAllAcceptedCredentials || !list.userId) return;
++  try {
++    await PKC.signalAllAcceptedCredentials({
++      rpId: list.rpId || window.location.hostname,
++      userId: list.userId,
++      allAcceptedCredentialIds: list.passkeys.map((p) => p.id),
++    });
++  } catch {
++    // Signal API is best-effort; ignore unsupported or rejected signals.
++  }
++}
++
++function formatDate(value?: string | null) {
++  if (!value) return null;
++  const d = new Date(value);
++  return isNaN(d.getTime()) ? null : d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
++}
++
++export default function PasskeyManager({ signInUrl }: { signInUrl: string }) {
++  const [token, setToken] = useState<string | null>(null);
++  const [list, setList] = useState<PasskeyList | null>(null);
++  const [loading, setLoading] = useState(true);
++  const [error, setError] = useState<string | null>(null);
++  const [notice, setNotice] = useState<string | null>(null);
++  const [editingId, setEditingId] = useState<string | null>(null);
++  const [draft, setDraft] = useState('');
++  const [busyId, setBusyId] = useState<string | null>(null);
++
++  const request = useCallback(
++    async (path: string, init: RequestInit = {}) => {
++      const response = await fetch(`${API_BASE}${path}`, {
++        ...init,
++        headers: {
++          'Content-Type': 'application/json',
++          Authorization: `Bearer ${token}`,
++          ...(init.headers || {}),
++        },
++      });
++      const data = await response.json().catch(() => ({}));
++      if (response.status === 401) {
++        localStorage.removeItem(TOKEN_KEY);
++        setToken(null);
++      }
++      if (!response.ok) throw new Error(data.error || 'Request failed');
++      return data;
++    },
++    [token],
++  );
++
++  useEffect(() => {
++    const stored = localStorage.getItem(TOKEN_KEY);
++    setToken(stored);
++    if (!stored) setLoading(false);
++  }, []);
++
++  useEffect(() => {
++    if (!token) return;
++    (async () => {
++      try {
++        const data: PasskeyList = await request('/passkeys');
++        setList(data);
++        await syncAuthenticator(data);
++      } catch (e) {
++        setError(`Could not load your passkeys: ${(e as Error).message}`);
++      } finally {
++        setLoading(false);
++      }
++    })();
++  }, [token, request]);
++
++  const startEdit = (p: Passkey) => {
++    setEditingId(p.id);
++    setDraft(p.name);
++    setError(null);
++    setNotice(null);
++  };
++
++  const saveName = async (p: Passkey) => {
++    const name = draft.trim();
++    if (!name) {
++      setError('Please enter a name for this passkey.');
++      return;
++    }
++    setBusyId(p.id);
++    setError(null);
++    try {
++      await request(`/passkeys/${encodeURIComponent(p.id)}`, { method: 'PATCH', body: JSON.stringify({ name }) });
++      setList((l) => l && { ...l, passkeys: l.passkeys.map((k) => (k.id === p.id ? { ...k, name } : k)) });
++      setEditingId(null);
++      setNotice('Passkey renamed.');
++    } catch (e) {
++      setError(`Could not rename passkey: ${(e as Error).message}`);
++    } finally {
++      setBusyId(null);
++    }
++  };
++
++  const remove = async (p: Passkey) => {
++    if (!window.confirm(`Remove "${p.name}"? You will no longer be able to sign in with it.`)) return;
++    setBusyId(p.id);
++    setError(null);
++    setNotice(null);
++    try {
++      await request(`/passkeys/${encodeURIComponent(p.id)}`, { method: 'DELETE' });
++      const next = { ...list!, passkeys: list!.passkeys.filter((k) => k.id !== p.id) };
++      setList(next);
++      await syncAuthenticator(next);
++      setNotice('Passkey removed. Your browser has been told to forget it.');
++    } catch (e) {
++      setError(`Could not remove passkey: ${(e as Error).message}`);
++    } finally {
++      setBusyId(null);
++    }
++  };
++
++  const btn = 'text-xs font-semibold py-1.5 px-3 rounded border disabled:opacity-60';
++
++  return (
++    <section aria-labelledby="passkeys-heading" className="bg-white border border-gray-200 rounded-lg shadow-sm p-6">
++      <h2 id="passkeys-heading" className="text-xl font-bold text-gray-800">Passkeys</h2>
++      <p className="text-sm text-gray-600 mt-1 mb-4">
++        Passkeys let you sign in without a password. Rename them to tell your devices apart, or remove ones you no longer use.
++      </p>
++
++      {error && <div className="mb-4 p-3 text-sm text-red-700 bg-red-100 rounded-lg" role="alert">{error}</div>}
++      {notice && <div className="mb-4 p-3 text-sm text-green-700 bg-green-100 rounded-lg" role="status">{notice}</div>}
++
++      {loading ? (
++        <p className="text-sm text-gray-500">Loading passkeys…</p>
++      ) : !token ? (
++        <p className="text-sm text-gray-700">
++          Please <a href={signInUrl} className="underline font-semibold">sign in</a> to manage your passkeys.
++        </p>
++      ) : list && list.passkeys.length === 0 ? (
++        <p className="text-sm text-gray-700">You have no registered passkeys.</p>
++      ) : (
++        <ul className="divide-y divide-gray-200">
++          {list?.passkeys.map((p) => {
++            const created = formatDate(p.createdAt);
++            const used = formatDate(p.lastUsedAt);
++            const busy = busyId === p.id;
++            return (
++              <li key={p.id} className="py-3 flex flex-wrap items-center justify-between gap-3">
++                {editingId === p.id ? (
++                  <form
++                    className="flex flex-1 items-center gap-2"
++                    onSubmit={(e) => { e.preventDefault(); saveName(p); }}
++                  >
++                    <label htmlFor={`name-${p.id}`} className="sr-only">Passkey name</label>
++                    <input
++                      id={`name-${p.id}`}
++                      autoFocus
++                      value={draft}
++                      maxLength={64}
++                      onChange={(e) => setDraft(e.target.value)}
++                      className="flex-1 px-3 py-1.5 border border-gray-300 rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
++                    />
++                    <button type="submit" disabled={busy} className={`${btn} bg-gray-900 text-white border-transparent`}>Save</button>
++                    <button type="button" onClick={() => setEditingId(null)} className={`${btn} border-gray-300 text-gray-700`}>Cancel</button>
++                  </form>
++                ) : (
++                  <>
++                    <div>
++                      <p className="text-sm font-semibold text-gray-900">{p.name}</p>
++                      <p className="text-xs text-gray-500">
++                        {created && `Added ${created}`}
++                        {created && used && ' · '}
++                        {used && `Last used ${used}`}
++                      </p>
++                    </div>
++                    <div className="flex gap-2">
++                      <button onClick={() => startEdit(p)} disabled={busy} className={`${btn} border-gray-300 text-gray-700`}>Rename</button>
++                      <button onClick={() => remove(p)} disabled={busy} className={`${btn} border-red-300 text-red-700`}>
++                        {busy ? 'Working…' : 'Remove'}
++                      </button>
++                    </div>
++                  </>
++                )}
++              </li>
++            );
++          })}
++        </ul>
++      )}
++    </section>
++  );
++}
+diff --git a/src/components/SignInForm.tsx b/src/components/SignInForm.tsx
+index a7c52b6..0069fac 100644
+--- a/src/components/SignInForm.tsx
++++ b/src/components/SignInForm.tsx
+@@ -30,7 +30,7 @@ export default function SignInForm() {
+         setError(`Login failed: ${data.error || 'Unknown error'}`);
+       } else {
+         setSuccess('Login successful!');
+-        // You might store the token here if needed, e.g., localStorage.setItem('token', data.token);
++        if (data.token) localStorage.setItem('devtools-times-token', data.token);
+       }
+     } catch (err) {
+       setError('An unexpected error occurred. Please try again later.');
+diff --git a/src/pages/account.astro b/src/pages/account.astro
+new file mode 100644
+index 0000000..243b154
+--- /dev/null
++++ b/src/pages/account.astro
+@@ -0,0 +1,13 @@
++---
++import Layout from '../layouts/Layout.astro';
++import PasskeyManager from '../components/PasskeyManager';
++
++const baseUrl = import.meta.env.BASE_URL;
++---
++
++<Layout title="Account Settings | The DevTools Times">
++  <div class="max-w-2xl mx-auto py-12 px-4 sm:px-6 lg:px-8 space-y-6">
++    <h1 class="text-3xl font-bold text-gray-900">Account settings</h1>
++    <PasskeyManager client:load signInUrl={`${baseUrl}signin`} />
++  </div>
++</Layout>

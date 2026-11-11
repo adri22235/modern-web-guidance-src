@@ -1,0 +1,551 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..9f77d70
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,3 @@
++node_modules/
++data/
++.env
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..2b1d736
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,62 @@
++# Daily Grind rewards registration
++
++The homepage includes a rewards registration form backed by `POST /api/verify-email`.
++It uses the experimental browser Email Verification API: the browser fills a hidden
++`autocomplete="email-verification-token"` input when a supported email provider can
++prove ownership. No OTP, magic link, or verification email is sent.
++
++## Deployment
++
++- Use Node.js 24 or later and install dependencies with `pnpm install --frozen-lockfile`.
++- Configure the environment variables in `.env.example` in your hosting environment.
++  The server does not automatically load `.env` files.
++- Set `PUBLIC_ORIGIN` to the exact externally visible HTTPS origin. Neither forwarded
++  headers nor the request Host header are trusted as the token audience.
++- Register that origin for the [Chrome Email Verification origin trial](https://developer.chrome.com/docs/identity/email-verification)
++  and set `EMAIL_VERIFICATION_ORIGIN_TRIAL` to the issued token. Keep it renewed.
++  The server emits it in the `Origin-Trial` response header.
++- Deploy with the `pnpm start` command behind an HTTPS reverse proxy. Local HTTP is
++  permitted only for localhost development. The default port is 11222.
++- Give the application a persistent, private `data/` directory. SQLite holds account
++  records and expiring signup sessions. This implementation targets one application
++  instance; multi-instance hosting needs a shared transactional database and limiter.
++- `pnpm build` performs syntax checks without starting the server or importing its entrypoint.
++
++Serving `index.html` alone is insufficient: each page render needs a server-generated
++nonce and session cookie. The Node server serves the page, script, and API; it never
++exposes the database or source files. Existing menu/account/order URLs remain outside
++this registration feature. Rewards earning, account login, and redemption are not added.
++
++## Verification behavior
++
++Each form receives a random 256-bit nonce stored in a server-side session, with a
++10-minute expiry. Its opaque cookie is HttpOnly, SameSite=Lax and Secure over HTTPS.
++Pages use `Cache-Control: no-store`. Submission atomically consumes the nonce, even
++on failure, and each response renders a fresh one. Origin checks and request limits
++protect the endpoint. Form submissions remain native so the browser can insert its
++verification token at submission time; registration works without JavaScript.
++
++The verifier uses `@sd-jwt/core` and `jose` to check the issuer signature, verified
++email claim (case-insensitively), expiration/freshness, asymmetric algorithm allowlist,
++browser key signature, audience, nonce, and SD-JWT hash binding. Before requesting
++issuer metadata or keys it checks the email domain's DNS TXT delegation. Outbound
++HTTPS requests reject private addresses and redirects, pin their DNS lookup, and
++have response-size and time limits. Issuer keys without `kid` are tried individually.
++
++Only successfully verified registrations are persisted. Passwords are salted and
++scrypt-hashed; raw tokens and passwords are never logged or retained. Duplicate
++accounts cannot overwrite existing credentials. Marketing is opt-in.
++
++Unsupported browsers, unsigned-in providers, missing tokens, and invalid tokens
++produce an inline retry message and never mark an email verified. The usual
++OTP/link fallback is deliberately omitted because this feature must not send either.
++Consequently, registration requires a participating browser/provider and an active
++origin-trial configuration. No universal browser-only ownership check exists.
++
++Protocol reference: [Email Verification Protocol draft 02](https://www.ietf.org/archive/id/draft-hardt-email-verification-02.html).
++
++## Validation performed
++
++Syntax checks only. No dev/preview server, browser walkthrough, server-entrypoint
++import, or live issuer exchange was run. End-to-end verification requires the deployed
++HTTPS origin, its origin-trial token, and a signed-in participating email account.
+diff --git a/index.html b/index.html
+index 66c9173..bd5affc 100644
+--- a/index.html
++++ b/index.html
+@@ -152,6 +152,59 @@
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    html { scroll-padding-top: 95px; }
++    .rewards {
++      margin: 64px 0;
++      display: grid;
++      grid-template-columns: 1fr 1.05fr;
++      border: 1px solid #e3d9d0;
++      border-radius: 18px;
++      overflow: hidden;
++      box-shadow: 0 12px 40px #4e342e0a;
++    }
++    .rewards-story { background: #efe8dd; padding: 44px 36px; position: relative; }
++    .eyebrow { font-size: .73rem; font-weight: 700; letter-spacing: .17em; text-transform: uppercase; }
++    .rewards-story h2 { font-family: Georgia, serif; font-size: clamp(2.3rem, 4vw, 3.3rem); line-height: 1.12; margin: 20px 0; font-weight: 400; }
++    .rewards-story > p { max-width: 32ch; color: #66554b; }
++    .perks { list-style: none; margin: 32px 0; display: grid; gap: 20px; }
++    .perks li { display: flex; align-items: center; gap: 15px; }
++    .perk-icon { width: 38px; height: 38px; border: 1px solid #c7b8a7; border-radius: 50%; display: grid; place-items: center; font-size: 1.1rem; flex-shrink: 0; }
++    .perks strong { display: block; font-size: .9rem; }
++    .perks small { color: #66554b; }
++    .member-card { background: #4e342e; color: #f8eedb; border-radius: 12px; padding: 24px; margin-top: 38px; box-shadow: 0 12px 24px #4e342e20; transform: rotate(-3deg); }
++    .member-card p { font-family: Georgia, serif; font-size: 1.6rem; margin: 18px 0 5px; }
++    .member-card .card-bottom { display: flex; justify-content: space-between; font-size: .7rem; letter-spacing: .08em; }
++    .rewards-form { background: white; padding: 42px 36px; }
++    .rewards-form h3 { font-family: Georgia, serif; font-size: 1.8rem; font-weight: 400; margin: 7px 0; }
++    .form-intro { color: #71635d; font-size: .9rem; margin-bottom: 24px; }
++    .field { margin-top: 18px; }
++    .field label { display: block; font-weight: 600; font-size: .85rem; margin-bottom: 7px; }
++    .field input { display: block; width: 100%; padding: 12px 14px; border: 1px solid #cbbfb8; border-radius: 6px; background: #fffefd; font: inherit; font-size: .95rem; color: var(--text); }
++    .field input::placeholder { color: #8b7d76; }
++    .field small { display: block; margin-top: 5px; color: #71635d; font-size: .75rem; }
++    .password-toggle { background: transparent; border: 0; padding: 7px 0; color: var(--primary); text-decoration: underline; cursor: pointer; font: inherit; font-size: .8rem; }
++    :focus-visible { outline: 3px solid #b56827; outline-offset: 4px; }
++    .verification-note { margin: 22px 0; padding: 14px; background: #f3f5ef; border-radius: 6px; color: #45503b; font-size: .8rem; display: flex; align-items: flex-start; gap: 10px; }
++    .verification-note strong { display: block; margin-bottom: 3px; }
++    .check-label { display: flex; align-items: flex-start; gap: 10px; font-size: .8rem; color: #66554b; cursor: pointer; }
++    .check-label input { margin-top: 4px; width: 16px; height: 16px; accent-color: var(--primary); flex-shrink: 0; }
++    .signup-button { width: 100%; border: 0; cursor: pointer; font: inherit; font-size: .9rem; font-weight: 600; padding: 14px 20px; margin-top: 22px; display: flex; justify-content: space-between; align-items: center; }
++    .signup-footnote { text-align: center; font-size: .72rem; color: #71635d; margin-top: 12px; }
++    .form-message { padding: 16px; border-radius: 6px; margin-bottom: 20px; font-size: .9rem; }
++    .is-error { color: #822b20; background: #fff1e9; border: 1px solid #e2b8a6; }
++    .is-success { color: #315334; background: #edf6e8; border: 1px solid #abc4a0; }
++    @media (max-width: 700px) {
++      nav { flex-wrap: wrap; gap: 10px; padding: 15px 5%; }
++      .logo { font-size: 1.15rem; }
++      nav ul { flex-wrap: wrap; gap: 14px; }
++      nav ul li { margin: 0; }
++      nav a { font-size: .8rem; }
++      .hero h1 { font-size: 2.3rem; }
++      .rewards { grid-template-columns: 1fr; margin: 40px 0; }
++      .rewards-story, .rewards-form { padding: 32px 24px; }
++      .member-card { max-width: 340px; }
++    }
+   </style>
+ </head>
+ 
+@@ -162,7 +215,7 @@
+     <ul>
+       <li><a href="/menu">Menu</a></li>
+       <li><a href="/locations">Locations</a></li>
+-      <li><a href="/rewards">Rewards</a></li>
++      <li><a href="#rewards">Rewards</a></li>
+       <li><a href="/account">My Account</a></li>
+       <li><a href="/logout" class="logout-link">Logout</a></li>
+     </ul>
+@@ -175,6 +228,53 @@
+   </header>
+ 
+   <main class="container">
++    <section class="rewards" id="rewards" aria-labelledby="rewards-title">
++      <div class="rewards-story">
++        <span class="eyebrow">Daily Grind Rewards</span>
++        <h2 id="rewards-title">Your daily ritual.<br>A little more rewarding.</h2>
++        <p>Good coffee brings us together. Join our coffee community and make every cup count.</p>
++        <ul class="perks">
++          <li><span class="perk-icon" aria-hidden="true">✧</span><div><strong>Every sip adds up</strong><small>Earn points on your favorite orders.</small></div></li>
++          <li><span class="perk-icon" aria-hidden="true">♧</span><div><strong>A reason to celebrate</strong><small>Enjoy a little birthday treat on us.</small></div></li>
++          <li><span class="perk-icon" aria-hidden="true">♡</span><div><strong>You're on the inside</strong><small>Be first to hear about seasonal favorites.</small></div></li>
++        </ul>
++        <div class="member-card" aria-hidden="true">
++          <span class="eyebrow">The Daily Grind</span>
++          <p>Good coffee. Great company.</p>
++          <div class="card-bottom"><span>REWARDS MEMBER</span><span>✦ &nbsp; EST. 2026</span></div>
++        </div>
++      </div>
++      <div class="rewards-form">
++        <span class="eyebrow">A better coffee break starts here</span>
++        <h3>Create your rewards account</h3>
++        <p class="form-intro">Free to join. Plenty to look forward to.</p>
++        <!-- SIGNUP_MESSAGE -->
++        <form method="POST" action="/api/verify-email#rewards">
++          <div class="field">
++            <label for="signup-name">Full name</label>
++            <input id="signup-name" name="name" type="text" autocomplete="name" maxlength="100" placeholder="How should we call you?" value="__SIGNUP_NAME__" required>
++          </div>
++          <div class="field">
++            <label for="signup-email">Email address</label>
++            <input id="signup-email" name="email" type="email" autocomplete="email" spellcheck="false" maxlength="254" placeholder="you@example.com" value="__SIGNUP_EMAIL__" aria-describedby="verification-help" required>
++          </div>
++          <input type="hidden" name="token" autocomplete="email-verification-token" nonce="__SIGNUP_NONCE__">
++          <div class="field">
++            <label for="signup-password">Password</label>
++            <input id="signup-password" name="password" type="password" autocomplete="new-password" minlength="12" maxlength="128" placeholder="Make it uniquely yours" aria-describedby="password-help" required>
++            <small id="password-help">Use 12–128 characters. You can paste a password.</small>
++            <button type="button" class="password-toggle" aria-controls="signup-password" aria-pressed="false" hidden>Show password</button>
++          </div>
++          <div class="verification-note" id="verification-help">
++            <span aria-hidden="true">✓</span>
++            <div><strong>Your email, confirmed by your browser.</strong>No codes. No email links. Works with participating email providers and supported browsers when you're signed in to your email account.</div>
++          </div>
++          <label class="check-label"><input type="checkbox" name="marketing">Send me occasional coffee news and member offers. <span class="sr-only">(Optional)</span></label>
++          <button class="btn signup-button" type="submit">Create my rewards account <span aria-hidden="true">↗</span></button>
++          <p class="signup-footnote">Your email is only marked verified after a secure check.</p>
++        </form>
++      </div>
++    </section>
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+       <div class="grid">
+@@ -207,6 +307,7 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script src="/signup.js" defer></script>
+ </body>
+ 
+ </html>
+diff --git a/lib/verify-email.mjs b/lib/verify-email.mjs
+new file mode 100644
+index 0000000..f1ff519
+--- /dev/null
++++ b/lib/verify-email.mjs
+@@ -0,0 +1,124 @@
++import { createHash } from 'node:crypto';
++import { lookup, resolveTxt } from 'node:dns/promises';
++import { get } from 'node:https';
++import ipaddr from 'ipaddr.js';
++import { decodeSdJwtSync, SDJwtInstance } from '@sd-jwt/core';
++import { createLocalJWKSet, importJWK, jwtVerify } from 'jose';
++
++const ALGORITHMS = ['Ed25519', 'EdDSA', 'ES256'];
++const normalize = (algorithm) => algorithm === 'Ed25519' ? 'EdDSA' : algorithm;
++const hasher = (data, algorithm) => {
++  if (algorithm !== 'sha-256') throw new Error('Unsupported digest');
++  return createHash('sha256').update(data).digest();
++};
++
++// DNS delegation alone does not make an issuer safe to fetch. Pin a public
++// address to the TLS request to prevent SSRF and DNS rebinding; reject redirects.
++async function publicJson(value) {
++  const url = new URL(value);
++  if (url.protocol !== 'https:' || url.port || url.username || url.password || url.hash) {
++    throw new Error('Invalid issuer URL');
++  }
++  const addresses = await lookup(url.hostname, { all: true });
++  if (!addresses.length || addresses.some(({ address }) => ipaddr.process(address).range() !== 'unicast')) {
++    throw new Error('Issuer must use public addresses');
++  }
++  return new Promise((resolve, reject) => {
++    const request = get(url, {
++      headers: { Accept: 'application/json' },
++      lookup: (_host, options, callback) => {
++        const selected = addresses[0];
++        if (options.all) callback(null, [selected]);
++        else callback(null, selected.address, selected.family);
++      },
++    }, (response) => {
++      if (response.statusCode !== 200) {
++        response.resume();
++        reject(new Error('Issuer discovery failed'));
++        return;
++      }
++      let length = 0;
++      const chunks = [];
++      response.on('data', (chunk) => {
++        length += chunk.length;
++        if (length > 131072) response.destroy(new Error('Issuer response too large'));
++        else chunks.push(chunk);
++      });
++      response.on('error', reject);
++      response.on('end', () => {
++        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
++        catch (error) { reject(error); }
++      });
++    });
++    const timer = setTimeout(() => request.destroy(new Error('Issuer timeout')), 5000);
++    request.on('close', () => clearTimeout(timer));
++    request.on('error', reject);
++  });
++}
++
++export async function verifyEmailVerificationToken({ rawToken, submittedEmail, expectedNonce, expectedAudience }) {
++  if (!expectedNonce || !rawToken || rawToken.length > 24576) throw new Error('Missing verification');
++  const decoded = decodeSdJwtSync(rawToken, hasher);
++  const claims = decoded.jwt.payload;
++  const issuer = claims.iss;
++  if (!decoded.kbJwt || claims.email_verified !== true || typeof claims.email !== 'string' ||
++      claims.email.toLowerCase() !== submittedEmail.toLowerCase() || typeof issuer !== 'string') {
++    throw new Error('Invalid email claims');
++  }
++  const issuerUrl = new URL(issuer);
++  if (issuerUrl.protocol !== 'https:' || issuerUrl.origin !== issuer || issuerUrl.port ||
++      issuerUrl.username || issuerUrl.password) throw new Error('Invalid issuer origin');
++  const domain = submittedEmail.slice(submittedEmail.lastIndexOf('@') + 1).toLowerCase();
++  const records = await resolveTxt(`_email-verification.${domain}`);
++  if (!records.some((parts) => {
++    const record = parts.join('');
++    return record.startsWith('iss=') && `https://${record.slice(4).trim()}` === issuer;
++  })) throw new Error('Issuer is not delegated by email domain');
++
++  const metadata = await publicJson(`${issuer}/.well-known/email-verification`);
++  if (metadata.issuer !== issuer || typeof metadata.jwks_uri !== 'string') throw new Error('Invalid issuer metadata');
++  const jwks = createLocalJWKSet(await publicJson(metadata.jwks_uri));
++  const issuerOptions = {
++    typ: 'ev+sd-jwt', issuer, algorithms: ALGORITHMS,
++    requiredClaims: ['iat', 'exp', 'email', 'email_verified', 'cnf'],
++    maxTokenAge: '5m', clockTolerance: 60,
++  };
++  const sdJwt = new SDJwtInstance({
++    hasher,
++    verifier: async (data, signature) => {
++      const jwt = `${data}.${signature}`;
++      try { await jwtVerify(jwt, jwks, issuerOptions); }
++      catch (error) {
++        if (error.code !== 'ERR_JWKS_MULTIPLE_MATCHING_KEYS') throw error;
++        let matched = false;
++        for await (const key of error) {
++          try { await jwtVerify(jwt, key, issuerOptions); matched = true; break; }
++          catch { /* Try the next issuer key when no kid was supplied. */ }
++        }
++        if (!matched) throw error;
++      }
++      return true;
++    },
++    kbVerifier: async (data, signature) => {
++      const jwk = claims.cnf?.jwk;
++      const algorithm = decoded.kbJwt.header.alg;
++      if (!jwk || jwk.d || !ALGORITHMS.includes(jwk.alg) || !ALGORITHMS.includes(algorithm) ||
++          normalize(jwk.alg) !== normalize(algorithm) ||
++          (algorithm !== 'ES256' && jwk.crv !== 'Ed25519')) throw new Error('Invalid holder key');
++      const key = await importJWK(jwk, algorithm);
++      await jwtVerify(`${data}.${signature}`, key, {
++        typ: 'kb+jwt', audience: expectedAudience, algorithms: [algorithm],
++        requiredClaims: ['iat', 'aud', 'nonce', 'sd_hash'],
++        maxTokenAge: '5m', clockTolerance: 60,
++      });
++      return true;
++    },
++  });
++  await sdJwt.verify(rawToken, {
++    requiredClaimKeys: ['email', 'email_verified'],
++    keyBindingNonce: expectedNonce,
++    expectedKeyBindingAudience: expectedAudience,
++    keyBindingMaxAgeSeconds: 300,
++    skewSeconds: 60,
++  });
++}
+diff --git a/package.json b/package.json
+index 2bd4d77..bea5338 100644
+--- a/package.json
++++ b/package.json
+@@ -2,9 +2,15 @@
+   "name": "daily-grind",
+   "version": "1.0.0",
+   "scripts": {
+-    "start": "pnpm dlx statikk --port ${PORT:-11222}"
++    "start": "node server.mjs",
++    "build": "node --check server.mjs && node --check lib/verify-email.mjs && node --check signup.js"
+   },
+   "pnpm": {
+     "onlyBuiltDependencies": []
++  },
++  "dependencies": {
++    "@sd-jwt/core": "^0.24.3",
++    "ipaddr.js": "^2.5.0",
++    "jose": "^6.2.15"
+   }
+ }
+diff --git a/server.mjs b/server.mjs
+new file mode 100644
+index 0000000..b2535b2
+--- /dev/null
++++ b/server.mjs
+@@ -0,0 +1,165 @@
++import { createServer } from 'node:http';
++import { randomBytes, randomUUID, scrypt } from 'node:crypto';
++import { promisify } from 'node:util';
++import { readFile, mkdir } from 'node:fs/promises';
++import { DatabaseSync } from 'node:sqlite';
++import { verifyEmailVerificationToken } from './lib/verify-email.mjs';
++
++const port = Number(process.env.PORT || 11222);
++const origin = new URL(process.env.PUBLIC_ORIGIN || `http://localhost:${port}`).origin;
++if (!origin.startsWith('https://') && !/^http:\/\/(localhost|127\.0\.0\.1)(:|$)/.test(origin)) {
++  throw new Error('PUBLIC_ORIGIN must use HTTPS outside localhost');
++}
++const secure = origin.startsWith('https://');
++const cookieName = secure ? '__Host-dg-signup' : 'dg-signup';
++const template = await readFile(new URL('./index.html', import.meta.url), 'utf8');
++const signupScript = await readFile(new URL('./signup.js', import.meta.url), 'utf8');
++await mkdir(new URL('./data/', import.meta.url), { recursive: true, mode: 0o700 });
++const db = new DatabaseSync(new URL('./data/rewards.sqlite', import.meta.url).pathname);
++db.exec(`PRAGMA journal_mode=WAL;
++  CREATE TABLE IF NOT EXISTS signup_sessions (id TEXT PRIMARY KEY, nonce TEXT NOT NULL, expires INTEGER NOT NULL);
++  CREATE TABLE IF NOT EXISTS rewards_accounts (
++    id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL,
++    email_key TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
++    marketing INTEGER NOT NULL, email_verified_at INTEGER NOT NULL
++  );`);
++const deriveKey = promisify(scrypt);
++const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({
++  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
++})[char]);
++
++function sessionId(request) {
++  return request.headers.cookie?.split(';').map((part) => part.trim())
++    .find((part) => part.startsWith(`${cookieName}=`))?.slice(cookieName.length + 1) || '';
++}
++
++function render(request, response, { status = 200, message = '', success = false, name = '', email = '' } = {}) {
++  const now = Date.now();
++  db.prepare('DELETE FROM signup_sessions WHERE expires < ?').run(now);
++  db.prepare('DELETE FROM signup_sessions WHERE id = ?').run(sessionId(request));
++  // Bound persistent anonymous state in this single-instance application.
++  db.prepare('DELETE FROM signup_sessions WHERE id IN (SELECT id FROM signup_sessions ORDER BY expires DESC LIMIT -1 OFFSET 10000)').run();
++  const id = randomBytes(32).toString('base64url');
++  const nonce = randomBytes(32).toString('base64url');
++  db.prepare('INSERT INTO signup_sessions VALUES (?, ?, ?)').run(id, nonce, now + 600000);
++  response.writeHead(status, {
++    'Content-Type': 'text/html; charset=utf-8',
++    'Cache-Control': 'no-store',
++    'Set-Cookie': `${cookieName}=${id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600${secure ? '; Secure' : ''}`,
++    'X-Content-Type-Options': 'nosniff',
++    'Referrer-Policy': 'strict-origin-when-cross-origin',
++    'Content-Security-Policy': "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https://images.unsplash.com; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
++    ...(process.env.EMAIL_VERIFICATION_ORIGIN_TRIAL ? { 'Origin-Trial': process.env.EMAIL_VERIFICATION_ORIGIN_TRIAL } : {}),
++  });
++  const notice = message ? `<div class="form-message ${success ? 'is-success' : 'is-error'}" role="${success ? 'status' : 'alert'}" tabindex="-1" autofocus>${escapeHtml(message)}</div>` : '';
++  response.end(template.replace('<!-- SIGNUP_MESSAGE -->', notice)
++    .replace('__SIGNUP_NONCE__', nonce)
++    .replace('__SIGNUP_NAME__', escapeHtml(name))
++    .replace('__SIGNUP_EMAIL__', escapeHtml(email)));
++}
++
++async function readForm(request) {
++  if (!request.headers['content-type']?.startsWith('application/x-www-form-urlencoded')) {
++    throw Object.assign(new Error('Please submit the signup form again.'), { status: 415 });
++  }
++  const chunks = [];
++  let size = 0;
++  for await (const chunk of request) {
++    size += chunk.length;
++    if (size > 40000) throw Object.assign(new Error('The form is too large. Please try again.'), { status: 413 });
++    chunks.push(chunk);
++  }
++  const form = new URLSearchParams(Buffer.concat(chunks).toString('utf8'));
++  for (const key of form.keys()) {
++    if (form.getAll(key).length !== 1) throw Object.assign(new Error('Please submit the form again.'), { status: 400 });
++  }
++  return form;
++}
++
++// Small per-address limiter; do not trust forwarded IP headers from arbitrary clients.
++const attempts = new Map();
++function limited(request) {
++  const now = Date.now();
++  for (const [key, entry] of attempts) if (entry.until < now) attempts.delete(key);
++  const address = request.socket.remoteAddress;
++  const entry = attempts.get(address) || { count: 0, until: now + 60000 };
++  entry.count += 1;
++  attempts.set(address, entry);
++  return entry.count > 30;
++}
++
++const server = createServer(async (request, response) => {
++  try {
++    const path = new URL(request.url, origin).pathname;
++    if (limited(request)) {
++      response.writeHead(429, { 'Retry-After': '60', 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
++      response.end('Too many requests. Please try again in one minute.');
++      return;
++    }
++    if (request.method === 'GET' && path === '/') return render(request, response);
++    if (request.method === 'GET' && path === '/signup.js') {
++      response.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'X-Content-Type-Options': 'nosniff' });
++      response.end(signupScript);
++      return;
++    }
++    if (path !== '/api/verify-email') {
++      response.writeHead(404, { 'Content-Type': 'text/plain' });
++      response.end('Page not found.');
++      return;
++    }
++    if (request.method !== 'POST') {
++      response.writeHead(405, { Allow: 'POST' });
++      response.end();
++      return;
++    }
++    // Atomic DELETE RETURNING consumes the session even on failed submissions.
++    const session = db.prepare('DELETE FROM signup_sessions WHERE id = ? RETURNING nonce, expires')
++      .get(sessionId(request));
++    if (request.headers.origin !== origin || request.headers['sec-fetch-site'] === 'cross-site') {
++      return render(request, response, { status: 403, message: 'Please sign up from the Daily Grind homepage.' });
++    }
++    if (!session || session.expires < Date.now()) {
++      return render(request, response, { status: 400, message: 'Your signup session expired. Please try again below.' });
++    }
++    const form = await readForm(request);
++    const name = (form.get('name') || '').trim();
++    const email = (form.get('email') || '').trim();
++    const password = form.get('password') || '';
++    const retry = (status, message) => render(request, response, { status, message, name, email });
++    if (!name || name.length > 100 || email.length > 254 ||
++        !/^[^\s@]+@[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$/.test(email) ||
++        password.length < 12 || password.length > 128) {
++      return retry(400, 'Enter your name, a valid email address, and a password with 12–128 characters.');
++    }
++    const rawToken = (form.get('token') || '').trim();
++    if (!rawToken) {
++      return retry(422, 'Your browser could not confirm this email. Try a supported browser while signed in to your email provider, then submit again. No verification email has been sent.');
++    }
++    try {
++      await verifyEmailVerificationToken({ rawToken, submittedEmail: email, expectedNonce: session.nonce, expectedAudience: origin });
++    } catch {
++      // Never log tokens, passwords, or email addresses.
++      console.warn('Email verification rejected');
++      return retry(422, 'We could not verify your email securely. Please check your email provider is signed in and try again. No account was created or verification email sent.');
++    }
++    const salt = randomBytes(16).toString('hex');
++    const hash = await deriveKey(password, salt, 64);
++    const result = db.prepare(`INSERT INTO rewards_accounts
++      (id, name, email, email_key, password_hash, marketing, email_verified_at)
++      VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(email_key) DO NOTHING`)
++      .run(randomUUID(), name, email, email.toLowerCase(), `${salt}:${hash.toString('hex')}`,
++        form.get('marketing') === 'on' ? 1 : 0, Date.now());
++    if (!result.changes) return retry(409, 'A rewards account already exists for your verified email address.');
++    return render(request, response, { success: true, message: 'Welcome to the Grind! Your email is verified and your rewards account is ready. No code, no inbox detour.' });
++  } catch (error) {
++    console.error('Signup request failed', error.status || 500);
++    if (!response.headersSent) render(request, response, {
++      status: error.status || 500,
++      message: error.status ? error.message : 'We could not complete your signup. Please try again shortly.',
++    });
++    else response.end();
++  }
++});
++server.requestTimeout = 15000;
++server.headersTimeout = 10000;
++server.listen(port, '0.0.0.0', () => console.log(`Daily Grind listening on port ${port}`));
+diff --git a/signup.js b/signup.js
+new file mode 100644
+index 0000000..d2def2d
+--- /dev/null
++++ b/signup.js
+@@ -0,0 +1,11 @@
++const toggle = document.querySelector('.password-toggle');
++const password = document.querySelector('#signup-password');
++if (toggle && password) {
++  toggle.hidden = false;
++  toggle.addEventListener('click', () => {
++    const show = password.type === 'password';
++    password.type = show ? 'text' : 'password';
++    toggle.textContent = show ? 'Hide password' : 'Show password';
++    toggle.setAttribute('aria-pressed', String(show));
++  });
++}

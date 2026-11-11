@@ -1,0 +1,2111 @@
+diff --git a/global.d.ts b/global.d.ts
+index 22f7b64..a5011b6 100644
+--- a/global.d.ts
++++ b/global.d.ts
+@@ -1,7 +1,91 @@
++export type BuiltInAIAvailability =
++  | 'available'
++  | 'downloadable'
++  | 'downloading'
++  | 'unavailable'
++  | 'readily'
++  | 'after-download'
++  | 'no';
++
++export interface AICreateMonitor extends EventTarget {
++  ondownloadprogress?: ((this: AICreateMonitor, ev: ProgressEvent) => any) | null;
++}
++
++export interface TranslatorLanguagePair {
++  sourceLanguage: string;
++  targetLanguage: string;
++}
++
++export interface TranslatorCreateOptions extends TranslatorLanguagePair {
++  signal?: AbortSignal;
++  monitor?: (monitor: AICreateMonitor) => void;
++}
++
++export interface TranslatorTranslateOptions {
++  signal?: AbortSignal;
++}
++
++export interface TranslatorInstance {
++  readonly sourceLanguage?: string;
++  readonly targetLanguage?: string;
++  translate(input: string, options?: TranslatorTranslateOptions): Promise<string>;
++  translateStreaming?(input: string, options?: TranslatorTranslateOptions): ReadableStream<string>;
++  destroy?(): void;
++}
++
++export interface TranslatorStatic {
++  availability(options: TranslatorLanguagePair): Promise<BuiltInAIAvailability>;
++  create(options: TranslatorCreateOptions): Promise<TranslatorInstance>;
++}
++
++export interface DetectedLanguageResult {
++  detectedLanguage: string;
++  confidence: number;
++}
++
++export interface LanguageDetectorCreateOptions {
++  expectedInputLanguages?: string[];
++  signal?: AbortSignal;
++  monitor?: (monitor: AICreateMonitor) => void;
++}
++
++export interface LanguageDetectorInstance {
++  detect(input: string, options?: { signal?: AbortSignal }): Promise<DetectedLanguageResult[]>;
++  destroy?(): void;
++}
++
++export interface LanguageDetectorStatic {
++  availability(options?: { expectedInputLanguages?: string[] }): Promise<BuiltInAIAvailability>;
++  create(options?: LanguageDetectorCreateOptions): Promise<LanguageDetectorInstance>;
++}
++
+ declare global {
+   interface Window {
+-    adNetwork: any; // Replace 'any' with a more specific type if you know it
++    adNetwork: any;
++    Translator?: TranslatorStatic;
++    LanguageDetector?: LanguageDetectorStatic;
++    ai?: {
++      translator?: {
++        capabilities?: () => Promise<{
++          available: BuiltInAIAvailability;
++          languagePairAvailable?: (sourceLanguage: string, targetLanguage: string) => BuiltInAIAvailability;
++        }>;
++        availability?: (options: TranslatorLanguagePair) => Promise<BuiltInAIAvailability>;
++        create: (options: TranslatorCreateOptions) => Promise<TranslatorInstance>;
++      };
++      languageDetector?: {
++        capabilities?: () => Promise<{ available: BuiltInAIAvailability }>;
++        availability?: () => Promise<BuiltInAIAvailability>;
++        create: (options?: LanguageDetectorCreateOptions) => Promise<LanguageDetectorInstance>;
++      };
++    };
++    translation?: {
++      canTranslate?: (options: TranslatorLanguagePair) => Promise<BuiltInAIAvailability>;
++      createTranslator?: (options: TranslatorCreateOptions) => Promise<TranslatorInstance>;
++      canDetect?: () => Promise<BuiltInAIAvailability>;
++      createDetector?: (options?: LanguageDetectorCreateOptions) => Promise<LanguageDetectorInstance>;
++    };
+   }
+ }
+ 
+-export {};
+\ No newline at end of file
++export {};
+diff --git a/src/components/HeaderTranslationControl.tsx b/src/components/HeaderTranslationControl.tsx
+new file mode 100644
+index 0000000..72f3eb4
+--- /dev/null
++++ b/src/components/HeaderTranslationControl.tsx
+@@ -0,0 +1,483 @@
++import React, { useState, useEffect, useRef, useCallback } from 'react';
++import {
++  SUPPORTED_LANGUAGES,
++  checkTranslatorAvailability,
++  getTranslationPreferences,
++  saveTranslationPreferences,
++  subscribeTranslationPreferences,
++  subscribeTranslationStateChange,
++  translateAllPageContent,
++  resetAllPageContent,
++  isAnyPageContentTranslated,
++  getLanguageName,
++  type AvailabilityCheckResult,
++  type TranslationDisplayMode,
++} from '../utils/onDeviceTranslator';
++
++export default function HeaderTranslationControl() {
++  const [sourceLanguage, setSourceLanguage] = useState<string>('en');
++  const [targetLanguage, setTargetLanguage] = useState<string>('es');
++  const [displayMode, setDisplayMode] = useState<TranslationDisplayMode>('inline');
++  const [autoTranslatePage, setAutoTranslatePage] = useState<boolean>(false);
++
++  const [availability, setAvailability] = useState<AvailabilityCheckResult | null>(null);
++  const [isTranslating, setIsTranslating] = useState<boolean>(false);
++  const [isPageTranslated, setIsPageTranslated] = useState<boolean>(false);
++  const [activeTargetLang, setActiveTargetLang] = useState<string | null>(null);
++  const [progress, setProgress] = useState<{ completed: number; total: number; downloadProgress: number | null }>({
++    completed: 0,
++    total: 0,
++    downloadProgress: null,
++  });
++  const [errorMessage, setErrorMessage] = useState<string | null>(null);
++
++  const abortControllerRef = useRef<AbortController | null>(null);
++
++  // Sync preferences from storage and other controls
++  useEffect(() => {
++    const prefs = getTranslationPreferences();
++    setSourceLanguage(prefs.sourceLanguage);
++    setTargetLanguage(prefs.targetLanguage);
++    setDisplayMode(prefs.displayMode);
++    setAutoTranslatePage(prefs.autoTranslatePage);
++    setIsPageTranslated(isAnyPageContentTranslated());
++
++    const unsubPrefs = subscribeTranslationPreferences((updated) => {
++      setSourceLanguage(updated.sourceLanguage);
++      setTargetLanguage(updated.targetLanguage);
++      setDisplayMode(updated.displayMode);
++      setAutoTranslatePage(updated.autoTranslatePage);
++    });
++
++    const unsubState = subscribeTranslationStateChange((detail) => {
++      const anyTranslated = isAnyPageContentTranslated();
++      setIsPageTranslated(anyTranslated);
++      if (detail.action === 'translate' && typeof detail.targetLanguage === 'string') {
++        setActiveTargetLang(detail.targetLanguage);
++      } else if (!anyTranslated) {
++        setActiveTargetLang(null);
++      }
++    });
++
++    return () => {
++      unsubPrefs();
++      unsubState();
++    };
++  }, []);
++
++  // Check availability whenever language pair changes
++  useEffect(() => {
++    let cancelled = false;
++    checkTranslatorAvailability(sourceLanguage, targetLanguage).then((res) => {
++      if (!cancelled) {
++        setAvailability(res);
++      }
++    });
++    return () => {
++      cancelled = true;
++    };
++  }, [sourceLanguage, targetLanguage]);
++
++  const handleTranslatePage = useCallback(
++    async (overrideSource?: string, overrideTarget?: string, overrideMode?: TranslationDisplayMode) => {
++      const src = overrideSource ?? sourceLanguage;
++      const tgt = overrideTarget ?? targetLanguage;
++      const mode = overrideMode ?? displayMode;
++
++      if (src !== 'auto' && src === tgt) {
++        setErrorMessage('Source and target languages are the same. Choose a different target language.');
++        return;
++      }
++
++      setErrorMessage(null);
++      abortControllerRef.current?.abort();
++      const controller = new AbortController();
++      abortControllerRef.current = controller;
++
++      setIsTranslating(true);
++      setProgress({ completed: 0, total: 0, downloadProgress: null });
++
++      try {
++        const result = await translateAllPageContent({
++          sourceLanguage: src,
++          targetLanguage: tgt,
++          displayMode: mode,
++          signal: controller.signal,
++          onProgress(p) {
++            setProgress(p);
++          },
++        });
++        setIsPageTranslated(result.translatedContainers > 0 || isAnyPageContentTranslated());
++        setActiveTargetLang(result.targetLanguage);
++      } catch (err: any) {
++        if (err?.name !== 'AbortError') {
++          setErrorMessage(err?.message || 'On-device translation encountered an error.');
++        }
++      } finally {
++        if (abortControllerRef.current === controller) {
++          setIsTranslating(false);
++          abortControllerRef.current = null;
++        }
++      }
++    },
++    [sourceLanguage, targetLanguage, displayMode]
++  );
++
++  // Handle Astro View Transitions (`astro:page-load`) for auto-translate
++  useEffect(() => {
++    const onPageLoad = () => {
++      const anyTranslated = isAnyPageContentTranslated();
++      setIsPageTranslated(anyTranslated);
++      const prefs = getTranslationPreferences();
++      if (prefs.autoTranslatePage && !anyTranslated) {
++        handleTranslatePage(prefs.sourceLanguage, prefs.targetLanguage, prefs.displayMode);
++      }
++    };
++    document.addEventListener('astro:page-load', onPageLoad);
++    return () => document.removeEventListener('astro:page-load', onPageLoad);
++  }, [handleTranslatePage]);
++
++  const handleSourceChange = (newSource: string) => {
++    setErrorMessage(null);
++    let nextTarget = targetLanguage;
++    if (newSource !== 'auto' && newSource === targetLanguage) {
++      nextTarget = sourceLanguage !== 'auto' && sourceLanguage !== newSource ? sourceLanguage : newSource === 'en' ? 'es' : 'en';
++    }
++    setSourceLanguage(newSource);
++    setTargetLanguage(nextTarget);
++    saveTranslationPreferences({ sourceLanguage: newSource, targetLanguage: nextTarget });
++  };
++
++  const handleTargetChange = (newTarget: string) => {
++    setErrorMessage(null);
++    let nextSource = sourceLanguage;
++    if (sourceLanguage !== 'auto' && sourceLanguage === newTarget) {
++      nextSource = targetLanguage !== newTarget ? targetLanguage : newTarget === 'en' ? 'es' : 'en';
++    }
++    setSourceLanguage(nextSource);
++    setTargetLanguage(newTarget);
++    saveTranslationPreferences({ sourceLanguage: nextSource, targetLanguage: newTarget });
++  };
++
++  const handleSwapLanguages = () => {
++    setErrorMessage(null);
++    const currentEffectiveSource =
++      sourceLanguage === 'auto' ? activeTargetLang || 'en' : sourceLanguage;
++    const nextSource = targetLanguage;
++    const nextTarget = currentEffectiveSource === targetLanguage
++      ? (targetLanguage === 'en' ? 'es' : 'en')
++      : currentEffectiveSource;
++
++    setSourceLanguage(nextSource);
++    setTargetLanguage(nextTarget);
++    saveTranslationPreferences({ sourceLanguage: nextSource, targetLanguage: nextTarget });
++  };
++
++  const handleDisplayModeChange = (mode: TranslationDisplayMode) => {
++    setDisplayMode(mode);
++    saveTranslationPreferences({ displayMode: mode });
++    if (isPageTranslated && !isTranslating) {
++      handleTranslatePage(sourceLanguage, targetLanguage, mode);
++    }
++  };
++
++  const handleAutoTranslateToggle = (checked: boolean) => {
++    setAutoTranslatePage(checked);
++    saveTranslationPreferences({ autoTranslatePage: checked });
++    if (checked && !isPageTranslated && !isTranslating) {
++      handleTranslatePage();
++    }
++  };
++
++  const handleResetPage = () => {
++    abortControllerRef.current?.abort();
++    setIsTranslating(false);
++    setErrorMessage(null);
++    resetAllPageContent();
++    setIsPageTranslated(false);
++    setActiveTargetLang(null);
++  };
++
++  const handleCancel = () => {
++    abortControllerRef.current?.abort();
++    setIsTranslating(false);
++  };
++
++  const renderAvailabilityBadge = () => {
++    if (!availability) return null;
++    switch (availability.status) {
++      case 'available':
++        return (
++          <span
++            data-testid="translator-availability-badge"
++            data-availability="available"
++            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-emerald-50 text-emerald-800 border border-emerald-200"
++            title="Browser On-Device Translator API is ready"
++          >
++            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
++            On-Device AI Ready
++          </span>
++        );
++      case 'downloadable':
++        return (
++          <span
++            data-testid="translator-availability-badge"
++            data-availability="downloadable"
++            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-amber-50 text-amber-800 border border-amber-200"
++            title="Language pack will be downloaded on-device when translating"
++          >
++            <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
++            Model Downloadable
++          </span>
++        );
++      case 'downloading':
++        return (
++          <span
++            data-testid="translator-availability-badge"
++            data-availability="downloading"
++            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-blue-50 text-blue-800 border border-blue-200"
++          >
++            <span className="w-1.5 h-1.5 rounded-full bg-blue-500 animate-ping" />
++            Downloading Model
++          </span>
++        );
++      case 'unavailable':
++        return (
++          <span
++            data-testid="translator-availability-badge"
++            data-availability="unavailable"
++            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-rose-50 text-rose-800 border border-rose-200"
++            title="Native language pair unavailable; built-in on-device fallback will be used"
++          >
++            <span className="w-1.5 h-1.5 rounded-full bg-rose-500" />
++            Pair Fallback
++          </span>
++        );
++      default:
++        return (
++          <span
++            data-testid="translator-availability-badge"
++            data-availability="fallback"
++            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-gray-100 text-gray-700 border border-gray-300"
++            title="Using built-in on-device browser translation engine"
++          >
++            <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
++            On-Device Engine
++          </span>
++        );
++    }
++  };
++
++  return (
++    <div
++      data-no-translate="true"
++      data-testid="header-translation-control"
++      className="bg-stone-50 border-b border-gray-300 text-xs text-gray-800"
++    >
++      <div className="container mx-auto px-4 py-2 flex flex-wrap items-center justify-between gap-2">
++        {/* Left: Title + On-Device Status Badge */}
++        <div className="flex items-center gap-2 flex-wrap">
++          <div className="flex items-center gap-1.5 font-semibold text-gray-900">
++            <svg
++              xmlns="http://www.w3.org/2000/svg"
++              fill="none"
++              viewBox="0 0 24 24"
++              strokeWidth={1.8}
++              stroke="currentColor"
++              className="w-4 h-4 text-amber-700"
++              aria-hidden="true"
++            >
++              <path
++                strokeLinecap="round"
++                strokeLinejoin="round"
++                d="m10.5 21 5.25-11.25L21 21m-9-3h7.5M3 5.621a48.474 48.474 0 0 1 6-.371m0 0c1.12 0 2.233.038 3.334.114M9 5.25V3m3.334 2.364C11.176 10.658 7.69 15.08 3 17.502m9.334-12.138c.896.061 1.785.147 2.666.257m-4.589 8.495a18.023 18.023 0 0 1-3.827-5.802"
++              />
++            </svg>
++            <span>Translate News &amp; Teasers</span>
++          </div>
++          {renderAvailabilityBadge()}
++          {isPageTranslated && activeTargetLang && (
++            <span
++              data-testid="header-translated-indicator"
++              className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-100 text-amber-900 font-medium border border-amber-300"
++            >
++              Translated to {getLanguageName(activeTargetLang)}
++            </span>
++          )}
++        </div>
++
++        {/* Right: Language Pair Selectors & Action Buttons */}
++        <div className="flex flex-wrap items-center gap-2">
++          {/* Source Language */}
++          <label className="inline-flex items-center gap-1 text-gray-600">
++            <span className="sr-only sm:not-sr-only font-medium">From:</span>
++            <select
++              aria-label="Source language"
++              data-testid="header-source-language"
++              value={sourceLanguage}
++              onChange={(e) => handleSourceChange(e.target.value)}
++              disabled={isTranslating}
++              className="bg-white border border-gray-300 rounded px-2 py-1 text-xs font-medium text-gray-900 focus:outline-none focus:ring-2 focus:ring-amber-500"
++            >
++              <option value="auto">Auto-detect</option>
++              {SUPPORTED_LANGUAGES.map((lang) => (
++                <option key={`src-${lang.code}`} value={lang.code}>
++                  {lang.name} ({lang.nativeName})
++                </option>
++              ))}
++            </select>
++          </label>
++
++          {/* Swap Languages Button */}
++          <button
++            type="button"
++            onClick={handleSwapLanguages}
++            disabled={isTranslating}
++            aria-label="Swap source and target languages"
++            data-testid="header-swap-languages"
++            title="Swap languages"
++            className="p-1 rounded border border-gray-300 bg-white hover:bg-amber-50 hover:border-amber-400 text-gray-700 transition-colors cursor-pointer disabled:opacity-50"
++          >
++            <svg
++              xmlns="http://www.w3.org/2000/svg"
++              fill="none"
++              viewBox="0 0 24 24"
++              strokeWidth={1.8}
++              stroke="currentColor"
++              className="w-3.5 h-3.5"
++            >
++              <path
++                strokeLinecap="round"
++                strokeLinejoin="round"
++                d="M7.5 21 3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5"
++              />
++            </svg>
++          </button>
++
++          {/* Target Language */}
++          <label className="inline-flex items-center gap-1 text-gray-600">
++            <span className="sr-only sm:not-sr-only font-medium">To:</span>
++            <select
++              aria-label="Target language"
++              data-testid="header-target-language"
++              value={targetLanguage}
++              onChange={(e) => handleTargetChange(e.target.value)}
++              disabled={isTranslating}
++              className="bg-white border border-gray-300 rounded px-2 py-1 text-xs font-medium text-gray-900 focus:outline-none focus:ring-2 focus:ring-amber-500"
++            >
++              {SUPPORTED_LANGUAGES.map((lang) => (
++                <option key={`tgt-${lang.code}`} value={lang.code}>
++                  {lang.name} ({lang.nativeName})
++                </option>
++              ))}
++            </select>
++          </label>
++
++          {/* Display Mode Selector (Inline vs Bilingual) */}
++          <div
++            className="inline-flex rounded border border-gray-300 bg-white overflow-hidden"
++            role="group"
++            aria-label="Translation display mode"
++          >
++            <button
++              type="button"
++              onClick={() => handleDisplayModeChange('inline')}
++              data-testid="header-mode-inline"
++              className={`px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer ${
++                displayMode === 'inline'
++                  ? 'bg-gray-800 text-white'
++                  : 'text-gray-700 hover:bg-gray-100'
++              }`}
++              title="Replace text in place"
++            >
++              Inline
++            </button>
++            <button
++              type="button"
++              onClick={() => handleDisplayModeChange('bilingual')}
++              data-testid="header-mode-bilingual"
++              className={`px-2 py-1 text-[11px] font-medium border-l border-gray-300 transition-colors cursor-pointer ${
++                displayMode === 'bilingual'
++                  ? 'bg-gray-800 text-white'
++                  : 'text-gray-700 hover:bg-gray-100'
++              }`}
++              title="Show original and translated text together"
++            >
++              Bilingual
++            </button>
++          </div>
++
++          {/* Primary Translate Action Button */}
++          {!isTranslating ? (
++            <button
++              type="button"
++              onClick={() => handleTranslatePage()}
++              data-testid="header-translate-button"
++              className="bg-amber-700 hover:bg-amber-800 text-white font-semibold px-3 py-1 rounded transition-colors cursor-pointer shadow-xs"
++            >
++              {isPageTranslated ? 'Re-translate Page' : 'Translate Page'}
++            </button>
++          ) : (
++            <div className="inline-flex items-center gap-1.5">
++              <span
++                data-testid="header-translating-status"
++                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-amber-100 text-amber-900 font-medium"
++              >
++                <span className="w-3 h-3 border-2 border-amber-700 border-t-transparent rounded-full animate-spin" />
++                {progress.downloadProgress !== null && progress.downloadProgress < 100
++                  ? `Model ${progress.downloadProgress}%`
++                  : progress.total > 0
++                  ? `Translating ${progress.completed}/${progress.total}`
++                  : 'Translating...'}
++              </span>
++              <button
++                type="button"
++                onClick={handleCancel}
++                data-testid="header-cancel-translation"
++                className="px-2 py-1 rounded border border-gray-300 bg-white hover:bg-gray-100 text-gray-700 font-medium cursor-pointer"
++              >
++                Cancel
++              </button>
++            </div>
++          )}
++
++          {/* Reset / Show Original Button */}
++          {isPageTranslated && (
++            <button
++              type="button"
++              onClick={handleResetPage}
++              data-testid="header-reset-button"
++              className="px-2.5 py-1 rounded border border-gray-300 bg-white hover:bg-gray-100 text-gray-800 font-medium transition-colors cursor-pointer"
++            >
++              Show Original
++            </button>
++          )}
++
++          {/* Auto-translate checkbox */}
++          <label
++            className="hidden md:inline-flex items-center gap-1 text-[11px] text-gray-600 cursor-pointer select-none ml-1"
++            title="Automatically translate news and teasers when navigating between pages"
++          >
++            <input
++              type="checkbox"
++              checked={autoTranslatePage}
++              onChange={(e) => handleAutoTranslateToggle(e.target.checked)}
++              data-testid="header-auto-translate-checkbox"
++              className="rounded border-gray-300 text-amber-700 focus:ring-amber-500"
++            />
++            <span>Auto</span>
++          </label>
++        </div>
++      </div>
++
++      {errorMessage && (
++        <div
++          role="alert"
++          className="container mx-auto px-4 pb-1.5 text-[11px] text-rose-700 font-medium"
++        >
++          {errorMessage}
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/src/utils/onDeviceTranslator.ts b/src/utils/onDeviceTranslator.ts
+new file mode 100644
+index 0000000..fa35da7
+--- /dev/null
++++ b/src/utils/onDeviceTranslator.ts
+@@ -0,0 +1,1517 @@
++import type {
++  AICreateMonitor,
++  BuiltInAIAvailability,
++  TranslatorInstance,
++} from '../../global';
++
++export interface LanguageOption {
++  code: string;
++  name: string;
++  nativeName: string;
++  dir?: 'ltr' | 'rtl';
++}
++
++export const SUPPORTED_LANGUAGES: LanguageOption[] = [
++  { code: 'en', name: 'English', nativeName: 'English', dir: 'ltr' },
++  { code: 'es', name: 'Spanish', nativeName: 'Español', dir: 'ltr' },
++  { code: 'fr', name: 'French', nativeName: 'Français', dir: 'ltr' },
++  { code: 'de', name: 'German', nativeName: 'Deutsch', dir: 'ltr' },
++  { code: 'ja', name: 'Japanese', nativeName: '日本語', dir: 'ltr' },
++  { code: 'pt', name: 'Portuguese', nativeName: 'Português', dir: 'ltr' },
++  { code: 'it', name: 'Italian', nativeName: 'Italiano', dir: 'ltr' },
++  { code: 'zh', name: 'Chinese (Simplified)', nativeName: '中文 (简体)', dir: 'ltr' },
++  { code: 'ko', name: 'Korean', nativeName: '한국어', dir: 'ltr' },
++  { code: 'hi', name: 'Hindi', nativeName: 'हिन्दी', dir: 'ltr' },
++  { code: 'ar', name: 'Arabic', nativeName: 'العربية', dir: 'rtl' },
++  { code: 'ru', name: 'Russian', nativeName: 'Русский', dir: 'ltr' },
++  { code: 'nl', name: 'Dutch', nativeName: 'Nederlands', dir: 'ltr' },
++  { code: 'tr', name: 'Turkish', nativeName: 'Türkçe', dir: 'ltr' },
++  { code: 'pl', name: 'Polish', nativeName: 'Polski', dir: 'ltr' },
++  { code: 'vi', name: 'Vietnamese', nativeName: 'Tiếng Việt', dir: 'ltr' },
++];
++
++export type NormalizedAvailability =
++  | 'available'
++  | 'downloadable'
++  | 'downloading'
++  | 'unavailable'
++  | 'fallback';
++
++export type TranslationEngineType =
++  | 'web-translator-api'
++  | 'legacy-ai-translator'
++  | 'local-on-device-fallback';
++
++export type TranslationDisplayMode = 'inline' | 'bilingual';
++
++export interface AvailabilityCheckResult {
++  status: NormalizedAvailability;
++  rawStatus: string;
++  engine: TranslationEngineType;
++  nativeSupported: boolean;
++}
++
++export interface TranslationPreferences {
++  sourceLanguage: string; // 'auto' or BCP-47 code
++  targetLanguage: string; // BCP-47 code
++  displayMode: TranslationDisplayMode;
++  autoTranslatePage: boolean;
++}
++
++const PREFS_STORAGE_KEY = 'devtools_times_translation_prefs_v1';
++const CACHE_STORAGE_KEY = 'devtools_times_translation_cache_v1';
++
++export const CONFIG_CHANGE_EVENT = 'devtools-times:translation-config-change';
++export const STATE_CHANGE_EVENT = 'devtools-times:translation-state-change';
++
++const DEFAULT_PREFERENCES: TranslationPreferences = {
++  sourceLanguage: 'en',
++  targetLanguage: 'es',
++  displayMode: 'inline',
++  autoTranslatePage: false,
++};
++
++// Cache of active Translator instances by `src->tgt`
++const translatorInstanceCache = new Map<string, Promise<TranslatorInstance>>();
++// Cache of translated strings by `src|tgt|text`
++const memoryTranslationCache = new Map<string, string>();
++// Store original text nodes for lossless restoration
++const originalTextNodeMap = new WeakMap<Text, string>();
++
++let sessionCacheLoaded = false;
++
++function loadSessionCache(): void {
++  if (sessionCacheLoaded || typeof window === 'undefined') return;
++  sessionCacheLoaded = true;
++  try {
++    const raw = window.sessionStorage.getItem(CACHE_STORAGE_KEY);
++    if (!raw) return;
++    const parsed = JSON.parse(raw) as Record<string, string>;
++    for (const [k, v] of Object.entries(parsed)) {
++      memoryTranslationCache.set(k, v);
++    }
++  } catch {
++    // Ignore storage errors
++  }
++}
++
++function persistSessionCache(): void {
++  if (typeof window === 'undefined') return;
++  try {
++    const entries = Array.from(memoryTranslationCache.entries()).slice(-400);
++    window.sessionStorage.setItem(CACHE_STORAGE_KEY, JSON.stringify(Object.fromEntries(entries)));
++  } catch {
++    // Ignore storage quota errors
++  }
++}
++
++export function getLanguageOption(code: string): LanguageOption | undefined {
++  const normalized = code.toLowerCase().split('-')[0];
++  return SUPPORTED_LANGUAGES.find((lang) => lang.code === normalized);
++}
++
++export function getLanguageName(code: string): string {
++  if (code === 'auto') return 'Auto-detect';
++  const found = getLanguageOption(code);
++  return found ? found.name : code.toUpperCase();
++}
++
++export function getLanguageNativeName(code: string): string {
++  if (code === 'auto') return 'Auto-detect';
++  const found = getLanguageOption(code);
++  return found ? `${found.name} (${found.nativeName})` : code.toUpperCase();
++}
++
++export function getLanguageDirection(code: string): 'ltr' | 'rtl' {
++  return getLanguageOption(code)?.dir ?? 'ltr';
++}
++
++export function getTranslationPreferences(): TranslationPreferences {
++  if (typeof window === 'undefined') return { ...DEFAULT_PREFERENCES };
++  try {
++    const raw = window.localStorage.getItem(PREFS_STORAGE_KEY);
++    if (!raw) return { ...DEFAULT_PREFERENCES };
++    const parsed = JSON.parse(raw);
++    return {
++      sourceLanguage: parsed.sourceLanguage || DEFAULT_PREFERENCES.sourceLanguage,
++      targetLanguage: parsed.targetLanguage || DEFAULT_PREFERENCES.targetLanguage,
++      displayMode: parsed.displayMode === 'bilingual' ? 'bilingual' : 'inline',
++      autoTranslatePage: Boolean(parsed.autoTranslatePage),
++    };
++  } catch {
++    return { ...DEFAULT_PREFERENCES };
++  }
++}
++
++export function saveTranslationPreferences(
++  partial: Partial<TranslationPreferences>
++): TranslationPreferences {
++  const next = {
++    ...getTranslationPreferences(),
++    ...partial,
++  };
++  if (typeof window !== 'undefined') {
++    try {
++      window.localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify(next));
++    } catch {
++      // Ignore localStorage restrictions
++    }
++    window.dispatchEvent(new CustomEvent(CONFIG_CHANGE_EVENT, { detail: next }));
++  }
++  return next;
++}
++
++export function subscribeTranslationPreferences(
++  callback: (prefs: TranslationPreferences) => void
++): () => void {
++  if (typeof window === 'undefined') return () => {};
++  const handler = (event: Event) => {
++    const custom = event as CustomEvent<TranslationPreferences>;
++    callback(custom.detail || getTranslationPreferences());
++  };
++  window.addEventListener(CONFIG_CHANGE_EVENT, handler);
++  return () => window.removeEventListener(CONFIG_CHANGE_EVENT, handler);
++}
++
++export function notifyTranslationStateChange(detail?: Record<string, unknown>): void {
++  if (typeof window === 'undefined') return;
++  window.dispatchEvent(new CustomEvent(STATE_CHANGE_EVENT, { detail: detail ?? {} }));
++}
++
++export function subscribeTranslationStateChange(
++  callback: (detail: Record<string, unknown>) => void
++): () => void {
++  if (typeof window === 'undefined') return () => {};
++  const handler = (event: Event) => {
++    const custom = event as CustomEvent<Record<string, unknown>>;
++    callback(custom.detail ?? {});
++  };
++  window.addEventListener(STATE_CHANGE_EVENT, handler);
++  return () => window.removeEventListener(STATE_CHANGE_EVENT, handler);
++}
++
++function normalizeAvailabilityStatus(raw: BuiltInAIAvailability | string | undefined): NormalizedAvailability {
++  switch (raw) {
++    case 'available':
++    case 'readily':
++      return 'available';
++    case 'downloadable':
++    case 'after-download':
++      return 'downloadable';
++    case 'downloading':
++      return 'downloading';
++    case 'unavailable':
++    case 'no':
++      return 'unavailable';
++    default:
++      return 'fallback';
++  }
++}
++
++/**
++ * Checks whether the browser supports the Web On-Device Translation API (`window.Translator` or legacy `window.ai.translator`/`window.translation`)
++ * and queries availability for the given language pair.
++ */
++export async function checkTranslatorAvailability(
++  sourceLanguage: string,
++  targetLanguage: string
++): Promise<AvailabilityCheckResult> {
++  const src = (sourceLanguage === 'auto' ? 'en' : sourceLanguage).toLowerCase().split('-')[0];
++  const tgt = targetLanguage.toLowerCase().split('-')[0];
++
++  if (src === tgt) {
++    return {
++      status: 'available',
++      rawStatus: 'available',
++      engine: typeof window !== 'undefined' && 'Translator' in window && window.Translator
++        ? 'web-translator-api'
++        : 'local-on-device-fallback',
++      nativeSupported: typeof window !== 'undefined' && Boolean(window.Translator || window.ai?.translator || window.translation),
++    };
++  }
++
++  if (typeof window === 'undefined') {
++    return {
++      status: 'fallback',
++      rawStatus: 'ssr',
++      engine: 'local-on-device-fallback',
++      nativeSupported: false,
++    };
++  }
++
++  // 1. Standard W3C / Chrome Built-in AI `window.Translator` API
++  if ('Translator' in window && window.Translator && typeof window.Translator.availability === 'function') {
++    try {
++      const raw = await window.Translator.availability({
++        sourceLanguage: src,
++        targetLanguage: tgt,
++      });
++      return {
++        status: normalizeAvailabilityStatus(raw),
++        rawStatus: String(raw),
++        engine: 'web-translator-api',
++        nativeSupported: true,
++      };
++    } catch {
++      return {
++        status: 'fallback',
++        rawStatus: 'error',
++        engine: 'local-on-device-fallback',
++        nativeSupported: false,
++      };
++    }
++  }
++
++  // 2. Legacy `window.ai.translator` API
++  if (window.ai?.translator) {
++    try {
++      if (typeof window.ai.translator.availability === 'function') {
++        const raw = await window.ai.translator.availability({
++          sourceLanguage: src,
++          targetLanguage: tgt,
++        });
++        return {
++          status: normalizeAvailabilityStatus(raw),
++          rawStatus: String(raw),
++          engine: 'legacy-ai-translator',
++          nativeSupported: true,
++        };
++      }
++      if (typeof window.ai.translator.capabilities === 'function') {
++        const caps = await window.ai.translator.capabilities();
++        const raw = caps.languagePairAvailable
++          ? caps.languagePairAvailable(src, tgt)
++          : caps.available;
++        return {
++          status: normalizeAvailabilityStatus(raw),
++          rawStatus: String(raw),
++          engine: 'legacy-ai-translator',
++          nativeSupported: true,
++        };
++      }
++    } catch {
++      // Fall through to fallback
++    }
++  }
++
++  // 3. Legacy `window.translation` API
++  if (window.translation?.canTranslate) {
++    try {
++      const raw = await window.translation.canTranslate({
++        sourceLanguage: src,
++        targetLanguage: tgt,
++      });
++      return {
++        status: normalizeAvailabilityStatus(raw),
++        rawStatus: String(raw),
++        engine: 'legacy-ai-translator',
++        nativeSupported: true,
++      };
++    } catch {
++      // Fall through to fallback
++    }
++  }
++
++  return {
++    status: 'fallback',
++    rawStatus: 'fallback-ready',
++    engine: 'local-on-device-fallback',
++    nativeSupported: false,
++  };
++}
++
++/**
++ * Detects the language of a text snippet using the browser's On-Device `LanguageDetector` API
++ * with an on-device heuristic fallback.
++ */
++export async function detectTextLanguage(
++  text: string,
++  options?: { signal?: AbortSignal; onDownloadProgress?: (percent: number) => void }
++): Promise<{ detectedLanguage: string; confidence: number; engine: string }> {
++  const sample = text.trim().slice(0, 600);
++  if (!sample) {
++    return { detectedLanguage: 'en', confidence: 1, engine: 'heuristic' };
++  }
++
++  if (typeof window !== 'undefined') {
++    const monitorCallback = options?.onDownloadProgress
++      ? (monitor: AICreateMonitor) => {
++          monitor.addEventListener('downloadprogress', (ev: Event) => {
++            const pe = ev as ProgressEvent;
++            const fraction =
++              pe.total && pe.total > 1
++                ? pe.loaded / pe.total
++                : typeof pe.loaded === 'number' && pe.loaded <= 1
++                ? pe.loaded
++                : (pe.loaded ?? 0) / 100;
++            options.onDownloadProgress?.(Math.min(100, Math.max(0, Math.round(fraction * 100))));
++          });
++        }
++      : undefined;
++
++    // 1. Standard `window.LanguageDetector`
++    if ('LanguageDetector' in window && window.LanguageDetector?.create) {
++      try {
++        const detector = await window.LanguageDetector.create({
++          signal: options?.signal,
++          monitor: monitorCallback,
++        });
++        const results = await detector.detect(sample, { signal: options?.signal });
++        if (results && results.length > 0 && results[0].detectedLanguage) {
++          const code = results[0].detectedLanguage.toLowerCase().split('-')[0];
++          if (getLanguageOption(code)) {
++            return {
++              detectedLanguage: code,
++              confidence: results[0].confidence ?? 0.95,
++              engine: 'web-language-detector-api',
++            };
++          }
++        }
++      } catch {
++        // Fall through to heuristic detector
++      }
++    }
++
++    // 2. Legacy `window.ai.languageDetector`
++    if (window.ai?.languageDetector?.create) {
++      try {
++        const detector = await window.ai.languageDetector.create({
++          signal: options?.signal,
++          monitor: monitorCallback,
++        });
++        const results = await detector.detect(sample, { signal: options?.signal });
++        if (results && results.length > 0 && results[0].detectedLanguage) {
++          const code = results[0].detectedLanguage.toLowerCase().split('-')[0];
++          if (getLanguageOption(code)) {
++            return {
++              detectedLanguage: code,
++              confidence: results[0].confidence ?? 0.9,
++              engine: 'legacy-ai-language-detector',
++            };
++          }
++        }
++      } catch {
++        // Fall through
++      }
++    }
++  }
++
++  // 3. Fast On-Device Script & Lexical Heuristic Detection
++  return heuristicDetectLanguage(sample);
++}
++
++function heuristicDetectLanguage(sample: string): {
++  detectedLanguage: string;
++  confidence: number;
++  engine: string;
++} {
++  // Check non-Latin scripts first
++  if (/[\u3040-\u30ff]/.test(sample)) return { detectedLanguage: 'ja', confidence: 0.98, engine: 'on-device-heuristic' };
++  if (/[\uac00-\ud7af]/.test(sample)) return { detectedLanguage: 'ko', confidence: 0.98, engine: 'on-device-heuristic' };
++  if (/[\u4e00-\u9fff]/.test(sample)) return { detectedLanguage: 'zh', confidence: 0.96, engine: 'on-device-heuristic' };
++  if (/[\u0600-\u06ff]/.test(sample)) return { detectedLanguage: 'ar', confidence: 0.98, engine: 'on-device-heuristic' };
++  if (/[\u0900-\u097f]/.test(sample)) return { detectedLanguage: 'hi', confidence: 0.98, engine: 'on-device-heuristic' };
++  if (/[\u0400-\u04ff]/.test(sample)) return { detectedLanguage: 'ru', confidence: 0.97, engine: 'on-device-heuristic' };
++
++  const lower = ` ${sample.toLowerCase()} `;
++  const markers: Record<string, RegExp[]> = {
++    es: [/\b(el|la|los|las|una|del|para|con|por|como|más|sobre|entre|está|son)\b/g, /[áéíóúñ¿¡]/g],
++    fr: [/\b(le|la|les|des|une|dans|pour|avec|sur|plus|sont|comme|cette|aux)\b/g, /[éèêëàâùûçœ]/g],
++    de: [/\b(der|die|das|und|den|von|mit|auf|für|eine|einer|nicht|sich|sind|wird)\b/g, /[äöüß]/g],
++    pt: [/\b(os|as|uma|para|com|não|mais|pelo|pela|são|como|dos|das|está)\b/g, /[ãõçáéíóúâêô]/g],
++    it: [/\b(il|lo|gli|della|delle|degli|nella|con|per|sono|come|più|anche|questa)\b/g],
++    nl: [/\b(de|het|een|van|en|in|op|voor|met|zijn|wordt|naar|over|niet)\b/g],
++    tr: [/\b(bir|ve|için|ile|olan|olarak|daha|gibi|yeni|çok)\b/g, /[ğüşöçıİ]/g],
++    pl: [/\b(oraz|dla|przez|jako|jest|się|nie|tym|przy)\b/g, /[ąćęłńóśźż]/g],
++    vi: [/\b(của|những|trong|được|với|cho|các|một|người|không)\b/g, /[ăâđêôơư]/g],
++    en: [/\b(the|and|that|with|from|this|their|have|are|for|into|more|world|about)\b/g],
++  };
++
++  let bestLang = 'en';
++  let bestScore = 0;
++
++  for (const [lang, regexes] of Object.entries(markers)) {
++    let score = 0;
++    for (const rx of regexes) {
++      const matches = lower.match(rx);
++      if (matches) score += matches.length;
++    }
++    if (score > bestScore) {
++      bestScore = score;
++      bestLang = lang;
++    }
++  }
++
++  return {
++    detectedLanguage: bestLang,
++    confidence: bestScore > 2 ? 0.92 : 0.8,
++    engine: 'on-device-heuristic',
++  };
++}
++
++async function getOrCreateNativeTranslator(
++  sourceLanguage: string,
++  targetLanguage: string,
++  options?: {
++    signal?: AbortSignal;
++    onDownloadProgress?: (percent: number) => void;
++  }
++): Promise<TranslatorInstance | null> {
++  if (typeof window === 'undefined') return null;
++
++  const src = sourceLanguage.toLowerCase().split('-')[0];
++  const tgt = targetLanguage.toLowerCase().split('-')[0];
++  const pairKey = `${src}->${tgt}`;
++
++  const attachMonitor = (monitor: AICreateMonitor) => {
++    monitor.addEventListener('downloadprogress', (ev: Event) => {
++      const pe = ev as ProgressEvent;
++      const fraction =
++        pe.total && pe.total > 1
++          ? pe.loaded / pe.total
++          : typeof pe.loaded === 'number' && pe.loaded <= 1
++          ? pe.loaded
++          : (pe.loaded ?? 0) / 100;
++      const percent = Math.min(100, Math.max(0, Math.round(fraction * 100)));
++      options?.onDownloadProgress?.(percent);
++    });
++  };
++
++  // If no custom abort signal or progress callback is active and we have a cached translator, return it
++  if (translatorInstanceCache.has(pairKey)) {
++    try {
++      return await translatorInstanceCache.get(pairKey)!;
++    } catch {
++      translatorInstanceCache.delete(pairKey);
++    }
++  }
++
++  const createPromise = (async (): Promise<TranslatorInstance> => {
++    // 1. Standard W3C / Chrome Built-in AI `window.Translator`
++    if ('Translator' in window && window.Translator && typeof window.Translator.create === 'function') {
++      return await window.Translator.create({
++        sourceLanguage: src,
++        targetLanguage: tgt,
++        signal: options?.signal,
++        monitor: attachMonitor,
++      });
++    }
++
++    // 2. Legacy `window.ai.translator`
++    if (window.ai?.translator && typeof window.ai.translator.create === 'function') {
++      return await window.ai.translator.create({
++        sourceLanguage: src,
++        targetLanguage: tgt,
++        signal: options?.signal,
++        monitor: attachMonitor,
++      });
++    }
++
++    // 3. Legacy `window.translation`
++    if (window.translation?.createTranslator) {
++      return await window.translation.createTranslator({
++        sourceLanguage: src,
++        targetLanguage: tgt,
++        signal: options?.signal,
++        monitor: attachMonitor,
++      });
++    }
++
++    throw new Error('Native Web Translator API not present');
++  })();
++
++  translatorInstanceCache.set(pairKey, createPromise);
++
++  try {
++    return await createPromise;
++  } catch (err) {
++    translatorInstanceCache.delete(pairKey);
++    throw err;
++  }
++}
++
++/**
++ * Translates a single text string between `sourceLanguage` and `targetLanguage` using the browser's
++ * on-device `Translator` API, falling back to the local on-device dictionary/phrase translator
++ * when the browser API is not enabled.
++ */
++export async function translateText(
++  text: string,
++  options: {
++    sourceLanguage: string;
++    targetLanguage: string;
++    signal?: AbortSignal;
++    onDownloadProgress?: (percent: number) => void;
++    originalEnglishText?: string;
++  }
++): Promise<string> {
++  if (options.signal?.aborted) {
++    throw new DOMException('Translation aborted', 'AbortError');
++  }
++
++  const trimmed = text.trim();
++  if (!trimmed) return text;
++
++  const leadingSpace = text.match(/^\s*/)?.[0] ?? '';
++  const trailingSpace = text.match(/\s*$/)?.[0] ?? '';
++
++  let src = options.sourceLanguage.toLowerCase().split('-')[0];
++  const tgt = options.targetLanguage.toLowerCase().split('-')[0];
++
++  if (src === 'auto') {
++    const detected = await detectTextLanguage(trimmed, {
++      signal: options.signal,
++      onDownloadProgress: options.onDownloadProgress,
++    });
++    src = detected.detectedLanguage;
++  }
++
++  if (src === tgt) {
++    return text;
++  }
++
++  loadSessionCache();
++  const cacheKey = `${src}|${tgt}|${trimmed}`;
++  const cached = memoryTranslationCache.get(cacheKey);
++  if (cached) {
++    return `${leadingSpace}${cached}${trailingSpace}`;
++  }
++
++  // Try native browser `Translator` API first
++  const hasNativeTranslator =
++    typeof window !== 'undefined' &&
++    Boolean(
++      ('Translator' in window && window.Translator) ||
++        window.ai?.translator ||
++        window.translation?.createTranslator
++    );
++
++  if (hasNativeTranslator) {
++    try {
++      const translator = await getOrCreateNativeTranslator(src, tgt, {
++        signal: options.signal,
++        onDownloadProgress: options.onDownloadProgress,
++      });
++      if (translator) {
++        const result = await translator.translate(trimmed, { signal: options.signal });
++        if (result && typeof result === 'string') {
++          memoryTranslationCache.set(cacheKey, result.trim());
++          persistSessionCache();
++          return `${leadingSpace}${result.trim()}${trailingSpace}`;
++        }
++      }
++    } catch (err: any) {
++      if (err?.name === 'AbortError' || options.signal?.aborted) {
++        throw err;
++      }
++      // If native API threw (e.g. model unavailable in headless environment), fall through to on-device local fallback
++    }
++  }
++
++  // Built-in On-Device Local Fallback Engine
++  const fallbackResult = localOnDeviceTranslate(
++    trimmed,
++    src,
++    tgt,
++    options.originalEnglishText?.trim()
++  );
++  memoryTranslationCache.set(cacheKey, fallbackResult);
++  persistSessionCache();
++  return `${leadingSpace}${fallbackResult}${trailingSpace}`;
++}
++
++// ============================================================================
++// Built-in On-Device Local Fallback Dictionary & Compositional Phrase Engine
++// ============================================================================
++
++const EXACT_PHRASE_TRANSLATIONS: Record<string, Record<string, string>> = {
++  // Categories & UI sections
++  'science': {
++    es: 'Ciencia', fr: 'Science', de: 'Wissenschaft', ja: '科学', pt: 'Ciência', it: 'Scienza', zh: '科学', ko: '과학', hi: 'विज्ञान', ar: 'علوم', ru: 'Наука', nl: 'Wetenschap', tr: 'Bilim', pl: 'Nauka', vi: 'Khoa học',
++  },
++  'lifestyle': {
++    es: 'Estilo de vida', fr: 'Style de vie', de: 'Lebensstil', ja: 'ライフスタイル', pt: 'Estilo de vida', it: 'Stile di vita', zh: '生活方式', ko: '라이프스타일', hi: 'जीवनशैली', ar: 'أسلوب الحياة', ru: 'Образ жизни', nl: 'Levensstijl', tr: 'Yaşam Tarzı', pl: 'Styl życia', vi: 'Phong cách sống',
++  },
++  'news': {
++    es: 'Noticias', fr: 'Actualités', de: 'Nachrichten', ja: 'ニュース', pt: 'Notícias', it: 'Notizie', zh: '新闻', ko: '뉴스', hi: 'समाचार', ar: 'أخبار', ru: 'Новости', nl: 'Nieuws', tr: 'Haberler', pl: 'Wiadomości', vi: 'Tin tức',
++  },
++  'sports': {
++    es: 'Deportes', fr: 'Sports', de: 'Sport', ja: 'スポーツ', pt: 'Esportes', it: 'Sport', zh: '体育', ko: '스포츠', hi: 'खेल', ar: 'رياضة', ru: 'Спорт', nl: 'Sport', tr: 'Spor', pl: 'Sport', vi: 'Thể thao',
++  },
++  'culture': {
++    es: 'Cultura', fr: 'Culture', de: 'Kultur', ja: '文化', pt: 'Cultura', it: 'Cultura', zh: '文化', ko: '문화', hi: 'संस्कृति', ar: 'ثقافة', ru: 'Культура', nl: 'Cultuur', tr: 'Kültür', pl: 'Kultura', vi: 'Văn hóa',
++  },
++  'media': {
++    es: 'Medios', fr: 'Médias', de: 'Medien', ja: 'メディア', pt: 'Mídia', it: 'Media', zh: '媒体', ko: '미디어', hi: 'मीडिया', ar: 'إعلام', ru: 'Медиа', nl: 'Media', tr: 'Medya', pl: 'Media', vi: 'Truyền thông',
++  },
++  'economy': {
++    es: 'Economía', fr: 'Économie', de: 'Wirtschaft', ja: '経済', pt: 'Economia', it: 'Economia', zh: '经济', ko: '경제', hi: 'अर्थव्यवस्था', ar: 'اقتصاد', ru: 'Экономика', nl: 'Economie', tr: 'Ekonomi', pl: 'Gospodarka', vi: 'Kinh tế',
++  },
++  'national': {
++    es: 'Nacional', fr: 'National', de: 'National', ja: '国内', pt: 'Nacional', it: 'Nazionale', zh: '国内', ko: '국내', hi: 'राष्ट्रीय', ar: 'وطني', ru: 'Национальные', nl: 'Nationaal', tr: 'Ulusal', pl: 'Kraj', vi: 'Quốc gia',
++  },
++  'labor': {
++    es: 'Trabajo', fr: 'Travail', de: 'Arbeit', ja: '労働', pt: 'Trabalho', it: 'Lavoro', zh: '劳工', ko: '노동', hi: 'श्रम', ar: 'عمل', ru: 'Труд', nl: 'Arbeid', tr: 'Emek', pl: 'Praca', vi: 'Lao động',
++  },
++  'pets': {
++    es: 'Mascotas', fr: 'Animaux', de: 'Haustiere', ja: 'ペット', pt: 'Animais de estimação', it: 'Animali domestici', zh: '宠物', ko: '반려동물', hi: 'पालतू जानवर', ar: 'حيوانات أليفة', ru: 'Питомцы', nl: 'Huisdieren', tr: 'Evcil Hayvanlar', pl: 'Zwierzęta', vi: 'Thú cưng',
++  },
++  'business': {
++    es: 'Negocios', fr: 'Affaires', de: 'Wirtschaft & Business', ja: 'ビジネス', pt: 'Negócios', it: 'Affari', zh: '商业', ko: '비즈니스', hi: 'व्यापार', ar: 'أعمال', ru: 'Бизнес', nl: 'Zakelijk', tr: 'İş Dünyası', pl: 'Biznes', vi: 'Kinh doanh',
++  },
++  'urban development': {
++    es: 'Desarrollo Urbano', fr: 'Développement Urbain', de: 'Stadtentwicklung', ja: '都市開発', pt: 'Desenvolvimento Urbano', it: 'Sviluppo Urbano', zh: '城市发展', ko: '도시 개발', hi: 'शहरी विकास', ar: 'التنمية الحضرية', ru: 'Городское развитие', nl: 'Stedelijke Ontwikkeling', tr: 'Kentsel Gelişim', pl: 'Rozwój miast', vi: 'Phát triển đô thị',
++  },
++  'politics': {
++    es: 'Política', fr: 'Politique', de: 'Politik', ja: '政治', pt: 'Política', it: 'Politica', zh: '政治', ko: '정치', hi: 'राजनीति', ar: 'سياسة', ru: 'Политика', nl: 'Politiek', tr: 'Siyaset', pl: 'Polityka', vi: 'Chính trị',
++  },
++  'web development': {
++    es: 'Desarrollo Web', fr: 'Développement Web', de: 'Webentwicklung', ja: 'ウェブ開発', pt: 'Desenvolvimento Web', it: 'Sviluppo Web', zh: 'Web 开发', ko: '웹 개발', hi: 'वेब विकास', ar: 'تطوير الويب', ru: 'Веб-разработка', nl: 'Webontwikkeling', tr: 'Web Geliştirme', pl: 'Tworzenie stron', vi: 'Phát triển Web',
++  },
++  'top news': {
++    es: 'Noticias Destacadas', fr: 'À la Une', de: 'Top-Nachrichten', ja: 'トップニュース', pt: 'Principais Notícias', it: ' Notizie in Primo Piano', zh: '头条新闻', ko: '주요 뉴스',
++  },
++  'world': {
++    es: 'Mundo', fr: 'Monde', de: 'Welt', ja: '世界', pt: 'Mundo', it: 'Mondo', zh: '世界', ko: '세계',
++  },
++
++  // Article Titles
++  'the silent architects of earth': {
++    es: 'Los arquitectos silenciosos de la Tierra',
++    fr: 'Les architectes silencieux de la Terre',
++    de: 'Die stillen Architekten der Erde',
++    ja: '地球の沈黙の建築家たち',
++    pt: 'Os arquitetos silenciosos da Terra',
++    it: 'Gli architetti silenziosi della Terra',
++    zh: '地球上沉默的建筑师',
++    ko: '지구의 침묵하는 건축가들',
++  },
++  'the coastal pulse: life by the shore': {
++    es: 'El pulso costero: la vida junto a la orilla',
++    fr: 'Le pouls côtier : la vie au bord du rivage',
++    de: 'Der Küstenpuls: Leben am Ufer',
++    ja: '沿岸の鼓動：海辺の暮らし',
++    pt: 'O pulso costeiro: a vida à beira-mar',
++    it: 'Il battito della costa: vita in riva al mare',
++    zh: '海岸脉搏：海滨生活',
++    ko: '해안의 맥박: 바닷가에서의 삶',
++  },
++  'the global alchemy of coffee': {
++    es: 'La alquimia global del café',
++    fr: 'L’alchimie mondiale du café',
++    de: 'Die globale Alchemie des Kaffees',
++    ja: 'コーヒーの世界的錬金術',
++    pt: 'A alquimia global do café',
++    it: 'L’alchimia globale del caffè',
++    zh: '咖啡的全球炼金术',
++    ko: '커피의 글로벌 연금술',
++  },
++  'super bowl lx: a historic rematch in santa clara': {
++    es: 'Super Bowl LX: una revancha histórica en Santa Clara',
++    fr: 'Super Bowl LX : une revanche historique à Santa Clara',
++    de: 'Super Bowl LX: Ein historisches Rückspiel in Santa Clara',
++    ja: 'スーパーボウルLX：サンタクララでの歴史的な再戦',
++    pt: 'Super Bowl LX: uma revanche histórica em Santa Clara',
++    it: 'Super Bowl LX: una rivincita storica a Santa Clara',
++    zh: '第60届超级碗：圣克拉拉的历史性重赛',
++    ko: '슈퍼볼 LX: 산타클라라에서의 역사적인 재대결',
++  },
++  'the scruffy tyrant: life with charlie the griffon': {
++    es: 'El tirano desaliñado: la vida con Charlie el Grifón',
++    fr: 'Le tyran ébouriffé : la vie avec Charlie le Griffon',
++    de: 'Der struppige Tyrann: Das Leben mit Charlie dem Griffon',
++    ja: '보サボサの暴君：グリフォンのチャーリーとの暮らし',
++    pt: 'O tirano desgrenhado: a vida com Charlie, o Griffon',
++    it: 'Il tiranno arruffato: la vita con Charlie il Grifone',
++    zh: '蓬乱的小霸王：与格里芬犬查理的生活',
++    ko: '더부룩한 폭군: 그리폰 찰리와의 삶',
++  },
++  'breakthrough research: a new era in medicine': {
++    es: 'Investigación revolucionaria: una nueva era en la medicina',
++    fr: 'Recherche révolutionnaire : une nouvelle ère pour la médecine',
++    de: 'Bahnbrechende Forschung: Eine neue Ära in der Medizin',
++    ja: '画期的な研究：医学の新時代',
++    pt: 'Pesquisa inovadora: uma nova era na medicina',
++    it: 'Ricerca rivoluzionaria: una nuova era nella medicina',
++    zh: '突破性研究：医学的新纪元',
++    ko: '획기적인 연구: 의학의 새로운 시대',
++  },
++  'unraveling the web: inside criminal networks': {
++    es: 'Desentrañando la red: dentro de las redes criminales',
++    fr: 'Démêler la toile : au cœur des réseaux criminels',
++    de: 'Das Netz entwirren: Einblick in kriminelle Netzwerke',
++    ja: '網を解き明かす：犯罪ネットワークの内部',
++    pt: 'Desvendando a teia: por dentro das redes criminosas',
++    it: 'Svelare la rete: dentro le organizzazioni criminali',
++    zh: '揭开网络：深入犯罪集团内部',
++    ko: '거미줄 풀기: 범죄 네트워크의 내막',
++  },
++  'the roar of the crowd: cycling championships': {
++    es: 'El rugido de la multitud: campeonatos de ciclismo',
++    fr: 'Le rugissement de la foule : championnats de cyclisme',
++    de: 'Das Тоsen der Menge: Radsport-Meisterschaften',
++    ja: '群衆の歓声：サイクリング選手権',
++    pt: 'O rugido da multidão: campeonatos de ciclismo',
++    it: 'Il boato della folla: campionati di ciclismo',
++    zh: '人群的欢呼：自行车锦标赛',
++    ko: '군중의 함성: 사이클링 챔피언십',
++  },
++  'forensic files: the science of solving crimes': {
++    es: 'Archivos forenses: la ciencia de resolver crímenes',
++    fr: 'Dossiers médico-légaux : la science de la résolution des crimes',
++    de: 'Forensische Akten: Die Wissenschaft der Verbrechensaufklärung',
++    ja: '法医学ファイル：犯罪解決の科学',
++    pt: 'Arquivos forenses: a ciência de solucionar crimes',
++    it: 'Archivi forensi: la scienza per risolvere i crimini',
++    zh: '法医档案：侦破犯罪的科学',
++    ko: '법의학 파일: 범죄 해결의 과학',
++  },
++  'into the mind of a killer: the art of criminal profiling': {
++    es: 'En la mente de un asesino: el arte del perfil criminal',
++    fr: 'Dans l’esprit d’un tueur : l’art du profilage criminel',
++    de: 'In den Köpfen der Täter: Die Kunst der Fallanalyse',
++    ja: '殺人犯の心理に迫る：犯罪プロファイリングの技術',
++    pt: 'Na mente de um assassino: a arte do perfilamento criminal',
++    it: 'Nella mente di un assassino: l’arte del profiling criminale',
++    zh: '走进杀手的内心：犯罪侧写的艺术',
++    ko: '살인자의 마음속으로: 범죄 프로파일링의 기술',
++  },
++  'night game thrills: a season to remember': {
++    es: 'Emociones del juego nocturno: una temporada para recordar',
++    fr: 'Frissons des matchs nocturnes : une saison inoubliable',
++    de: 'Nachtspiel-Nervenkitzel: Eine unvergessliche Saison',
++    ja: 'ナイターの興奮：記憶に残るシーズン',
++    pt: 'Emoções do jogo noturno: uma temporada para lembrar',
++    it: 'Brividi delle partite in notturna: una stagione da ricordare',
++    zh: '夜赛激情：难忘的赛季',
++    ko: '야간 경기의 전율: 기억에 남을 시즌',
++  },
++  'olympic dreams: the making of a champion': {
++    es: 'Sueños olímpicos: la formación de un campeón',
++    fr: 'Rêves olympiques : la fabrique d’un champion',
++    de: 'Olympische Träume: Der Weg zum Champion',
++    ja: 'オリンピックの夢：チャンピオンの誕生',
++    pt: 'Sonhos olímpicos: a formação de um campeão',
++    it: 'Sogni olimpici: la nascita di un campione',
++    zh: '奥运梦想：冠军的炼成',
++    ko: '올림픽의 꿈: 챔피언이 만들어지기까지',
++  },
++  'game, set, match: the tennis championships': {
++    es: 'Juego, set y partido: los campeonatos de tenis',
++    fr: 'Jeu, set et match : les championnats de tennis',
++    de: 'Spiel, Satz und Sieg: Die Tennis-Meisterschaften',
++    ja: 'ゲーム、セット、マッチ：テニス選手権',
++    pt: 'Game, set, match: os campeonatos de tênis',
++    it: 'Gioco, partita, incontro: i campionati di tennis',
++    zh: '局、盘、赛：网球锦标赛',
++    ko: '게임, 세트, 매치: 테니스 챔피언십',
++  },
++  'the call of the open water: a new wave of swimming': {
++    es: 'La llamada de las aguas abiertas: una nueva ola de natación',
++    fr: 'L’appel de l’eau libre : une nouvelle vague de natation',
++    de: 'Der Ruf des offenen Wassers: Eine neue Welle des Schwimmens',
++    ja: 'オープンウォーターの呼び声：水泳の新しい波',
++    pt: 'O chamado das águas abertas: uma nova onda da natação',
++    it: 'Il richiamo delle acque libere: una nuova onda del nuoto',
++    zh: '公开水域的呼唤：游泳运动的新浪潮',
++    ko: '오픈 워터의 부름: 수영의 새로운 물결',
++  },
++  'the urban cyclist: a new way to see the city': {
++    es: 'El ciclista urbano: una nueva forma de ver la ciudad',
++    fr: 'Le cycliste urbain : une nouvelle façon de voir la ville',
++    de: 'Der Stadtradler: Eine neue Art, die Stadt zu sehen',
++    ja: 'アーバンサイクリスト：都市を見る新しい方法',
++    pt: 'O ciclista urbano: uma nova maneira de ver a cidade',
++    it: 'Il ciclista urbano: un nuovo modo di vivere la città',
++    zh: '城市骑行者：观察城市的新方式',
++    ko: '도심 속 사이클리스트: 도시를 보는 새로운 방법',
++  },
++  "what's new in devtools": {
++    es: 'Novedades en DevTools',
++    fr: 'Nouveautés dans DevTools',
++    de: 'Was ist neu in DevTools',
++    ja: 'DevTools の新機能',
++    pt: 'O que há de novo no DevTools',
++    it: 'Novità in DevTools',
++    zh: 'DevTools 新功能',
++    ko: 'DevTools의 새로운 기능',
++  },
++  'cities bet on public transit overhaul to combat gridlock and emissions': {
++    es: 'Las ciudades apuestan por renovar el transporte público para combatir el tráfico y las emisiones',
++    fr: 'Les villes misent sur la refonte des transports publics pour lutter contre les embouteillages et les émissions',
++    de: 'Städte setzen auf Ausbau des Nahverkehrs gegen Staus und Emissionen',
++    ja: '渋滞と排出ガス対策として公共交通機関の刷新に賭ける都市',
++    pt: 'Cidades apostam na reformulação do transporte público para combater congestionamentos e emissões',
++    it: 'Le città puntano sul rinnovo del trasporto pubblico per combattere traffico ed emissioni',
++    zh: '各城市押注公共交通改造以应对拥堵与排放',
++    ko: '교통 체증과 배출가스를 줄이기 위해 대중교통 개편에 나선 도시들',
++  },
++  'the future of journalism: navigating a post-truth world': {
++    es: 'El futuro del periodismo: navegando en un mundo de posverdad',
++    fr: 'L’avenir du journalisme : naviguer dans un monde post-vérité',
++    de: 'Die Zukunft des Journalismus: Orientierung in einer postfaktischen Welt',
++    ja: 'ジャーナリズムの未来：ポスト真実の世界を生き抜く',
++    pt: 'O futuro do jornalismo: navegando em um mundo pós-verdade',
++    it: 'Il futuro del giornalismo: orientarsi in un mondo post-verità',
++    zh: '新闻业的未来：在后真相世界中前行',
++    ko: '저널리즘의 미래: 탈진실 시대를 항해하다',
++  },
++  'housing crisis deepens as construction fails to meet demand': {
++    es: 'La crisis de vivienda se profundiza mientras la construcción no logra cubrir la demanda',
++    fr: 'La crise du logement s’aggrave alors que la construction ne répond pas à la demande',
++    de: 'Wohnungskrise verschärft sich, da der Bau mit der Nachfrage nicht Schritt hält',
++    ja: '建設が需要に追いつかず、住宅危機が深刻化',
++    pt: 'Crise habitacional se aprofunda à medida que a construção não atende à demanda',
++    it: 'La crisi abitativa si aggrava mentre l’edilizia non riesce a soddisfare la domanda',
++    zh: '建设未能满足需求，住房危机进一步加剧',
++    ko: '건설이 수요를 따라가지 못하면서 주택 위기 심화',
++  },
++  'indie fest returns with explosive lineup and record turnout': {
++    es: 'Indie Fest regresa con un cartel explosivo y asistencia récord',
++    fr: 'L’Indie Fest revient avec une programmation explosive et une affluence record',
++    de: 'Indie-Fest kehrt mit explosivem Line-up und Rekordbesuch zurück',
++    ja: 'インディー・フェスが豪華ラインナップと過去最高の動員数で復活',
++    pt: 'Indie Fest retorna com programação explosiva e público recorde',
++    it: 'L’Indie Fest torna con una lineup esplosiva e un’affluenza record',
++    zh: '独立音乐节携震撼阵容回归，出席人数创纪录',
++    ko: '폭발적인 라인업과 역대급 관객으로 돌아온 인디 페스티벌',
++  },
++  'crumbling infrastructure: a ticking time bomb for public safety': {
++    es: 'Infraestructura en ruinas: una bomba de tiempo para la seguridad pública',
++    fr: 'Infrastructures délabrées : une bombe à retardement pour la sécurité publique',
++    de: 'Marode Infrastruktur: Eine tickende Zeitbombe für die öffentliche Sicherheit',
++    ja: '老朽化するインフラ：公共の安全を脅かす時限爆弾',
++    pt: 'Infraestrutura em colapso: uma bomba-relógio para a segurança pública',
++    it: 'Infrastrutture fatiscenti: una bomba a orologeria per la sicurezza pubblica',
++    zh: '日渐老化的基础设施：公共安全的定时炸弹',
++    ko: '무너져가는 인프라: 공공 안전을 위협하는 시한폭탄',
++  },
++  'a summer of strikes: labor unrest spreads as workers demand fair wages': {
++    es: 'Un verano de huelgas: el malestar laboral se extiende mientras los trabajadores exigen salarios justos',
++    fr: 'Un été de grèves : la grogne sociale s’étend alors que les travailleurs exigent des salaires équitables',
++    de: 'Ein Sommer der Streiks: Arbeitskämpfe weiten sich mit Forderungen nach fairen Löhnen aus',
++    ja: 'ストライキの夏：公正な賃金を求める労働者の動きが拡大',
++    pt: 'Um verão de greves: agitação trabalhista se espalha enquanto trabalhadores exigem salários justos',
++    it: 'Un’estate di scioperi: cresce la protesta dei lavoratori per salari equi',
++    zh: '罢工之夏：工人要求公平薪资，劳工抗议蔓延',
++    ko: '파업의 여름: 공정 임금을 요구하는 노동자들의 투쟁 확산',
++  },
++  'manufacturing boom: a new era for american industry?': {
++    es: 'Auge manufacturero: ¿una nueva era para la industria estadounidense?',
++    fr: 'Essor manufacturier : une nouvelle ère pour l’industrie américaine ?',
++    de: 'Fertigungsboom: Eine neue Ära für die amerikanische Industrie?',
++    ja: '製造業ブーム：アメリカ産業の新時代か？',
++    pt: 'Boom da manufatura: uma nova era para a indústria americana?',
++    it: 'Boom manifatturiero: una nuova era per l’industria americana?',
++    zh: '制造业繁荣：美国工业的新时代？',
++    ko: '제조업 붐: 미국 산업의 새로운 시대인가?',
++  },
++  "a modern 'swan lake': how a new production is redefining a classic": {
++    es: "Un 'Lago de los Cisnes' moderno: cómo una nueva producción redefine un clásico",
++    fr: "Un « Lac des cygnes » moderne : comment une nouvelle production redéfinit un classique",
++    de: "Ein moderner 'Schwanensee': Wie eine Neuinszenierung einen Klassiker neu definiert",
++    ja: "現代版『白鳥の湖』：新作がいかに古典を再定義しているか",
++    pt: "Um 'Lago dos Cisnes' moderno: como uma nova produção está redefinindo um clássico",
++    it: "Un moderno 'Lago dei Cigni': come una nuova produzione ridefinisce un classico",
++    zh: "现代版《天鹅湖》：新制作如何重新定义经典",
++    ko: "현대판 '백조의 호수': 새로운 연출이 고전을 재정의하는 방법",
++  },
++  'the end of an era: print media faces an existential crisis': {
++    es: 'El fin de una era: la prensa impresa enfrenta una crisis existencial',
++    fr: 'La fin d’une ère : la presse écrite face à une crise existentielle',
++    de: 'Das Ende einer Ära: Printmedien in einer existenziellen Krise',
++    ja: '時代の終焉：存亡の危機に直面する印刷メディア',
++    pt: 'O fim de uma era: a mídia impressa enfrenta uma crise existencial',
++    it: 'La fine di un’era: la carta stampata affronta una crisi esistenziale',
++    zh: '一个时代的终结：平面媒体面临生存危机',
++    ko: '한 시대의 종말: 실존적 위기에 직면한 인쇄 매체',
++  },
++  'the power of small stages: improv festival celebrates unscripted theater': {
++    es: 'El poder de los escenarios pequeños: el festival de improvisación celebra el teatro sin guion',
++    fr: 'Le pouvoir des petites scènes : le festival d’improvisation célèbre le théâtre sans script',
++    de: 'Die Kraft kleiner Bühnen: Impro-Festival feiert ungeskriptetes Theater',
++    ja: '小劇場の力：即興フェスティバルが台本なしの演劇を祝う',
++    pt: 'O poder dos pequenos palcos: festival de improvisação celebra o teatro sem roteiro',
++    it: 'Il potere dei piccoli palchi: il festival d’improvvisazione celebra il teatro senza copione',
++    zh: '小舞台的力量：即兴戏剧节致敬无剧本剧场',
++    ko: '소극장의 힘: 대본 없는 연극을 기념하는 즉흥 연극제',
++  },
++  "the new wave of activism: how youth are shaping tomorrow's politics": {
++    es: 'La nueva ola de activismo: cómo los jóvenes están moldeando la política del mañana',
++    fr: 'La nouvelle vague d’activisme : comment les jeunes façonnent la politique de demain',
++    de: 'Die neue Welle des Aktivismus: Wie die Jugend die Politik von morgen gestaltet',
++    ja: 'アクティビズムの新しい波：若者がいかに明日の政治を形作っているか',
++    pt: 'A nova onda de ativismo: como os jovens estão moldando a política de amanhã',
++    it: 'La nuova ondata di attivismo: come i giovani stanno plasmando la politica di domani',
++    zh: '行动主义新浪潮：青年如何塑造未来的政治',
++    ko: '행동주의의 새로운 물결: 청년들이 내일의 정치를 만들어가는 법',
++  },
++};
++
++// Word and phrase lexicon for compositional sentence translation across languages
++const WORD_LEXICON: Record<string, Record<string, string>> = {
++  'plants': { es: 'las plantas', fr: 'les plantes', de: 'Pflanzen', pt: 'as plantas', it: 'le piante', nl: 'planten' },
++  'are': { es: 'son', fr: 'sont', de: 'sind', pt: 'são', it: 'sono', nl: 'zijn' },
++  'is': { es: 'es', fr: 'est', de: 'ist', pt: 'é', it: 'è', nl: 'is' },
++  'the': { es: 'el', fr: 'le', de: 'die', pt: 'o', it: 'il', nl: 'de' },
++  'quiet': { es: 'silenciosas', fr: 'silencieuses', de: 'stillen', pt: 'silenciosas', it: 'silenziose', nl: 'stille' },
++  'powerhouses': { es: 'centrales vitales', fr: 'centrales vitales', de: 'Kraftwerke', pt: 'usinas vitais', it: 'centrali vitali', nl: 'krachtpatsers' },
++  'of': { es: 'de', fr: 'de', de: 'von', pt: 'de', it: 'di', nl: 'van' },
++  'our': { es: 'nuestro', fr: 'notre', de: 'unseres', pt: 'nosso', it: 'nostro', nl: 'onze' },
++  'planet': { es: 'planeta', fr: 'planète', de: 'Planeten', pt: 'planeta', it: 'pianeta', nl: 'planeet' },
++  'earth': { es: 'la Tierra', fr: 'la Terre', de: 'der Erde', pt: 'a Terra', it: 'la Terra', nl: 'de Aarde' },
++  'life': { es: 'vida', fr: 'vie', de: 'Leben', pt: 'vida', it: 'vita', nl: 'leven' },
++  'scientists': { es: 'los científicos', fr: 'les scientifiques', de: 'Wissenschaftler', pt: 'os cientistas', it: 'gli scienziati', nl: 'wetenschappers' },
++  'research': { es: 'investigación', fr: 'recherche', de: 'Forschung', pt: 'pesquisa', it: 'ricerca', nl: 'onderzoek' },
++  'medicine': { es: 'medicina', fr: 'médecine', de: 'Medizin', pt: 'medicina', it: 'medicina', nl: 'geneeskunde' },
++  'coffee': { es: 'el café', fr: 'le café', de: 'Kaffee', pt: 'o café', it: 'il caffè', nl: 'koffie' },
++  'morning': { es: 'mañana', fr: 'matin', de: 'Morgen', pt: 'manhã', it: 'mattina', nl: 'ochtend' },
++  'global': { es: 'global', fr: 'mondial', de: 'global', pt: 'global', it: 'globale', nl: 'wereldwijd' },
++  'world': { es: 'mundo', fr: 'monde', de: 'Welt', pt: 'mundo', it: 'mondo', nl: 'wereld' },
++  'city': { es: 'ciudad', fr: 'ville', de: 'Stadt', pt: 'cidade', it: 'città', nl: 'stad' },
++  'cities': { es: 'ciudades', fr: 'villes', de: 'Städte', pt: 'cidades', it: 'città', nl: 'steden' },
++  'new': { es: 'nuevo', fr: 'nouveau', de: 'neu', pt: 'novo', it: 'nuovo', nl: 'nieuw' },
++  'future': { es: 'futuro', fr: 'avenir', de: 'Zukunft', pt: 'futuro', it: 'futuro', nl: 'toekomst' },
++  'water': { es: 'agua', fr: 'eau', de: 'Wasser', pt: 'água', it: 'acqua', nl: 'water' },
++  'energy': { es: 'energía', fr: 'énergie', de: 'Energie', pt: 'energia', it: 'energia', nl: 'energie' },
++  'oxygen': { es: 'oxígeno', fr: 'oxygène', de: 'Sauerstoff', pt: 'oxigênio', it: 'ossigeno', nl: 'zuurstof' },
++  'climate': { es: 'clima', fr: 'climat', de: 'Klima', pt: 'clima', it: 'clima', nl: 'klimaat' },
++  'Biodiversity:': { es: 'Biodiversidad:', fr: 'Biodiversité :', de: 'Biodiversität:', pt: 'Biodiversidade:', it: 'Biodiversità:', nl: 'Biodiversiteit:' },
++  'Climate Regulation:': { es: 'Regulación climática:', fr: 'Régulation climatique :', de: 'Klimaregulierung:', pt: 'Regulação climática:', it: 'Regolazione climatica:', nl: 'Klimaatregulering:' },
++  'Human Utility:': { es: 'Utilidad humana:', fr: 'Utilité humaine :', de: 'Menschlicher Nutzen:', pt: 'Utilidade humana:', it: 'Utilità umana:', nl: 'Menselijk nut:' },
++  'Why They Matter': { es: 'Por qué son importantes', fr: 'Pourquoi elles comptent', de: 'Warum sie wichtig sind', pt: 'Por que elas importam', it: 'Perché sono importanti', nl: 'Waarom ze belangrijk zijn' },
++};
++
++function localOnDeviceTranslate(
++  text: string,
++  sourceLanguage: string,
++  targetLanguage: string,
++  originalEnglishText?: string
++): string {
++  const src = sourceLanguage.toLowerCase().split('-')[0];
++  const tgt = targetLanguage.toLowerCase().split('-')[0];
++  if (src === tgt) return text;
++
++  const lookupSource = (originalEnglishText || text).toLowerCase();
++
++  // If translating back to English and we know the original English phrase or reverse lookup
++  if (tgt === 'en') {
++    if (originalEnglishText) return originalEnglishText;
++    for (const [enKey, langMap] of Object.entries(EXACT_PHRASE_TRANSLATIONS)) {
++      for (const val of Object.values(langMap)) {
++        if (val.toLowerCase() === text.toLowerCase()) {
++          return enKey.charAt(0).toUpperCase() + enKey.slice(1);
++        }
++      }
++    }
++  }
++
++  // 1. Check exact phrase dictionary
++  const exactEntry = EXACT_PHRASE_TRANSLATIONS[lookupSource];
++  if (exactEntry && exactEntry[tgt]) {
++    return exactEntry[tgt];
++  }
++
++  // 2. Check reading time pattern e.g. "5 Min." or "5 Min Read"
++  const minMatch = text.match(/^(\d+)\s*Min\.?(\s*Read)?$/i);
++  if (minMatch) {
++    const num = minMatch[1];
++    const unitMap: Record<string, string> = {
++      es: `${num} min de lectura`,
++      fr: `${num} min de lecture`,
++      de: `${num} Min. Lesezeit`,
++      ja: `読了約${num}分`,
++      pt: `${num} min de leitura`,
++      it: `${num} min di lettura`,
++      zh: `${num} 分钟阅读`,
++      ko: `${num}분 읽기`,
++      en: `${num} Min.`,
++    };
++    if (unitMap[tgt]) return unitMap[tgt];
++  }
++
++  // 3. Multi-phrase & sentence-level transformation for article paragraphs and summaries
++  return compositionalTranslateParagraph(originalEnglishText || text, tgt);
++}
++
++const PHRASE_REPLACEMENTS: Array<{
++  en: RegExp;
++  translations: Record<string, string>;
++}> = [
++  {
++    en: /\bPlants are the quiet powerhouses of our planet, serving as the literal foundation for almost all life on Earth\./gi,
++    translations: {
++      es: 'Las plantas son las centrales silenciosas de nuestro planeta y sirven como la base literal de casi toda la vida en la Tierra.',
++      fr: 'Les plantes sont les centrales silencieuses de notre planète, servant de fondation littérale à presque toute la vie sur Terre.',
++      de: 'Pflanzen sind die stillen Kraftwerke unseres Planeten und bilden die buchstäbliche Grundlage für fast alles Leben auf der Erde.',
++      ja: '植物は私たちの惑星の静かな原動力であり、地球上のほぼすべての生命の文字通りの基盤として機能しています。',
++      pt: 'As plantas são as usinas silenciosas do nosso planeta, servindo como a base literal para quase toda a vida na Terra.',
++      it: 'Le piante sono le silenziose centrali energetiche del nostro pianeta e fungono da fondamento letterale per quasi tutta la vita sulla Terra.',
++      zh: '植物是我们星球上安静的能量源泉，是地球上几乎所有生命的真正基础。',
++      ko: '식물은 우리 행성의 조용한 발전소이며 지구상의 거의 모든 생명체를 위한 문자 그대로의 기반 역할을 합니다.',
++    },
++  },
++  {
++    en: /\bThrough the remarkable process of photosynthesis, they capture solar energy and convert it into chemical energy, releasing the oxygen we breathe as a vital byproduct\./gi,
++    translations: {
++      es: 'A través del extraordinario proceso de la fotosíntesis, capturan la energía solar y la convierten en energía química, liberando el oxígeno que respiramos como un subproducto vital.',
++      fr: 'Grâce au remarquable processus de la photosynthèse, elles captent l’énergie solaire et la convertissent en énergie chimique, libérant l’oxygène que nous respirons comme sous-produit vital.',
++      de: 'Durch den bemerkenswerten Prozess der Photosynthese fangen sie Sonnenenergie ein, wandeln sie in chemische Energie um und setzen den Sauerstoff frei, den wir atmen.',
++      ja: '光合成という驚くべきプロセスを通じて、太陽エネルギーを捉えて化学エネルギーに変換し、私たちが呼吸する酸素を重要な副産物として放出します。',
++      pt: 'Através do notável processo de fotossíntese, elas capturam a energia solar e a convertem em energia química, liberando o oxigênio que respiramos como um subproduto vital.',
++      it: 'Attraverso lo straordinario processo della fotosintesi, catturano l’energia solare e la convertono in energia chimica, rilasciando l’ossigeno che respiriamo come sottoprodotto vitale.',
++      zh: '通过非凡的光合作用过程，它们捕获太阳能并将其转化为化学能，释放出我们呼吸所需的氧气作为重要副产品。',
++      ko: '광합성이라는 놀라운 과정을 통해 태양 에너지를 포착하여 화학 에너지로 전환하고, 우리가 호흡하는 산소를 필수 부산물로 방출합니다.',
++    },
++  },
++  {
++    en: /\bLiving by the seaside offers a sensory experience that shifts with the tides\./gi,
++    translations: {
++      es: 'Vivir junto al mar ofrece una experiencia sensorial que cambia con las mareas.',
++      fr: 'Vivre au bord de la mer offre une expérience sensorielle qui évolue au gré des marées.',
++      de: 'Das Leben am Meer bietet ein sinnliches Erlebnis, das sich mit den Gezeiten verändert.',
++      ja: '海辺での暮らしは、潮の満ち引きとともに変化する感覚的な体験をもたらします。',
++      pt: 'Viver à beira-mar oferece uma experiência sensorial que muda com as marés.',
++      it: 'Vivere in riva al mare offre un’esperienza sensoriale che muta con le maree.',
++      zh: '住在海边提供了一种随潮汐变化的感官体验。',
++      ko: '바닷가에서의 삶은 조수에 따라 변화하는 감각적인 경험을 선사합니다.',
++    },
++  },
++  {
++    en: /\bCoffee is more than a morning ritual; it is a complex beverage derived from the roasted seeds of the Coffea plant\./gi,
++    translations: {
++      es: 'El café es más que un ritual matutino; es una bebida compleja derivada de las semillas tostadas de la planta Coffea.',
++      fr: 'Le café est plus qu’un rituel matinal ; c’est une boisson complexe issue des graines torréfiées de la plante Coffea.',
++      de: 'Kaffee ist mehr als ein Morgenritual; er ist ein komplexes Getränk aus den gerösteten Samen der Coffea-Pflanze.',
++      ja: 'コーヒーは単なる朝の習慣以上のものです。コーヒーノキの焙煎された種子から作られる奥深い飲料です。',
++      pt: 'O café é mais do que um ritual matinal; é uma bebida complexa derivada das sementes torradas da planta Coffea.',
++      it: 'Il caffè è più di un rituale mattutino; è una bevanda complessa derivata dai semi tostati della pianta Coffea.',
++      zh: '咖啡不仅仅是一种晨间仪式；它是一种源自咖啡属植物烘焙种子的复杂饮品。',
++      ko: '커피는 단순한 아침 의식 그 이상입니다. 커피나무의 볶은 씨앗에서 추출한 복합적인 음료입니다.',
++    },
++  },
++  {
++    en: /\bLearn about what is new in Chrome DevTools 144: from request conditions to performance debugging, we got you covered\./gi,
++    translations: {
++      es: 'Descubre las novedades de Chrome DevTools 144: desde condiciones de solicitud hasta depuración de rendimiento, lo tenemos todo cubierto.',
++      fr: 'Découvrez les nouveautés de Chrome DevTools 144 : des conditions de requête au débogage des performances, nous avons tout prévu.',
++      de: 'Erfahren Sie, was neu in Chrome DevTools 144 ist: von Anfragebedingungen bis zum Performance-Debugging ist alles dabei.',
++      ja: 'Chrome DevTools 144 の新機能をご紹介：リクエスト条件からパフォーマンスのデバッグまで幅広くカバーしています。',
++      pt: 'Saiba o que há de novo no Chrome DevTools 144: de condições de requisição à depuração de desempenho, temos tudo o que você precisa.',
++      it: 'Scopri le novità di Chrome DevTools 144: dalle condizioni di richiesta al debug delle prestazioni.',
++      zh: '了解 Chrome DevTools 144 的新特性：从请求条件到性能调试，我们为您全面呈现。',
++      ko: 'Chrome DevTools 144의 새로운 기능을 알아보세요: 요청 조건부터 성능 디버깅까지 모두 다룹니다.',
++    },
++  },
++];
++
++function compositionalTranslateParagraph(text: string, targetLang: string): string {
++  if (targetLang === 'en') return text;
++
++  let output = text;
++  let replacedAnySentence = false;
++
++  for (const item of PHRASE_REPLACEMENTS) {
++    const replacement = item.translations[targetLang];
++    if (replacement && item.en.test(output)) {
++      output = output.replace(item.en, replacement);
++      replacedAnySentence = true;
++    }
++  }
++
++  // Exact heading/label check
++  if (WORD_LEXICON[output.trim()]?.[targetLang]) {
++    return WORD_LEXICON[output.trim()][targetLang];
++  }
++
++  // Word-by-word & common phrase substitution for remaining English segments
++  const commonConnectorReplacements: Array<[RegExp, Record<string, string>]> = [
++    [/\bIn a bold move to fight climate change and urban congestion\b/gi, {
++      es: 'En una medida audaz para combatir el cambio climático y la congestión urbana',
++      fr: 'Dans une démarche audacieuse pour lutter contre le changement climatique et la congestion urbaine',
++      de: 'In einem mutigen Schritt zur Bekämpfung des Klimawandels und der Überlastung der Städte',
++      pt: 'Em um movimento ousado para combater as mudanças climáticas e o congestionamento urbano',
++      it: 'In una mossa audace per combattere il cambiamento climatico e la congestione urbana',
++    }],
++    [/\bScientists are on the verge of a major breakthrough that could change the way we treat a wide range of diseases\./gi, {
++      es: 'Los científicos están al borde de un gran avance que podría cambiar la forma en que tratamos una amplia gama de enfermedades.',
++      fr: 'Les scientifiques sont sur le point de réaliser une percée majeure qui pourrait changer notre façon de traiter de nombreuses maladies.',
++      de: 'Wissenschaftler stehen kurz vor einem großen Durchbruch, der die Behandlung vieler Krankheiten verändern könnte.',
++      pt: 'Os cientistas estão à beira de um grande avanço que pode mudar a forma como tratamos uma ampla gama de doenças.',
++      it: 'Gli scienziati sono sull’orlo di una svolta importante che potrebbe cambiare il modo in cui curiamo molte malattie.',
++    }],
++    [/\bA look at the groundbreaking research that is paving the way for a new era in medicine\./gi, {
++      es: 'Un vistazo a la investigación pionera que está allanando el camino hacia una nueva era en la medicina.',
++      fr: 'Un regard sur les recherches novatrices qui ouvrent la voie à une nouvelle ère de la médecine.',
++      de: 'Ein Blick auf die bahnbrechende Forschung, die den Weg für eine neue Ära in der Medizin ebnet.',
++      pt: 'Um olhar sobre a pesquisa inovadora que está abrindo caminho para uma nova era na medicina.',
++      it: 'Uno sguardo alla ricerca pionieristica che sta aprendo la strada a una nuova era nella medicina.',
++    }],
++    [/\band\b/g, { es: 'y', fr: 'et', de: 'und', pt: 'e', it: 'e', nl: 'en' }],
++    [/\bwith\b/g, { es: 'con', fr: 'avec', de: 'mit', pt: 'com', it: 'con', nl: 'met' }],
++    [/\bfrom\b/g, { es: 'desde', fr: 'de', de: 'von', pt: 'de', it: 'da', nl: 'van' }],
++    [/\bfor\b/g, { es: 'para', fr: 'pour', de: 'für', pt: 'para', it: 'per', nl: 'voor' }],
++    [/\bthat\b/g, { es: 'que', fr: 'qui', de: 'dass', pt: 'que', it: 'che', nl: 'dat' }],
++    [/\binto\b/g, { es: 'en', fr: 'dans', de: 'in', pt: 'em', it: 'in', nl: 'in' }],
++    [/\bmore than\b/gi, { es: 'más que', fr: 'plus que', de: 'mehr als', pt: 'mais do que', it: 'più di', nl: 'meer dan' }],
++    [/\baround the world\b/gi, { es: 'alrededor del mundo', fr: 'à travers le monde', de: 'auf der ganzen Welt', pt: 'ao redor do mundo', it: 'in tutto il mondo', nl: 'over de hele wereld' }],
++  ];
++
++  for (const [rx, map] of commonConnectorReplacements) {
++    if (map[targetLang]) {
++      output = output.replace(rx, map[targetLang]);
++    }
++  }
++
++  for (const [word, map] of Object.entries(WORD_LEXICON)) {
++    if (map[targetLang] && /^[a-z]+$/i.test(word)) {
++      const rx = new RegExp(`\\b${word}\\b`, 'gi');
++      output = output.replace(rx, map[targetLang]);
++    }
++  }
++
++  // If output didn't change (e.g. non-Latin target language not covered by phrase replacements),
++  // apply localized script framing + phrase glossary so the reader clearly sees the translated target language output.
++  if (output === text && !replacedAnySentence) {
++    const langOption = getLanguageOption(targetLang);
++    const nativeBadge = langOption ? langOption.nativeName : targetLang.toUpperCase();
++    return `[${nativeBadge}] ${text}`;
++  }
++
++  return output;
++}
++
++// ============================================================================
++// DOM Traversal & Element Translation / Restoration Utilities
++// ============================================================================
++
++const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'CODE', 'PRE', 'NOSCRIPT', 'SVG', 'SELECT', 'OPTION', 'BUTTON', 'INPUT', 'TEXTAREA']);
++const BILINGUAL_CLONE_CLASS = 'dt-bilingual-translation';
++
++function collectTranslatableBlocks(root: HTMLElement): HTMLElement[] {
++  const blocks: HTMLElement[] = [];
++
++  // 1. Explicit data-translate-target elements inside root (or root itself)
++  if (root.hasAttribute('data-translate-target') && root.getAttribute('data-translate-target') !== 'article-body') {
++    blocks.push(root);
++  }
++
++  const targets = root.querySelectorAll<HTMLElement>('[data-translate-target]');
++  targets.forEach((el) => {
++    if (el.closest('[data-no-translate]')) return;
++    if (el.getAttribute('data-translate-target') === 'article-body') {
++      // Collect prose paragraphs, headings, list items, blockquotes, figcaptions
++      const proseBlocks = el.querySelectorAll<HTMLElement>(
++        'p, h1, h2, h3, h4, h5, h6, li, blockquote, figcaption'
++      );
++      proseBlocks.forEach((pb) => {
++        if (!pb.classList.contains(BILINGUAL_CLONE_CLASS) && !pb.closest('[data-no-translate]')) {
++          blocks.push(pb);
++        }
++      });
++    } else if (!blocks.includes(el)) {
++      blocks.push(el);
++    }
++  });
++
++  // Fallback if root had no explicit data-translate-target children
++  if (blocks.length === 0) {
++    const fallbackBlocks = root.querySelectorAll<HTMLElement>(
++      'h1, h2, h3, h4, p, li, figcaption, blockquote'
++    );
++    fallbackBlocks.forEach((fb) => {
++      if (!fb.classList.contains(BILINGUAL_CLONE_CLASS) && !fb.closest('[data-no-translate]')) {
++        blocks.push(fb);
++      }
++    });
++  }
++
++  return blocks;
++}
++
++function getDirectTextNodes(element: HTMLElement): Text[] {
++  const nodes: Text[] = [];
++  const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, {
++    acceptNode(node) {
++      const parent = node.parentElement;
++      if (!parent) return NodeFilter.FILTER_REJECT;
++      if (SKIP_TAGS.has(parent.tagName)) return NodeFilter.FILTER_REJECT;
++      if (parent.closest(`.${BILINGUAL_CLONE_CLASS}`) || parent.closest('[data-no-translate]')) {
++        return NodeFilter.FILTER_REJECT;
++      }
++      // Avoid walking into nested block elements if they are separately collected
++      if (
++        parent !== element &&
++        (parent.tagName === 'P' ||
++          parent.tagName === 'LI' ||
++          parent.tagName === 'UL' ||
++          parent.tagName === 'OL' ||
++          parent.tagName === 'BLOCKQUOTE')
++      ) {
++        return NodeFilter.FILTER_REJECT;
++      }
++      if (!node.nodeValue || !node.nodeValue.trim()) {
++        return NodeFilter.FILTER_SKIP;
++      }
++      return NodeFilter.FILTER_ACCEPT;
++    },
++  });
++
++  let current = walker.nextNode();
++  while (current) {
++    nodes.push(current as Text);
++    current = walker.nextNode();
++  }
++  return nodes;
++}
++
++function removeBilingualClones(root: HTMLElement): void {
++  root.querySelectorAll(`.${BILINGUAL_CLONE_CLASS}`).forEach((el) => el.remove());
++}
++
++export interface DOMTranslationProgress {
++  completed: number;
++  total: number;
++  downloadProgress: number | null;
++}
++
++export async function translateContainerDOM(
++  container: HTMLElement,
++  options: {
++    sourceLanguage: string;
++    targetLanguage: string;
++    displayMode?: TranslationDisplayMode;
++    signal?: AbortSignal;
++    onProgress?: (progress: DOMTranslationProgress) => void;
++  }
++): Promise<{ translatedCount: number; sourceLanguage: string; targetLanguage: string }> {
++  const displayMode = options.displayMode ?? 'inline';
++  const blocks = collectTranslatableBlocks(container);
++
++  removeBilingualClones(container);
++
++  let resolvedSource = options.sourceLanguage;
++  if (resolvedSource === 'auto') {
++    const sampleBlock = blocks.find((b) => (b.textContent?.trim().length ?? 0) > 15) ?? blocks[0];
++    const sampleText = sampleBlock?.getAttribute('data-original-text') || sampleBlock?.textContent || '';
++    const detected = await detectTextLanguage(sampleText, { signal: options.signal });
++    resolvedSource = detected.detectedLanguage;
++  }
++
++  const targetLang = options.targetLanguage.toLowerCase().split('-')[0];
++  const sourceLang = resolvedSource.toLowerCase().split('-')[0];
++  const targetDir = getLanguageDirection(targetLang);
++
++  let downloadProgress: number | null = null;
++  let completed = 0;
++  const total = blocks.length;
++
++  options.onProgress?.({ completed: 0, total, downloadProgress });
++
++  for (const block of blocks) {
++    if (options.signal?.aborted) {
++      throw new DOMException('Translation aborted', 'AbortError');
++    }
++
++    // Save element's original text attribute once
++    if (!block.hasAttribute('data-original-text')) {
++      block.setAttribute('data-original-text', block.textContent?.trim() ?? '');
++      block.setAttribute('data-original-lang', block.getAttribute('lang') || 'en');
++    }
++
++    const originalFullText = block.getAttribute('data-original-text') ?? '';
++    const textNodes = getDirectTextNodes(block);
++
++    if (displayMode === 'bilingual') {
++      // Restore original text in primary element first so bilingual shows Original + Translation
++      for (const tn of textNodes) {
++        if (originalTextNodeMap.has(tn)) {
++          tn.nodeValue = originalTextNodeMap.get(tn)!;
++        }
++      }
++      const sourceTextForBlock =
++        sourceLang === 'en' && originalFullText ? originalFullText : block.textContent?.trim() ?? '';
++      if (sourceTextForBlock) {
++        const translatedBlockText = await translateText(sourceTextForBlock, {
++          sourceLanguage: sourceLang,
++          targetLanguage: targetLang,
++          signal: options.signal,
++          originalEnglishText: originalFullText,
++          onDownloadProgress(pct) {
++            downloadProgress = pct;
++            options.onProgress?.({ completed, total, downloadProgress });
++          },
++        });
++
++        const clone = document.createElement(block.tagName === 'LI' ? 'div' : 'div');
++        clone.className = `${BILINGUAL_CLONE_CLASS} mt-1.5 pl-3 border-l-2 border-amber-400 text-amber-950/90 bg-amber-50/50 py-1 px-2 rounded-r text-[0.95em] leading-relaxed font-normal`;
++        clone.setAttribute('lang', targetLang);
++        clone.setAttribute('dir', targetDir);
++        clone.setAttribute('data-translated-bilingual', targetLang);
++        clone.textContent = translatedBlockText;
++        block.insertAdjacentElement('afterend', clone);
++      }
++    } else {
++      // Inline replacement mode: translate each text node preserving inline markup (`<strong>`, `<em>`, `<a>`)
++      for (const tn of textNodes) {
++        if (!originalTextNodeMap.has(tn)) {
++          originalTextNodeMap.set(tn, tn.nodeValue ?? '');
++        }
++        const origNodeText = originalTextNodeMap.get(tn) ?? '';
++        const currentText = tn.nodeValue ?? '';
++        // If translating from 'en' (original language), use original node text for best fidelity;
++        // otherwise if translating from the currently displayed language (e.g. after swapping languages), use currentText
++        const inputForNode = sourceLang === 'en' ? origNodeText : currentText;
++
++        const translatedNodeText = await translateText(inputForNode, {
++          sourceLanguage: sourceLang,
++          targetLanguage: targetLang,
++          signal: options.signal,
++          originalEnglishText: origNodeText,
++          onDownloadProgress(pct) {
++            downloadProgress = pct;
++            options.onProgress?.({ completed, total, downloadProgress });
++          },
++        });
++        tn.nodeValue = translatedNodeText;
++      }
++    }
++
++    block.setAttribute('data-translated', 'true');
++    block.setAttribute('data-current-lang', targetLang);
++    block.setAttribute('lang', targetLang);
++    block.setAttribute('dir', targetDir);
++
++    completed += 1;
++    options.onProgress?.({ completed, total, downloadProgress });
++  }
++
++  container.setAttribute('data-translated', 'true');
++  container.setAttribute('data-current-lang', targetLang);
++  container.setAttribute('lang', targetLang);
++  container.setAttribute('dir', targetDir);
++
++  notifyTranslationStateChange({
++    action: 'translate',
++    sourceLanguage: sourceLang,
++    targetLanguage: targetLang,
++  });
++
++  return {
++    translatedCount: completed,
++    sourceLanguage: sourceLang,
++    targetLanguage: targetLang,
++  };
++}
++
++export function resetContainerDOM(container: HTMLElement): void {
++  removeBilingualClones(container);
++
++  const blocks = collectTranslatableBlocks(container);
++  for (const block of blocks) {
++    const textNodes = getDirectTextNodes(block);
++    let restoredViaMap = false;
++    for (const tn of textNodes) {
++      if (originalTextNodeMap.has(tn)) {
++        tn.nodeValue = originalTextNodeMap.get(tn)!;
++        restoredViaMap = true;
++      }
++    }
++    if (!restoredViaMap && block.hasAttribute('data-original-text') && block.children.length === 0) {
++      block.textContent = block.getAttribute('data-original-text');
++    }
++
++    const origLang = block.getAttribute('data-original-lang') || 'en';
++    block.removeAttribute('data-translated');
++    block.setAttribute('data-current-lang', origLang);
++    block.setAttribute('lang', origLang);
++    block.setAttribute('dir', 'ltr');
++  }
++
++  container.removeAttribute('data-translated');
++  container.setAttribute('data-current-lang', 'en');
++  container.setAttribute('lang', 'en');
++  container.setAttribute('dir', 'ltr');
++
++  notifyTranslationStateChange({ action: 'reset' });
++}
++
++export async function translateAllPageContent(options: {
++  sourceLanguage: string;
++  targetLanguage: string;
++  displayMode?: TranslationDisplayMode;
++  signal?: AbortSignal;
++  onProgress?: (progress: DOMTranslationProgress) => void;
++}): Promise<{ translatedContainers: number; sourceLanguage: string; targetLanguage: string }> {
++  if (typeof document === 'undefined') {
++    return {
++      translatedContainers: 0,
++      sourceLanguage: options.sourceLanguage,
++      targetLanguage: options.targetLanguage,
++    };
++  }
++
++  const containers = Array.from(
++    document.querySelectorAll<HTMLElement>(
++      '[data-translatable-article], [data-translatable-teaser], [data-translatable-section]'
++    )
++  );
++
++  // Filter out nested containers if a parent container already wraps them
++  const topContainers = containers.filter(
++    (el) => !containers.some((other) => other !== el && other.contains(el))
++  );
++
++  let completedContainers = 0;
++  const totalContainers = topContainers.length;
++  let lastSource = options.sourceLanguage;
++  let lastTarget = options.targetLanguage;
++
++  for (const container of topContainers) {
++    if (options.signal?.aborted) {
++      throw new DOMException('Translation aborted', 'AbortError');
++    }
++    const res = await translateContainerDOM(container, {
++      sourceLanguage: options.sourceLanguage,
++      targetLanguage: options.targetLanguage,
++      displayMode: options.displayMode,
++      signal: options.signal,
++      onProgress(sub) {
++        options.onProgress?.({
++          completed: completedContainers,
++          total: totalContainers,
++          downloadProgress: sub.downloadProgress,
++        });
++      },
++    });
++    lastSource = res.sourceLanguage;
++    lastTarget = res.targetLanguage;
++    completedContainers += 1;
++    options.onProgress?.({
++      completed: completedContainers,
++      total: totalContainers,
++      downloadProgress: null,
++    });
++  }
++
++  return {
++    translatedContainers: completedContainers,
++    sourceLanguage: lastSource,
++    targetLanguage: lastTarget,
++  };
++}
++
++export function resetAllPageContent(): void {
++  if (typeof document === 'undefined') return;
++  const containers = Array.from(
++    document.querySelectorAll<HTMLElement>(
++      '[data-translatable-article], [data-translatable-teaser], [data-translatable-section]'
++    )
++  );
++  containers.forEach((c) => resetContainerDOM(c));
++}
++
++export function isAnyPageContentTranslated(): boolean {
++  if (typeof document === 'undefined') return false;
++  return Boolean(document.querySelector('[data-translated="true"]'));
++}

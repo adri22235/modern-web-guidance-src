@@ -1,0 +1,273 @@
+diff --git a/index.html b/index.html
+index 66c9173..8a963dd 100644
+--- a/index.html
++++ b/index.html
+@@ -207,6 +207,7 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script src="/security.js" defer></script>
+ </body>
+ 
+ </html>
+diff --git a/package.json b/package.json
+index 2bd4d77..d1fe2ea 100644
+--- a/package.json
++++ b/package.json
+@@ -2,6 +2,7 @@
+   "name": "daily-grind",
+   "version": "1.0.0",
+   "scripts": {
++    "test": "node --test",
+     "start": "pnpm dlx statikk --port ${PORT:-11222}"
+   },
+   "pnpm": {
+diff --git a/security.js b/security.js
+new file mode 100644
+index 0000000..04c0d79
+--- /dev/null
++++ b/security.js
+@@ -0,0 +1,92 @@
++(() => {
++  'use strict';
++
++  // Deployment configuration: only this ordering service may send order actions.
++  const ORDERING_ORIGIN = new URL('https://orders.dailygrind.com').origin;
++  const PAGE_ORIGIN = window.location.origin;
++  const EXTERNAL_ORIGINS = new Set([ORDERING_ORIGIN]);
++
++  function parseWebURL(value) {
++    if (typeof value !== 'string' || value.trim() === '') return null;
++    try {
++      const url = new URL(value, window.location.href);
++      if (!['https:', 'http:'].includes(url.protocol)) return null;
++      if (url.username || url.password) return null;
++      return url;
++    } catch {
++      return null;
++    }
++  }
++
++  function sameSiteURL(value) {
++    const url = parseWebURL(value);
++    // Exact origins also enforce scheme and port; subdomains are not implicitly trusted.
++    return url && url.origin === PAGE_ORIGIN ? url : null;
++  }
++
++  function allowedLinkURL(value) {
++    const url = parseWebURL(value);
++    return url && (url.origin === PAGE_ORIGIN ||
++      (url.protocol === 'https:' && EXTERNAL_ORIGINS.has(url.origin))) ? url : null;
++  }
++
++  // Check at activation time too, including links inserted or changed after page load.
++  function validateLink(event) {
++    const link = event.target.closest?.('a[href]');
++    if (!link) return;
++    const url = allowedLinkURL(link.getAttribute('href'));
++    if (!url) {
++      event.preventDefault();
++      return;
++    }
++    link.href = url.href;
++    if (url.origin !== PAGE_ORIGIN || link.target === '_blank') {
++      link.relList.add('noopener', 'noreferrer');
++    }
++  }
++  document.addEventListener('click', validateLink, true);
++  document.addEventListener('auxclick', validateLink, true);
++
++  // Capture the intended iframe's identity before it can send initialization.
++  const widget = document.createElement('iframe');
++  widget.title = 'Daily Grind rewards widget';
++  widget.hidden = true;
++  widget.setAttribute('sandbox', 'allow-scripts');
++  let expectedWidgetSource;
++  let widgetSource = null;
++
++  window.addEventListener('message', (event) => {
++    const data = event.data;
++    if (!data || typeof data !== 'object' || Array.isArray(data)) return;
++
++    // Sandboxed frames have the shared opaque origin "null". Origin alone
++    // cannot identify one: initialization must come from our exact iframe.
++    if (event.origin === 'null' && event.source && event.source === expectedWidgetSource) {
++      if (data.type === 'widget:init' && widgetSource === null) {
++        widgetSource = event.source;
++      } else if (data.type === 'widget:status' && event.source === widgetSource &&
++          typeof data.status === 'string' && data.status.length <= 200) {
++        widget.dispatchEvent(new CustomEvent('widget:status', { detail: data.status }));
++      }
++      return;
++    }
++
++    if (event.origin !== ORDERING_ORIGIN) return;
++    if (data.type === 'order:redirect') {
++      const url = sameSiteURL(data.url);
++      if (url) window.location.assign(url.href);
++    } else if (data.type === 'order:external-link') {
++      const url = allowedLinkURL(data.url);
++      if (url) window.open(url.href, '_blank', 'noopener,noreferrer');
++    }
++  });
++
++  document.body.append(widget);
++  expectedWidgetSource = widget.contentWindow;
++  widget.srcdoc = '<!doctype html><title>Rewards widget</title><script>' +
++    // These public lifecycle messages carry no sensitive data. The parent
++    // authenticates their source, since this sandbox has an opaque origin.
++    'parent.postMessage({type:"widget:init"}, "*");' +
++    'parent.postMessage({type:"widget:status",status:"ready"}, "*");' +
++    '</script>';
++})();
+diff --git a/security.test.cjs b/security.test.cjs
+new file mode 100644
+index 0000000..5f576f0
+--- /dev/null
++++ b/security.test.cjs
+@@ -0,0 +1,145 @@
++const { test } = require('node:test');
++const assert = require('node:assert/strict');
++const { readFileSync } = require('node:fs');
++const vm = require('node:vm');
++
++const script = readFileSync(`${__dirname}/security.js`, 'utf8');
++const orderingOrigin = 'https://orders.dailygrind.com';
++
++function setup() {
++  const handlers = {};
++  const redirects = [];
++  const opened = [];
++  const statuses = [];
++  const widget = {
++    contentWindow: {},
++    setAttribute(name, value) { this[name] = value; },
++    dispatchEvent(event) { statuses.push(event.detail); },
++  };
++  vm.runInNewContext(script, {
++    URL,
++    CustomEvent: class { constructor(type, options) { Object.assign(this, { type }, options); } },
++    window: {
++      location: {
++        href: 'https://dailygrind.com/menu',
++        origin: 'https://dailygrind.com',
++        assign(url) { redirects.push(url); },
++      },
++      open(...args) { opened.push(args); },
++      addEventListener(type, handler) { handlers[type] = handler; },
++    },
++    document: {
++      createElement() { return widget; },
++      body: { append() {} },
++      addEventListener(type, handler) { handlers[type] = handler; },
++    },
++  });
++  return {
++    handlers, redirects, opened, statuses, widget,
++    message(data, origin = orderingOrigin, source = {}) {
++      handlers.message({ data, origin, source });
++    },
++  };
++}
++
++test('ordering messages require the exact trusted origin', () => {
++  const app = setup();
++  for (const origin of ['null', 'https://evil.test', `${orderingOrigin}.evil.test`,
++    'http://orders.dailygrind.com', `${orderingOrigin}:444`]) {
++    app.message({ type: 'order:redirect', url: '/account' }, origin);
++    app.message({ type: 'order:external-link', url: `${orderingOrigin}/checkout` }, origin);
++  }
++  assert.deepEqual(app.redirects, []);
++  assert.deepEqual(app.opened, []);
++  app.message({ type: 'order:redirect', url: '/account' });
++  assert.deepEqual(app.redirects, ['https://dailygrind.com/account']);
++});
++
++test('redirects use parsed origins, schemes, credentials and ports', () => {
++  const app = setup();
++  const rejected = [
++    '//evil.test/path', 'https://dailygrind.com.evil.test/',
++    'https://dailygrind.com@evil.test/', 'https://evil.test@dailygrind.com/',
++    'https://dailygrind.com:444/', 'http://dailygrind.com/',
++    'https://rewards.dailygrind.com/', 'https://evil.test/#dailygrind.com',
++    '\\\\evil.test/path', 'javascript:alert(1)', 'data:text/html,hello',
++    'https://[invalid', '', null, {}, 123,
++  ];
++  for (const url of rejected) app.message({ type: 'order:redirect', url });
++  assert.deepEqual(app.redirects, []);
++  for (const url of ['/account?next=https://evil.test', '../rewards',
++    'https://DAILYGRIND.com:443/menu']) app.message({ type: 'order:redirect', url });
++  assert.deepEqual(app.redirects, [
++    'https://dailygrind.com/account?next=https://evil.test',
++    'https://dailygrind.com/rewards', 'https://dailygrind.com/menu',
++  ]);
++});
++
++test('external actions allow only configured web origins and isolate the opener', () => {
++  const app = setup();
++  for (const url of ['https://evil.test', `${orderingOrigin}.evil.test`,
++    'https://orders.dailygrind.com@evil.test', 'javascript:alert(1)',
++    'https://user@orders.dailygrind.com', `${orderingOrigin}:444`]) {
++    app.message({ type: 'order:external-link', url });
++  }
++  assert.deepEqual(app.opened, []);
++  app.message({ type: 'order:external-link', url: `${orderingOrigin}/checkout` });
++  assert.deepEqual(app.opened, [[`${orderingOrigin}/checkout`, '_blank', 'noopener,noreferrer']]);
++});
++
++test('link activation validates current href for clicks and auxiliary clicks', () => {
++  const app = setup();
++  for (const type of ['click', 'auxclick']) {
++    const rel = [];
++    const link = {
++      getAttribute() { return 'https://dailygrind.com.evil.test'; },
++      relList: { add(...values) { rel.push(...values); } },
++    };
++    let prevented = false;
++    const event = { target: { closest() { return link; } }, preventDefault() { prevented = true; } };
++    app.handlers[type](event);
++    assert.equal(prevented, true);
++    link.getAttribute = () => `${orderingOrigin}/checkout`;
++    prevented = false;
++    app.handlers[type](event);
++    assert.equal(prevented, false);
++    assert.equal(link.href, `${orderingOrigin}/checkout`);
++    assert.deepEqual(rel, ['noopener', 'noreferrer']);
++  }
++});
++
++test('sandbox initialization pins only the intended widget and requires initialization', () => {
++  const app = setup();
++  const intended = app.widget.contentWindow;
++  const attacker = {};
++  assert.equal(app.widget.sandbox, 'allow-scripts');
++  app.message({ type: 'widget:init' }, 'null', attacker);
++  app.message({ type: 'widget:status', status: 'too early' }, 'null', intended);
++  app.message({ type: 'widget:init' }, orderingOrigin, intended);
++  app.message({ type: 'widget:status', status: 'wrong origin init' }, 'null', intended);
++  assert.deepEqual(app.statuses, []);
++  app.message({ type: 'widget:init' }, 'null', intended);
++  app.message({ type: 'widget:init' }, 'null', attacker);
++  app.message({ type: 'widget:status', status: 'attacker' }, 'null', attacker);
++  app.message({ type: 'widget:status', status: 'missing sender' }, 'null', null);
++  app.message({ type: 'widget:status', status: 'wrong origin' }, orderingOrigin, intended);
++  app.message({ type: 'widget:status', status: 'ready' }, 'null', intended);
++  app.message({ type: 'widget:status', status: 'still ready' }, 'null', intended);
++  app.message({ type: 'widget:status', status: '<img src=x onerror=alert(1)>' }, 'null', intended);
++  assert.deepEqual(app.statuses, ['ready', 'still ready', '<img src=x onerror=alert(1)>']);
++});
++
++test('malformed payloads are ignored without actions or exceptions', () => {
++  const app = setup();
++  for (const data of [null, undefined, 1, 'order:redirect', [], {},
++    { type: 'unknown' }, { type: 'order:redirect' }, { type: 'order:external-link', url: {} }]) {
++    app.message(data);
++  }
++  app.message({ type: 'widget:init' }, 'null', app.widget.contentWindow);
++  for (const status of [null, {}, 7, 'a'.repeat(201)]) {
++    app.message({ type: 'widget:status', status }, 'null', app.widget.contentWindow);
++  }
++  assert.deepEqual(app.redirects, []);
++  assert.deepEqual(app.opened, []);
++  assert.deepEqual(app.statuses, []);
++});

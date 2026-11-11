@@ -1,0 +1,350 @@
+diff --git a/index.html b/index.html
+index 66c9173..3635680 100644
+--- a/index.html
++++ b/index.html
+@@ -153,11 +153,12 @@
+       font-size: 0.85rem;
+     }
+   </style>
++  <script src="/perf-monitor.js" defer></script>
+ </head>
+ 
+ <body>
+ 
+-  <nav>
++  <nav data-perf-region="navbar">
+     <div class="logo">THE DAILY GRIND</div>
+     <ul>
+       <li><a href="/menu">Menu</a></li>
+@@ -171,24 +172,24 @@
+   <header class="hero">
+     <h1>Wake Up Your Senses</h1>
+     <p>Ethically sourced, locally roasted, delivered to your cup.</p>
+-    <a href="/order-online" class="btn">Order Now</a>
++    <a href="/order-online" class="btn" data-perf-region="order-now">Order Now</a>
+   </header>
+ 
+   <main class="container">
+-    <section>
++    <section data-perf-region="seasonal-favorites">
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+       <div class="grid">
+-        <div class="card">
++        <div class="card" data-perf-label="Maple Oat Latte">
+           <h3>Maple Oat Latte</h3>
+           <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+           <a href="/menu/seasonal" class="btn">View Details</a>
+         </div>
+-        <div class="card">
++        <div class="card" data-perf-label="Dark Roast Espresso">
+           <h3>Dark Roast Espresso</h3>
+           <p>Bold, smokey, and perfect for a morning boost.</p>
+           <a href="/menu/espresso" class="btn">View Details</a>
+         </div>
+-        <div class="card">
++        <div class="card" data-perf-label="Cold Brew">
+           <h3>Cold Brew</h3>
+           <p>Steeped for 18 hours for maximum smoothness.</p>
+           <a href="/menu/cold-brew" class="btn">View Details</a>
+diff --git a/perf-monitor.js b/perf-monitor.js
+new file mode 100644
+index 0000000..4ea3664
+--- /dev/null
++++ b/perf-monitor.js
+@@ -0,0 +1,296 @@
++/**
++ * Daily Grind — client-side interaction paint monitoring.
++ *
++ * Measures how long it takes from a user interaction to the moment the
++ * resulting visual update is painted on screen, for:
++ *   - clicks in the navigation bar          (data-perf-region="navbar")
++ *   - the hero "Order Now" button           (data-perf-region="order-now")
++ *   - "Seasonal Favorites" cards            (data-perf-region="seasonal-favorites")
++ *   - client-side view switches (SPA soft navigations, from any trigger)
++ *
++ * APIs used (progressive enhancement — all feature-detected):
++ *   - 'interaction-contentful-paint' : interaction start -> contentful paint
++ *     presented on screen, including paints after async work (fetch, await…).
++ *   - 'soft-navigation'              : client-side route changes caused by an
++ *     interaction (URL change + contentful paint), with per-view FCP/LCP.
++ *   - 'event' (Event Timing)         : interaction -> next frame. Used to map
++ *     interactionId -> target element, and as the fallback metric in browsers
++ *     without interaction-contentful-paint (Firefox, Safari).
++ *
++ * Results are queued and flushed with navigator.sendBeacon() when the page is
++ * hidden (covers unloads caused by full-page navigations from these links).
++ * They are also exposed on window.__dailyGrindPerf and dispatched as a
++ * 'dailygrind:perf' CustomEvent for debugging / other integrations.
++ */
++(() => {
++  'use strict';
++
++  const ENDPOINT = '/api/rum';
++  const DEBUG = /[?&]perfdebug\b/.test(location.search);
++
++  const supported = (type) =>
++    typeof PerformanceObserver !== 'undefined' &&
++    !!PerformanceObserver.supportedEntryTypes?.includes(type);
++
++  const HAS_ICP = supported('interaction-contentful-paint');
++  const HAS_SOFT_NAV = supported('soft-navigation');
++  const HAS_EVENT_TIMING = supported('event');
++
++  if (!HAS_ICP && !HAS_SOFT_NAV && !HAS_EVENT_TIMING) return;
++
++  // ---------------------------------------------------------------------------
++  // Attribution: which tracked UI element did an interaction come from?
++  // ---------------------------------------------------------------------------
++
++  /** @returns {{region: string, label: string} | null} */
++  function describeTarget(node) {
++    const el = node instanceof Element ? node : node?.parentElement;
++    if (!el) return null;
++    const regionEl = el.closest('[data-perf-region]');
++    if (!regionEl) return null;
++    const region = regionEl.dataset.perfRegion;
++    const labelEl = el.closest('[data-perf-label]');
++    const clickable = el.closest('a, button');
++    const label =
++      labelEl?.dataset.perfLabel ||
++      clickable?.textContent.trim() ||
++      region;
++    return { region, label, href: clickable?.getAttribute('href') ?? null };
++  }
++
++  /** interactionId -> attribution */
++  const byInteractionId = new Map();
++
++  // Fallback attribution for interactions that Event Timing does not report
++  // (entries under the 16ms durationThreshold). Keyed by event timeStamp, which
++  // equals the interaction's startTime in performance entries.
++  /** @type {{time: number, target: ReturnType<typeof describeTarget>}[]} */
++  const recentInputs = [];
++  const remember = (event) => {
++    const target = describeTarget(event.target);
++    if (!target) return;
++    recentInputs.push({ time: event.timeStamp, target });
++    if (recentInputs.length > 20) recentInputs.shift();
++  };
++  for (const type of ['pointerdown', 'keydown', 'click']) {
++    document.addEventListener(type, remember, { capture: true, passive: true });
++  }
++
++  function attributionFor(interactionId, startTime) {
++    if (byInteractionId.has(interactionId)) return byInteractionId.get(interactionId);
++    // Find the input event that started this interaction (within one 8ms tick
++    // of rounding tolerance), preferring the earliest (pointerdown before click).
++    const match = recentInputs.find((i) => Math.abs(i.time - startTime) <= 8);
++    return match ? match.target : null;
++  }
++
++  // ---------------------------------------------------------------------------
++  // Reporting
++  // ---------------------------------------------------------------------------
++
++  const queue = [];
++  const store = (window.__dailyGrindPerf = window.__dailyGrindPerf || []);
++
++  function report(metric) {
++    const record = { ...metric, page: location.pathname, ts: Date.now() };
++    queue.push(record);
++    store.push(record);
++    document.dispatchEvent(new CustomEvent('dailygrind:perf', { detail: record }));
++    if (DEBUG) console.debug('[perf]', record);
++  }
++
++  function flush() {
++    if (!queue.length) return;
++    const body = JSON.stringify(queue.splice(0));
++    if (!(navigator.sendBeacon && navigator.sendBeacon(ENDPOINT, body))) {
++      fetch(ENDPOINT, { method: 'POST', body, keepalive: true }).catch(() => {});
++    }
++  }
++
++  document.addEventListener('visibilitychange', () => {
++    if (document.visibilityState === 'hidden') {
++      finalizeAll();
++      flush();
++    }
++  });
++  // pagehide covers bfcache-eligible unloads where visibilitychange may race.
++  addEventListener('pagehide', () => {
++    finalizeAll();
++    flush();
++  });
++
++  // ---------------------------------------------------------------------------
++  // 1. Event Timing: target attribution + next-frame latency fallback
++  // ---------------------------------------------------------------------------
++
++  /** interactionId -> longest event-timing entry for that interaction */
++  const eventTimingByInteraction = new Map();
++
++  if (HAS_EVENT_TIMING) {
++    new PerformanceObserver((list) => {
++      for (const entry of list.getEntries()) {
++        if (!entry.interactionId) continue;
++        const target = describeTarget(entry.target);
++        if (target && !byInteractionId.has(entry.interactionId)) {
++          byInteractionId.set(entry.interactionId, target);
++        }
++        const prev = eventTimingByInteraction.get(entry.interactionId);
++        if (!prev || entry.duration > prev.duration) {
++          eventTimingByInteraction.set(entry.interactionId, entry);
++        }
++      }
++    }).observe({ type: 'event', buffered: true, durationThreshold: 16 });
++  }
++
++  // ---------------------------------------------------------------------------
++  // 2. Interaction contentful paint: interaction -> visual update painted
++  // ---------------------------------------------------------------------------
++
++  /**
++   * Pending per-interaction results. ICP entries are emitted progressively
++   * (each one a larger paint), so keep the latest and finalize later.
++   * interactionId -> { first: entry, last: entry }
++   */
++  const pendingPaints = new Map();
++  const FINALIZE_AFTER_MS = 5000;
++
++  function finalizeInteraction(interactionId) {
++    const pending = pendingPaints.get(interactionId);
++    if (!pending) return;
++    pendingPaints.delete(interactionId);
++    clearTimeout(pending.timer);
++    const { first, last } = pending;
++    const target = attributionFor(interactionId, first.startTime);
++    if (!target) return; // Not one of the tracked UI elements.
++    const nextFrame = eventTimingByInteraction.get(interactionId);
++    report({
++      type: 'interaction-paint',
++      region: target.region,
++      label: target.label,
++      href: target.href,
++      interactionId,
++      // Interaction start -> first contentful update presented on screen.
++      firstPaintDuration: Math.round(first.duration),
++      // Interaction start -> largest contentful update presented on screen.
++      largestPaintDuration: Math.round(last.duration),
++      largestPaintElement: describeElement(last.largestContentfulPaint?.element),
++      largestPaintSize: last.largestContentfulPaint?.size ?? null,
++      // Interaction start -> very next frame (INP-style), when reported.
++      nextFrameDuration: nextFrame ? Math.round(nextFrame.duration) : null,
++    });
++  }
++
++  function finalizeAll() {
++    for (const id of [...pendingPaints.keys()]) finalizeInteraction(id);
++    finalizeSoftNav();
++    flushEventTimingFallback();
++  }
++
++  function describeElement(el) {
++    if (!el) return null;
++    let s = el.tagName.toLowerCase();
++    if (el.id) s += `#${el.id}`;
++    if (el.classList?.length) s += `.${[...el.classList].join('.')}`;
++    return s;
++  }
++
++  if (HAS_ICP) {
++    new PerformanceObserver((list) => {
++      for (const entry of list.getEntries()) {
++        const id = entry.interactionId;
++        const pending = pendingPaints.get(id);
++        if (pending) {
++          pending.last = entry;
++          clearTimeout(pending.timer);
++          pending.timer = setTimeout(() => finalizeInteraction(id), FINALIZE_AFTER_MS);
++        } else {
++          pendingPaints.set(id, {
++            first: entry,
++            last: entry,
++            timer: setTimeout(() => finalizeInteraction(id), FINALIZE_AFTER_MS),
++          });
++        }
++        // A new interaction supersedes older ones: finalize anything earlier.
++        for (const [otherId, other] of pendingPaints) {
++          if (otherId !== id && other.first.startTime < entry.startTime) {
++            finalizeInteraction(otherId);
++          }
++        }
++      }
++    }).observe({ type: 'interaction-contentful-paint', buffered: true });
++  }
++
++  // Fallback for browsers without ICP: report Event Timing next-frame latency
++  // for tracked elements (does not include later async paints).
++  const reportedFallback = new Set();
++  function flushEventTimingFallback() {
++    if (HAS_ICP) return;
++    for (const [id, entry] of eventTimingByInteraction) {
++      if (reportedFallback.has(id)) continue;
++      reportedFallback.add(id);
++      const target = attributionFor(id, entry.startTime);
++      if (!target) continue;
++      report({
++        type: 'interaction-next-frame',
++        region: target.region,
++        label: target.label,
++        href: target.href,
++        interactionId: id,
++        nextFrameDuration: Math.round(entry.duration),
++      });
++    }
++  }
++  if (!HAS_ICP && HAS_EVENT_TIMING) setInterval(flushEventTimingFallback, FINALIZE_AFTER_MS);
++
++  // ---------------------------------------------------------------------------
++  // 3. Soft navigations: client-side view switches -> FCP / LCP of new view
++  // ---------------------------------------------------------------------------
++
++  let activeSoftNav = null;
++  let activeSoftNavLcp = null;
++
++  function finalizeSoftNav() {
++    if (!activeSoftNav) return;
++    const nav = activeSoftNav;
++    const lcp = activeSoftNavLcp;
++    activeSoftNav = activeSoftNavLcp = null;
++    const target = attributionFor(nav.interactionId, nav.startTime);
++    report({
++      type: 'soft-navigation',
++      url: nav.name,
++      navigationId: nav.navigationId,
++      interactionId: nav.interactionId,
++      region: target?.region ?? null,
++      label: target?.label ?? null,
++      // Interaction start -> first contentful paint of the new view.
++      fcpDuration: Math.round(nav.duration),
++      // Interaction start -> largest contentful paint of the new view.
++      lcpDuration: lcp ? Math.round(lcp.duration) : null,
++      lcpElement: describeElement(lcp?.largestContentfulPaint?.element),
++      lcpSize: lcp?.largestContentfulPaint?.size ?? null,
++    });
++  }
++
++  if (HAS_SOFT_NAV) {
++    new PerformanceObserver((list) => {
++      for (const entry of list.getEntries()) {
++        finalizeSoftNav();
++        activeSoftNav = entry;
++        // Seed with paints that happened before the URL was updated.
++        activeSoftNavLcp = entry.getLargestInteractionContentfulPaint?.() ?? null;
++      }
++    }).observe({ type: 'soft-navigation', buffered: true });
++
++    if (HAS_ICP) {
++      new PerformanceObserver((list) => {
++        for (const entry of list.getEntries()) {
++          // Match by interactionId, not navigationId, so pre-URL-change paints
++          // are included and later unrelated interactions are excluded.
++          if (activeSoftNav && entry.interactionId === activeSoftNav.interactionId) {
++            activeSoftNavLcp = entry;
++          }
++        }
++      }).observe({ type: 'interaction-contentful-paint', buffered: true });
++    }
++  }
++})();

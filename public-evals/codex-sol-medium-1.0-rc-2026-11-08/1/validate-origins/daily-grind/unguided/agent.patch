@@ -1,0 +1,229 @@
+diff --git a/index.html b/index.html
+index 66c9173..8340844 100644
+--- a/index.html
++++ b/index.html
+@@ -195,6 +195,8 @@
+         </div>
+       </div>
+     </section>
++    <iframe id="order-widget" title="Order updates" sandbox="allow-scripts"
++      style="width: 100%; height: 80px; border: 0; margin-top: 20px;"></iframe>
+   </main>
+ 
+   <footer>
+@@ -207,6 +209,7 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script type="module" src="/page-security.mjs"></script>
+ </body>
+ 
+ </html>
+diff --git a/package.json b/package.json
+index 2bd4d77..d1fe2ea 100644
+--- a/package.json
++++ b/package.json
+@@ -2,6 +2,7 @@
+   "name": "daily-grind",
+   "version": "1.0.0",
+   "scripts": {
++    "test": "node --test",
+     "start": "pnpm dlx statikk --port ${PORT:-11222}"
+   },
+   "pnpm": {
+diff --git a/page-security.mjs b/page-security.mjs
+new file mode 100644
+index 0000000..88731fa
+--- /dev/null
++++ b/page-security.mjs
+@@ -0,0 +1,95 @@
++// Deployment configuration: only this ordering service may request redirects.
++export const ORDERING_ORIGIN = 'https://orders.thedailygrind.com';
++
++export function parseWebURL(value, base) {
++  if (typeof value !== 'string' || !value.trim()) return null;
++  try {
++    const url = new URL(value, base);
++    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) {
++      return null;
++    }
++    return url;
++  } catch {
++    return null;
++  }
++}
++
++export function sameSiteRedirect(value, base) {
++  const url = parseWebURL(value, base);
++  // Restrict redirects to the exact origin; sibling subdomains are not trusted.
++  return url && url.origin === new URL(base).origin ? url.href : null;
++}
++
++export function createMessageHandler({ widget, baseURL, navigate, resize }) {
++  let widgetSender = null;
++
++  return (event) => {
++    const data = event.data;
++    if (!data || typeof data !== 'object' || Array.isArray(data)) return;
++
++    if (event.origin === ORDERING_ORIGIN && event.source) {
++      if (data.type === 'order-complete') {
++        const redirect = sameSiteRedirect(data.redirectUrl, baseURL);
++        if (redirect) navigate(redirect);
++      }
++      return;
++    }
++
++    // Sandboxed documents have the shared opaque origin "null". Authenticate
++    // the actual WindowProxy before accepting initialization, then pin it.
++    if (event.origin !== 'null' || !event.source) return;
++    if (data.type === 'widget-ready') {
++      if (!widgetSender && event.source === widget.contentWindow) {
++        widgetSender = event.source;
++      }
++      return;
++    }
++    if (event.source !== widgetSender) return;
++    if (data.type === 'widget-resize' && Number.isInteger(data.height)
++        && data.height >= 40 && data.height <= 600) {
++      resize(data.height);
++    }
++  };
++}
++
++export function validateLink(link, baseURL) {
++  const url = parseWebURL(link.getAttribute('href'), baseURL);
++  if (!url) return false;
++  if (url.origin !== new URL(baseURL).origin || link.target === '_blank') {
++    link.relList.add('noopener', 'noreferrer');
++    // An external URL must not navigate a parent or another named window.
++    if (url.origin !== new URL(baseURL).origin) link.target = '_blank';
++  }
++  return true;
++}
++
++if (typeof document !== 'undefined') {
++  const widget = document.getElementById('order-widget');
++  window.addEventListener('message', createMessageHandler({
++    widget,
++    baseURL: window.location.href,
++    navigate: (url) => window.location.assign(url),
++    resize: (height) => { widget.style.height = `${height}px`; },
++  }));
++
++  // Install the listener before loading the opaque-origin widget.
++  widget.srcdoc = `<!doctype html><html lang="en"><meta charset="utf-8">
++    <p style="font: 16px system-ui; color: #3e2723; text-align: center">Order online for your next coffee break.</p>
++    <script>
++      parent.postMessage({ type: 'widget-ready' }, '*');
++      parent.postMessage({ type: 'widget-resize', height: 80 }, '*');
++    <\/script></html>`;
++
++  for (const link of document.querySelectorAll('a[href]')) {
++    if (!validateLink(link, window.location.href)) link.removeAttribute('href');
++  }
++  // Also validate links added or changed after page initialization.
++  document.addEventListener('click', (event) => {
++    const link = event.target.closest?.('a[href]');
++    if (link && !validateLink(link, window.location.href)) event.preventDefault();
++  }, true);
++  document.addEventListener('auxclick', (event) => {
++    const link = event.target.closest?.('a[href]');
++    if (link && !validateLink(link, window.location.href)) event.preventDefault();
++  }, true);
++}
+diff --git a/page-security.test.mjs b/page-security.test.mjs
+new file mode 100644
+index 0000000..dd51cbd
+--- /dev/null
++++ b/page-security.test.mjs
+@@ -0,0 +1,89 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import {
++  ORDERING_ORIGIN, createMessageHandler, parseWebURL, sameSiteRedirect, validateLink,
++} from './page-security.mjs';
++
++const baseURL = 'https://thedailygrind.com/order-online';
++
++test('redirects use parsed exact origins and reject URL confusion', () => {
++  assert.equal(sameSiteRedirect('/orders/123?paid=true', baseURL),
++    'https://thedailygrind.com/orders/123?paid=true');
++  assert.equal(sameSiteRedirect('https://THEDAILYGRIND.com:443/thanks', baseURL),
++    'https://thedailygrind.com/thanks');
++  for (const value of [
++    '//evil.example/thanks', 'https://thedailygrind.com.evil.example/',
++    'https://thedailygrind.com@evil.example/', 'https://evil.example/?thedailygrind.com',
++    'https://thedailygrind.com:444/', 'http://thedailygrind.com/',
++    'https://orders.thedailygrind.com/', 'https://thedailygrind.com\\@evil.example',
++    'javascript:alert(1)', 'data:text/html,test', 'https://%', '', null, {},
++  ]) {
++    // A backslash before @ becomes a path separator, so the parsed host is safe.
++    if (value === 'https://thedailygrind.com\\@evil.example') {
++      assert.equal(sameSiteRedirect(value, baseURL), 'https://thedailygrind.com/@evil.example');
++    } else {
++      assert.equal(sameSiteRedirect(value, baseURL), null, String(value));
++    }
++  }
++});
++
++test('ordering messages require the exact trusted origin and a valid redirect', () => {
++  const navigations = [];
++  const handler = createMessageHandler({
++    widget: { contentWindow: {} }, baseURL,
++    navigate: (url) => navigations.push(url), resize: () => {},
++  });
++  const source = {};
++  for (const origin of ['null', 'https://evil.example', `${ORDERING_ORIGIN}.evil.example`]) {
++    handler({ origin, source, data: { type: 'order-complete', redirectUrl: '/thanks' } });
++  }
++  handler({ origin: ORDERING_ORIGIN, source: null, data: { type: 'order-complete', redirectUrl: '/thanks' } });
++  handler({ origin: ORDERING_ORIGIN, source, data: null });
++  handler({ origin: ORDERING_ORIGIN, source, data: { type: 'order-complete', redirectUrl: '//evil.example' } });
++  assert.deepEqual(navigations, []);
++  handler({ origin: ORDERING_ORIGIN, source, data: { type: 'order-complete', redirectUrl: '/thanks' } });
++  assert.deepEqual(navigations, ['https://thedailygrind.com/thanks']);
++});
++
++test('opaque widget initialization authenticates and pins the original sender', () => {
++  const original = {};
++  const attacker = {};
++  const widget = { contentWindow: original };
++  const heights = [];
++  const handler = createMessageHandler({
++    widget, baseURL, navigate: () => assert.fail('widget cannot navigate'),
++    resize: (height) => heights.push(height),
++  });
++  const send = (source, type, height = 100, origin = 'null') =>
++    handler({ source, origin, data: { type, height } });
++  send(original, 'widget-resize');
++  send(attacker, 'widget-ready');
++  send(attacker, 'widget-resize');
++  send(original, 'widget-ready', 100, 'https://evil.example');
++  send(original, 'widget-resize');
++  assert.deepEqual(heights, []);
++  send(original, 'widget-ready');
++  send(original, 'widget-resize', 120);
++  widget.contentWindow = attacker;
++  send(attacker, 'widget-ready');
++  send(attacker, 'widget-resize');
++  send(original, 'widget-resize', 160);
++  for (const height of [-1, 601, NaN, Infinity, '100', 45.5]) {
++    send(original, 'widget-resize', height);
++  }
++  assert.deepEqual(heights, [120, 160]);
++});
++
++test('external links reject unsafe schemes and credentials and isolate new windows', () => {
++  for (const value of ['javascript:alert(1)', 'data:text/html,test', 'https://user:pass@example.com', 'https://%']) {
++    assert.equal(parseWebURL(value, baseURL), null);
++  }
++  const rel = new Set();
++  const link = {
++    getAttribute: () => 'https://thedailygrind.com.evil.example/path',
++    target: '_top', relList: { add: (...tokens) => tokens.forEach((token) => rel.add(token)) },
++  };
++  assert.equal(validateLink(link, baseURL), true);
++  assert.equal(link.target, '_blank');
++  assert.deepEqual([...rel], ['noopener', 'noreferrer']);
++});

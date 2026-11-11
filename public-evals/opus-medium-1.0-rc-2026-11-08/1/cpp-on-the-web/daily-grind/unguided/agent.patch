@@ -1,0 +1,1385 @@
+diff --git a/build.sh b/build.sh
+new file mode 100755
+index 0000000..3e2869b
+--- /dev/null
++++ b/build.sh
+@@ -0,0 +1,15 @@
++#!/bin/sh
++# Builds smallpt.wasm from wasm/smallpt.cpp with emscripten. If emcc is not
++# installed, falls back to assembling the equivalent hand-written
++# wasm/smallpt.wat (verified pixel-identical by tools/check.mjs).
++set -e
++cd "$(dirname "$0")"
++if command -v emcc >/dev/null 2>&1; then
++  emcc -O3 wasm/smallpt.cpp -o smallpt.wasm \
++    --no-entry -sSTANDALONE_WASM -sINITIAL_MEMORY=16MB \
++    -sEXPORTED_FUNCTIONS=_init,_set_color,_get_passes,_render_pass,_get_rgba
++  echo "Built smallpt.wasm with emcc"
++else
++  echo "emcc not found; assembling wasm/smallpt.wat instead" >&2
++  node tools/wat2wasm.mjs wasm/smallpt.wat smallpt.wasm
++fi
+diff --git a/index.html b/index.html
+index 66c9173..ff9225a 100644
+--- a/index.html
++++ b/index.html
+@@ -135,6 +135,72 @@
+       background: #3e2723;
+     }
+ 
++    /* Path tracer */
++    .render-section {
++      margin-top: 60px;
++      text-align: center;
++    }
++
++    .render-section > p {
++      max-width: 640px;
++      margin: 10px auto 0;
++    }
++
++    .render-frame {
++      display: inline-block;
++      margin-top: 20px;
++      background: white;
++      padding: 12px;
++      border-radius: 8px;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++      max-width: 100%;
++    }
++
++    #smallpt-canvas {
++      display: block;
++      width: 640px;
++      max-width: 100%;
++      aspect-ratio: 4 / 3;
++      background: #222;
++      border-radius: 4px;
++    }
++
++    .render-status {
++      margin-top: 10px;
++      font-size: 0.85rem;
++      color: #6d4c41;
++      font-variant-numeric: tabular-nums;
++    }
++
++    .swatches {
++      display: flex;
++      flex-wrap: wrap;
++      justify-content: center;
++      gap: 6px 16px;
++      margin-top: 8px;
++      font-size: 0.8rem;
++      list-style: none;
++    }
++
++    .swatches li {
++      display: flex;
++      align-items: center;
++      gap: 6px;
++    }
++
++    .swatches span {
++      width: 14px;
++      height: 14px;
++      border-radius: 50%;
++      border: 1px solid rgba(0, 0, 0, 0.2);
++    }
++
++    button.btn {
++      border: none;
++      font: inherit;
++      cursor: pointer;
++    }
++
+     footer {
+       background: var(--secondary);
+       text-align: center;
+@@ -195,6 +261,21 @@
+         </div>
+       </div>
+     </section>
++
++    <section class="render-section" aria-labelledby="render-heading">
++      <h2 id="render-heading">Freshly Rendered</h2>
++      <p>While your coffee brews, your browser is path tracing this scene in real time using
++        <a href="http://www.kevinbeason.com/smallpt/">smallpt</a>, Kevin Beason's 99-line C++ path tracer,
++        compiled to WebAssembly. The image sharpens as more light samples are added.</p>
++      <div class="render-frame">
++        <canvas id="smallpt-canvas" width="320" height="240" aria-label="Path-traced image of two spheres in a room"></canvas>
++        <div class="render-status" id="smallpt-status" role="status">Loading WebAssembly&hellip;</div>
++        <ul class="swatches" id="smallpt-swatches"></ul>
++      </div>
++      <div>
++        <button type="button" class="btn" id="smallpt-rerun">Re-render with random colors</button>
++      </div>
++    </section>
+   </main>
+ 
+   <footer>
+@@ -207,6 +288,77 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script>
++    (() => {
++      const WIDTH = 320, HEIGHT = 240, PASSES = 64; // 4 samples per pixel per pass
++      // Sphere indices in smallpt's scene that get recolored, with their original colors.
++      const SPHERES = [
++        { index: 0, label: 'Left wall', color: [0.75, 0.25, 0.25], value: 0.75 },
++        { index: 1, label: 'Right wall', color: [0.25, 0.25, 0.75], value: 0.75 },
++        { index: 6, label: 'Mirror sphere', color: [0.999, 0.999, 0.999], value: 0.999 },
++        { index: 7, label: 'Glass sphere', color: [0.999, 0.999, 0.999], value: 0.999 },
++      ];
++
++      const canvas = document.getElementById('smallpt-canvas');
++      const ctx = canvas.getContext('2d');
++      const status = document.getElementById('smallpt-status');
++      const swatches = document.getElementById('smallpt-swatches');
++      const button = document.getElementById('smallpt-rerun');
++      const worker = new Worker('smallpt-worker.js');
++      let jobId = 0;
++
++      const hsvToRgb = (h, s, v) => {
++        const f = (n) => {
++          const k = (n + h * 6) % 6;
++          return v - v * s * Math.max(0, Math.min(k, 4 - k, 1));
++        };
++        return [f(5), f(3), f(1)];
++      };
++
++      const toCss = ([r, g, b]) => `rgb(${[r, g, b].map((c) => Math.round(c * 255)).join(',')})`;
++
++      function render(randomize) {
++        const colors = SPHERES.map((s) => {
++          const rgb = randomize ? hsvToRgb(Math.random(), 0.35 + Math.random() * 0.5, s.value) : s.color;
++          return { ...s, rgb };
++        });
++        swatches.replaceChildren(...colors.map(({ label, rgb }) => {
++          const li = document.createElement('li');
++          const chip = document.createElement('span');
++          chip.style.background = toCss(rgb);
++          li.append(chip, label);
++          return li;
++        }));
++        status.textContent = 'Rendering\u2026';
++        worker.postMessage({
++          id: ++jobId,
++          width: WIDTH,
++          height: HEIGHT,
++          passes: PASSES,
++          colors: colors.map(({ index, rgb }) => [index, ...rgb]),
++        });
++      }
++
++      worker.onmessage = ({ data }) => {
++        if (data.id !== jobId) return; // stale frame from a previous render
++        if (data.type === 'frame') {
++          ctx.putImageData(new ImageData(data.pixels, data.width, data.height), 0, 0);
++          status.textContent = `${data.passes * 4} samples/pixel \u00b7 ${(data.ms / 1000).toFixed(1)} s`;
++        } else if (data.type === 'done') {
++          status.textContent += ' \u00b7 done';
++        } else if (data.type === 'error') {
++          status.textContent = `Could not run the renderer: ${data.message}`;
++        }
++      };
++      worker.onerror = (e) => {
++        status.textContent = `Could not run the renderer: ${e.message || 'worker failed to load'}`;
++      };
++
++      button.addEventListener('click', () => render(true));
++      render(false);
++    })();
++  </script>
++
+ </body>
+ 
+ </html>
+diff --git a/package.json b/package.json
+index 2bd4d77..5ff2a82 100644
+--- a/package.json
++++ b/package.json
+@@ -2,6 +2,8 @@
+   "name": "daily-grind",
+   "version": "1.0.0",
+   "scripts": {
++    "build": "sh build.sh",
++    "check": "node tools/check.mjs",
+     "start": "pnpm dlx statikk --port ${PORT:-11222}"
+   },
+   "pnpm": {
+diff --git a/smallpt-worker.js b/smallpt-worker.js
+new file mode 100644
+index 0000000..80adfb6
+--- /dev/null
++++ b/smallpt-worker.js
+@@ -0,0 +1,62 @@
++// Runs smallpt.wasm off the main thread and streams progressively refined frames.
++//
++// Message in:  { id, width, height, passes, colors: [[sphereIndex, r, g, b], ...] }
++// Messages out: { id, type: 'frame', pixels, width, height, passes, ms }
++//               { id, type: 'done' } | { id, type: 'error', message }
++
++const wasm = (async () => {
++  const response = await fetch(new URL('smallpt.wasm', self.location.href));
++  if (!response.ok) throw new Error(`Failed to load smallpt.wasm (${response.status})`);
++  const module = await WebAssembly.compile(await response.arrayBuffer());
++
++  // The module needs cos/sin/pow from the host (the emcc build links its own
++  // libm instead). Anything else an emcc build imports (e.g. WASI) is stubbed.
++  const math = { cos: Math.cos, sin: Math.sin, pow: Math.pow };
++  const imports = {};
++  for (const { module: mod, name, kind } of WebAssembly.Module.imports(module)) {
++    if (kind !== 'function') continue;
++    imports[mod] ??= {};
++    imports[mod][name] = (mod === 'env' && math[name]) || (() => 0);
++  }
++  const instance = await WebAssembly.instantiate(module, imports);
++  instance.exports._initialize?.(); // emcc reactor builds run static constructors here
++  return instance.exports;
++})();
++
++let current = 0;
++
++self.onmessage = async ({ data: job }) => {
++  current = job.id;
++  let smallpt;
++  try {
++    smallpt = await wasm;
++  } catch (err) {
++    self.postMessage({ id: job.id, type: 'error', message: err.message });
++    return;
++  }
++  if (job.id !== current) return;
++
++  smallpt.init(job.width, job.height);
++  for (const [i, r, g, b] of job.colors) smallpt.set_color(i, r, g, b);
++
++  const start = performance.now();
++  for (let pass = 0; pass < job.passes; pass++) {
++    smallpt.render_pass((Math.random() * 0xffffffff) >>> 0);
++    const ptr = smallpt.get_rgba();
++    const pixels = new Uint8ClampedArray(smallpt.memory.buffer, ptr, job.width * job.height * 4).slice();
++    self.postMessage({
++      id: job.id,
++      type: 'frame',
++      pixels,
++      width: job.width,
++      height: job.height,
++      passes: smallpt.get_passes(),
++      ms: performance.now() - start,
++    }, [pixels.buffer]);
++
++    // Yield so a newer job can preempt this one between passes.
++    await new Promise((resolve) => setTimeout(resolve, 0));
++    if (job.id !== current) return;
++  }
++  self.postMessage({ id: job.id, type: 'done' });
++};
+diff --git a/smallpt.wasm b/smallpt.wasm
+new file mode 100644
+index 0000000..691f259
+Binary files /dev/null and b/smallpt.wasm differ
+diff --git a/tools/check.mjs b/tools/check.mjs
+new file mode 100644
+index 0000000..9d4b91a
+--- /dev/null
++++ b/tools/check.mjs
+@@ -0,0 +1,56 @@
++#!/usr/bin/env node
++// Cross-checks smallpt.wasm against a native (g++) build of wasm/smallpt.cpp:
++// renders the same scene with the same seeds and colors and compares pixels.
++//
++// Usage: node tools/check.mjs [width height passes]
++import { execFileSync } from 'node:child_process';
++import { readFileSync, writeFileSync, mkdtempSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join, dirname } from 'node:path';
++import { fileURLToPath } from 'node:url';
++
++const root = join(dirname(fileURLToPath(import.meta.url)), '..');
++const [w, h, passes] = (process.argv.length > 4 ? process.argv.slice(2, 5) : [80, 60, 3]).map(Number);
++const colors = [[6, 0.9, 0.3, 0.1], [7, 0.2, 0.8, 0.95], [0, 0.1, 0.6, 0.3]];
++const seed = (p) => (p + 1) * 2654435761 >>> 0;
++
++// Native build
++const dir = mkdtempSync(join(tmpdir(), 'smallpt-'));
++writeFileSync(join(dir, 'main.cpp'), `
++#include <stdio.h>
++#include "${join(root, 'wasm/smallpt.cpp')}"
++int main() {
++  init(${w}, ${h});
++  ${colors.map(([i, r, g, b]) => `set_color(${i}, ${r}, ${g}, ${b});`).join('\n  ')}
++  for (int p = 0; p < ${passes}; p++) render_pass((unsigned)((p + 1) * 2654435761u));
++  fwrite(get_rgba(), 1, ${w * h * 4}, stdout);
++}
++`);
++execFileSync('g++', ['-O2', '-ffp-contract=off', '-o', join(dir, 'smallpt'), join(dir, 'main.cpp')]);
++const native = execFileSync(join(dir, 'smallpt'), { maxBuffer: 1 << 26 });
++
++// Wasm build
++const { instance } = await WebAssembly.instantiate(readFileSync(join(root, 'smallpt.wasm')), {
++  env: { cos: Math.cos, sin: Math.sin, pow: Math.pow },
++});
++const ex = instance.exports;
++ex.init(w, h);
++for (const [i, r, g, b] of colors) ex.set_color(i, r, g, b);
++const t0 = performance.now();
++for (let p = 0; p < passes; p++) ex.render_pass(seed(p));
++const ms = performance.now() - t0;
++const wasm = new Uint8Array(ex.memory.buffer, ex.get_rgba(), w * h * 4);
++
++let diffPixels = 0, maxDiff = 0, sum = 0;
++for (let i = 0; i < w * h; i++) {
++  let d = 0;
++  for (let c = 0; c < 3; c++) d = Math.max(d, Math.abs(native[i * 4 + c] - wasm[i * 4 + c]));
++  if (d) diffPixels++;
++  maxDiff = Math.max(maxDiff, d);
++  sum += wasm[i * 4] + wasm[i * 4 + 1] + wasm[i * 4 + 2];
++}
++console.log(`${w}x${h}, ${passes} passes: wasm render ${ms.toFixed(0)} ms, mean value ${(sum / (w * h * 3)).toFixed(1)}`);
++console.log(`pixels differing from native: ${diffPixels}/${w * h} (max channel diff ${maxDiff})`);
++// Math.cos/sin in JS may differ from libm in the last bit, which can send an
++// occasional path a different way; anything more than that is a porting bug.
++if (diffPixels > w * h * 0.01) process.exit(1);
+diff --git a/tools/wat2wasm.mjs b/tools/wat2wasm.mjs
+new file mode 100644
+index 0000000..978dafb
+--- /dev/null
++++ b/tools/wat2wasm.mjs
+@@ -0,0 +1,352 @@
++#!/usr/bin/env node
++// Minimal WebAssembly text -> binary assembler. Supports the subset of WAT used by
++// wasm/smallpt.wat: imports, memory, globals, functions (named params/locals,
++// multi-value results), exports, start, folded and flat instructions, and
++// structured control flow (block / loop / if-then-else).
++//
++// Usage: node tools/wat2wasm.mjs input.wat output.wasm
++import { readFileSync, writeFileSync } from 'node:fs';
++
++// ---------- s-expression parser ----------
++function parse(src) {
++  const tokens = [];
++  const re = /\s+|;;[^\n]*|\(;[\s\S]*?;\)|(\()|(\))|("(?:[^"\\]|\\.)*")|([^\s()";]+)/gy;
++  let m;
++  while (re.lastIndex < src.length) {
++    const at = re.lastIndex;
++    if (!(m = re.exec(src))) throw new Error(`Unexpected input at ${at}: ${src.slice(at, at + 20)}`);
++    if (m[1]) tokens.push('(');
++    else if (m[2]) tokens.push(')');
++    else if (m[3]) tokens.push({ str: JSON.parse(m[3]) });
++    else if (m[4]) tokens.push(m[4]);
++  }
++  let i = 0;
++  const read = () => {
++    const t = tokens[i++];
++    if (t !== '(') return t;
++    const list = [];
++    while (tokens[i] !== ')') {
++      if (i >= tokens.length) throw new Error('Unbalanced parentheses');
++      list.push(read());
++    }
++    i++;
++    return list;
++  };
++  return read();
++}
++
++// ---------- binary encoding helpers ----------
++const uleb = (n) => {
++  const out = [];
++  do {
++    let b = n & 0x7f;
++    n >>>= 7;
++    if (n) b |= 0x80;
++    out.push(b);
++  } while (n);
++  return out;
++};
++const sleb = (n) => {
++  const out = [];
++  n |= 0;
++  for (;;) {
++    const b = n & 0x7f;
++    n >>= 7;
++    if ((n === 0 && !(b & 0x40)) || (n === -1 && b & 0x40)) { out.push(b); return out; }
++    out.push(b | 0x80);
++  }
++};
++const f64 = (x) => [...new Uint8Array(new Float64Array([x]).buffer)];
++const str = (s) => { const b = [...Buffer.from(s, 'utf8')]; return [...uleb(b.length), ...b]; };
++const vec = (items) => [...uleb(items.length), ...items.flat()];
++const section = (id, bytes) => (bytes ? [id, ...uleb(bytes.length), ...bytes] : []);
++
++const VALTYPE = { i32: 0x7f, i64: 0x7e, f32: 0x7d, f64: 0x7c };
++
++// op name -> [opcode bytes, immediate kind]
++const OPS = {
++  unreachable: [[0x00]], nop: [[0x01]], return: [[0x0f]], drop: [[0x1a]], select: [[0x1b]],
++  br: [[0x0c], 'label'], br_if: [[0x0d], 'label'], call: [[0x10], 'func'],
++  'local.get': [[0x20], 'local'], 'local.set': [[0x21], 'local'], 'local.tee': [[0x22], 'local'],
++  'global.get': [[0x23], 'global'], 'global.set': [[0x24], 'global'],
++  'i32.load': [[0x28], 'mem2'], 'f64.load': [[0x2b], 'mem3'], 'i32.load8_u': [[0x2d], 'mem0'],
++  'i32.store': [[0x36], 'mem2'], 'f64.store': [[0x39], 'mem3'], 'i32.store8': [[0x3a], 'mem0'],
++  'i32.const': [[0x41], 'i32'], 'f64.const': [[0x44], 'f64'],
++  'i32.eqz': [[0x45]], 'i32.eq': [[0x46]], 'i32.ne': [[0x47]], 'i32.lt_s': [[0x48]], 'i32.lt_u': [[0x49]],
++  'i32.gt_s': [[0x4a]], 'i32.gt_u': [[0x4b]], 'i32.le_s': [[0x4c]], 'i32.le_u': [[0x4d]],
++  'i32.ge_s': [[0x4e]], 'i32.ge_u': [[0x4f]],
++  'f64.eq': [[0x61]], 'f64.ne': [[0x62]], 'f64.lt': [[0x63]], 'f64.gt': [[0x64]], 'f64.le': [[0x65]], 'f64.ge': [[0x66]],
++  'i32.add': [[0x6a]], 'i32.sub': [[0x6b]], 'i32.mul': [[0x6c]], 'i32.div_s': [[0x6d]], 'i32.div_u': [[0x6e]],
++  'i32.rem_s': [[0x6f]], 'i32.rem_u': [[0x70]], 'i32.and': [[0x71]], 'i32.or': [[0x72]], 'i32.xor': [[0x73]],
++  'i32.shl': [[0x74]], 'i32.shr_s': [[0x75]], 'i32.shr_u': [[0x76]],
++  'f64.abs': [[0x99]], 'f64.neg': [[0x9a]], 'f64.ceil': [[0x9b]], 'f64.floor': [[0x9c]], 'f64.trunc': [[0x9d]],
++  'f64.nearest': [[0x9e]], 'f64.sqrt': [[0x9f]], 'f64.add': [[0xa0]], 'f64.sub': [[0xa1]], 'f64.mul': [[0xa2]],
++  'f64.div': [[0xa3]], 'f64.min': [[0xa4]], 'f64.max': [[0xa5]],
++  'i32.trunc_f64_s': [[0xaa]], 'i32.trunc_f64_u': [[0xab]],
++  'f64.convert_i32_s': [[0xb7]], 'f64.convert_i32_u': [[0xb8]],
++};
++
++const isName = (x) => typeof x === 'string' && x[0] === '$';
++const head = (x) => (Array.isArray(x) ? x[0] : undefined);
++
++function parseI32(s) {
++  const n = Number(s.replace(/_/g, ''));
++  if (!Number.isInteger(n) || n < -0x80000000 || n > 0xffffffff) throw new Error(`Bad i32 literal ${s}`);
++  return n | 0;
++}
++
++function assemble(mod) {
++  if (head(mod) !== 'module') throw new Error('Expected (module ...)');
++  const fields = mod.slice(1);
++
++  const types = [];          // encoded func types (as strings for dedupe)
++  const typeIndex = (params, results) => {
++    const key = JSON.stringify([params, results]);
++    let i = types.findIndex((t) => t.key === key);
++    if (i < 0) { i = types.length; types.push({ key, params, results }); }
++    return i;
++  };
++  const funcNames = new Map();
++  const globalNames = new Map();
++  const imports = [];
++  const funcs = [];
++  const globals = [];
++  const exports = [];
++  let memory = null;
++  let start = null;
++
++  const parseSig = (items) => {
++    const params = [], paramNames = [], results = [];
++    let rest = 0;
++    for (const it of items) {
++      if (head(it) === 'param') {
++        if (isName(it[1])) { paramNames.push(it[1]); params.push(it[2]); }
++        else for (const t of it.slice(1)) { paramNames.push(null); params.push(t); }
++      } else if (head(it) === 'result') results.push(...it.slice(1));
++      else break;
++      rest++;
++    }
++    return { params, paramNames, results, rest };
++  };
++
++  // Pass 1: collect declarations so that names resolve regardless of order.
++  for (const f of fields) {
++    const kind = head(f);
++    if (kind === 'import') {
++      const [, modName, name, desc] = f;
++      if (head(desc) !== 'func') throw new Error('Only function imports are supported');
++      let rest = desc.slice(1);
++      const id = isName(rest[0]) ? rest.shift() : null;
++      const sig = parseSig(rest);
++      if (id) funcNames.set(id, imports.length);
++      imports.push({ mod: modName.str, name: name.str, type: typeIndex(sig.params, sig.results) });
++    }
++  }
++  for (const f of fields) {
++    const kind = head(f);
++    if (kind === 'func') {
++      let rest = f.slice(1);
++      const id = isName(rest[0]) ? rest.shift() : null;
++      const exportNames = [];
++      while (head(rest[0]) === 'export') exportNames.push(rest.shift()[1].str);
++      const sig = parseSig(rest);
++      rest = rest.slice(sig.rest);
++      const localNames = [...sig.paramNames], localTypes = [];
++      while (head(rest[0]) === 'local') {
++        const l = rest.shift();
++        if (isName(l[1])) { localNames.push(l[1]); localTypes.push(l[2]); }
++        else for (const t of l.slice(1)) { localNames.push(null); localTypes.push(t); }
++      }
++      const index = imports.length + funcs.length;
++      if (id) funcNames.set(id, index);
++      for (const e of exportNames) exports.push({ name: e, kind: 0, index });
++      funcs.push({ id, type: typeIndex(sig.params, sig.results), sig, localNames, localTypes, body: rest });
++    } else if (kind === 'global') {
++      let rest = f.slice(1);
++      const id = isName(rest[0]) ? rest.shift() : null;
++      const exportNames = [];
++      while (head(rest[0]) === 'export') exportNames.push(rest.shift()[1].str);
++      const t = rest.shift();
++      const mutable = head(t) === 'mut';
++      const index = globals.length;
++      if (id) globalNames.set(id, index);
++      for (const e of exportNames) exports.push({ name: e, kind: 3, index });
++      globals.push({ type: mutable ? t[1] : t, mutable, init: rest });
++    } else if (kind === 'memory') {
++      let rest = f.slice(1);
++      if (isName(rest[0])) rest.shift();
++      while (head(rest[0]) === 'export') exports.push({ name: rest.shift()[1].str, kind: 2, index: 0 });
++      memory = rest.map(Number);
++    } else if (kind === 'export') {
++      const [, name, [k, ref]] = f;
++      if (k !== 'func') throw new Error('Only func exports supported in (export ...)');
++      exports.push({ name: name.str, kind: 0, ref });
++    } else if (kind === 'start') {
++      start = f[1];
++    } else if (kind !== 'import') {
++      throw new Error(`Unsupported module field ${kind}`);
++    }
++  }
++
++  const resolve = (map, ref, what) => {
++    if (isName(ref)) {
++      if (!map.has(ref)) throw new Error(`Unknown ${what} ${ref}`);
++      return map.get(ref);
++    }
++    return parseI32(ref);
++  };
++
++  // Pass 2: encode function bodies.
++  function compileBody(fn) {
++    const out = [];
++    const labels = []; // innermost last
++    const localIndex = (ref) => {
++      if (isName(ref)) {
++        const i = fn.localNames.indexOf(ref);
++        if (i < 0) throw new Error(`Unknown local ${ref} in ${fn.id}`);
++        return i;
++      }
++      return parseI32(ref);
++    };
++    const labelDepth = (ref) => {
++      if (isName(ref)) {
++        const i = labels.lastIndexOf(ref);
++        if (i < 0) throw new Error(`Unknown label ${ref} in ${fn.id}`);
++        return labels.length - 1 - i;
++      }
++      return parseI32(ref);
++    };
++    const blockType = (items) => {
++      if (head(items[0]) === 'result') {
++        const r = items.shift().slice(1);
++        if (r.length === 1) return [VALTYPE[r[0]]];
++        if (r.length === 0) return [0x40];
++        return sleb(typeIndex([], r));
++      }
++      return [0x40];
++    };
++    const immediate = (kind, args) => {
++      switch (kind) {
++        case 'label': return uleb(labelDepth(args.shift()));
++        case 'func': return uleb(resolve(funcNames, args.shift(), 'function'));
++        case 'local': return uleb(localIndex(args.shift()));
++        case 'global': return uleb(resolve(globalNames, args.shift(), 'global'));
++        case 'i32': return sleb(parseI32(args.shift()));
++        case 'f64': return f64(parseFloat(args.shift()));
++        case 'mem0': case 'mem2': case 'mem3': {
++          let align = Number(kind[3]), offset = 0;
++          while (typeof args[0] === 'string' && /^(offset|align)=/.test(args[0])) {
++            const [k, v] = args.shift().split('=');
++            if (k === 'offset') offset = Number(v);
++            else align = Math.log2(Number(v));
++          }
++          return [...uleb(align), ...uleb(offset)];
++        }
++        default: return [];
++      }
++    };
++
++    // Compile a sequence of instructions (atoms = flat, lists = folded).
++    const seq = (items) => {
++      items = [...items];
++      while (items.length) {
++        const it = items.shift();
++        if (Array.isArray(it)) { folded(it); continue; }
++        if (it === 'block' || it === 'loop' || it === 'if' || it === 'else' || it === 'end') {
++          throw new Error(`Flat structured instruction '${it}' not supported; use folded form`);
++        }
++        const op = OPS[it];
++        if (!op) throw new Error(`Unknown instruction ${it} in ${fn.id}`);
++        out.push(...op[0], ...immediate(op[1], items));
++      }
++    };
++    const folded = (expr) => {
++      const [op, ...rest] = expr;
++      if (op === 'block' || op === 'loop') {
++        const label = isName(rest[0]) ? rest.shift() : null;
++        const bt = blockType(rest);
++        out.push(op === 'block' ? 0x02 : 0x03, ...bt);
++        labels.push(label);
++        seq(rest);
++        labels.pop();
++        out.push(0x0b);
++        return;
++      }
++      if (op === 'if') {
++        const label = isName(rest[0]) ? rest.shift() : null;
++        const bt = blockType(rest);
++        const thenIdx = rest.findIndex((x) => head(x) === 'then');
++        if (thenIdx < 0) throw new Error(`(if) without (then) in ${fn.id}`);
++        seq(rest.slice(0, thenIdx));
++        out.push(0x04, ...bt);
++        labels.push(label);
++        seq(rest[thenIdx].slice(1));
++        const els = rest[thenIdx + 1];
++        if (els) {
++          if (head(els) !== 'else') throw new Error(`Expected (else) in ${fn.id}`);
++          out.push(0x05);
++          seq(els.slice(1));
++        }
++        labels.pop();
++        out.push(0x0b);
++        return;
++      }
++      const def = OPS[op];
++      if (!def) throw new Error(`Unknown instruction ${op} in ${fn.id}`);
++      const args = [...rest];
++      const imm = immediate(def[1], args);
++      seq(args.filter(Array.isArray));
++      if (args.some((a) => !Array.isArray(a))) throw new Error(`Unexpected operand in (${op} ...) in ${fn.id}`);
++      out.push(...def[0], ...imm);
++    };
++
++    seq(fn.body);
++    out.push(0x0b);
++
++    // Run-length encode local declarations.
++    const decls = [];
++    for (const t of fn.localTypes) {
++      const last = decls[decls.length - 1];
++      if (last && last[1] === t) last[0]++;
++      else decls.push([1, t]);
++    }
++    const body = [...vec(decls.map(([n, t]) => [...uleb(n), VALTYPE[t]])), ...out];
++    return [...uleb(body.length), ...body];
++  }
++
++  const constExpr = (init) => {
++    const [op, val] = init[0];
++    if (op === 'i32.const') return [0x41, ...sleb(parseI32(val)), 0x0b];
++    if (op === 'f64.const') return [0x44, ...f64(parseFloat(val)), 0x0b];
++    throw new Error(`Unsupported global initializer ${op}`);
++  };
++
++  const code = funcs.map(compileBody); // may add multi-value block types
++  for (const e of exports) if (e.ref !== undefined) e.index = resolve(funcNames, e.ref, 'function');
++
++  const bytes = [
++    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
++    ...section(1, vec(types.map((t) => [0x60, ...vec(t.params.map((p) => [VALTYPE[p]])), ...vec(t.results.map((r) => [VALTYPE[r]]))]))),
++    ...section(2, imports.length && vec(imports.map((im) => [...str(im.mod), ...str(im.name), 0x00, ...uleb(im.type)]))),
++    ...section(3, funcs.length && vec(funcs.map((f) => uleb(f.type)))),
++    ...section(5, memory && vec([memory.length > 1 ? [0x01, ...uleb(memory[0]), ...uleb(memory[1])] : [0x00, ...uleb(memory[0])]])),
++    ...section(6, globals.length && vec(globals.map((g) => [VALTYPE[g.type], g.mutable ? 1 : 0, ...constExpr(g.init)]))),
++    ...section(7, exports.length && vec(exports.map((e) => [...str(e.name), e.kind, ...uleb(e.index)]))),
++    ...section(8, start && uleb(resolve(funcNames, start, 'function'))),
++    ...section(10, vec(code)),
++  ];
++  return new Uint8Array(bytes);
++}
++
++const [, , input, output] = process.argv;
++if (!input || !output) {
++  console.error('Usage: node tools/wat2wasm.mjs input.wat output.wasm');
++  process.exit(1);
++}
++const wasm = assemble(parse(readFileSync(input, 'utf8')));
++if (!WebAssembly.validate(wasm)) {
++  // Compile anyway to surface the engine's error message.
++  new WebAssembly.Module(wasm);
++}
++writeFileSync(output, wasm);
++console.log(`Wrote ${output} (${wasm.length} bytes)`);
+diff --git a/wasm/smallpt.cpp b/wasm/smallpt.cpp
+new file mode 100644
+index 0000000..8db179f
+--- /dev/null
++++ b/wasm/smallpt.cpp
+@@ -0,0 +1,175 @@
++// smallpt, a Path Tracer by Kevin Beason, 2008 (http://www.kevinbeason.com/smallpt/)
++// MIT licensed. Adapted for WebAssembly:
++//  - no stdio / stdlib / OpenMP; output is an RGBA buffer in linear memory
++//  - progressive rendering: each render_pass() adds one sample per sub-pixel
++//    (4 per pixel) to an accumulation buffer; the running average is clamped
++//    and gamma-corrected by get_rgba()
++//  - radiance() is iterative (Russian roulette picks reflection vs refraction
++//    for glass at every depth), so it needs no deep native stack
++//  - erand48 replaced by a 32-bit xorshift so results are reproducible
++//  - sphere colors can be changed from JavaScript via set_color()
++//
++// Build: see build.sh (emcc -O3 -sSTANDALONE_WASM --no-entry ...)
++#include <math.h>
++
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#define EXPORT extern "C" EMSCRIPTEN_KEEPALIVE
++#else
++#define EXPORT extern "C"
++#endif
++
++struct Vec {
++  double x, y, z;
++  Vec operator+(const Vec &b) const { return Vec{x + b.x, y + b.y, z + b.z}; }
++  Vec operator-(const Vec &b) const { return Vec{x - b.x, y - b.y, z - b.z}; }
++  Vec operator*(double b) const { return Vec{x * b, y * b, z * b}; }
++  Vec mult(const Vec &b) const { return Vec{x * b.x, y * b.y, z * b.z}; }
++  Vec norm() const { return *this * (1 / sqrt(x * x + y * y + z * z)); }
++  double dot(const Vec &b) const { return x * b.x + y * b.y + z * b.z; }
++  Vec operator%(const Vec &b) const { return Vec{y * b.z - z * b.y, z * b.x - x * b.z, x * b.y - y * b.x}; }
++};
++enum Refl_t { DIFF, SPEC, REFR };
++struct Sphere {
++  double rad;
++  Vec p, e, c;
++  Refl_t refl;
++  double intersect(const Vec &o, const Vec &d) const {
++    Vec op = p - o;
++    double t, eps = 1e-4, b = op.dot(d), det = b * b - op.dot(op) + rad * rad;
++    if (det < 0) return 0;
++    det = sqrt(det);
++    return (t = b - det) > eps ? t : ((t = b + det) > eps ? t : 0);
++  }
++};
++
++static const int NUM_SPHERES = 9;
++static Sphere spheres[NUM_SPHERES] = {
++  {1e5,  {1e5 + 1, 40.8, 81.6},    {},           {.75, .25, .25}, DIFF}, // Left
++  {1e5,  {-1e5 + 99, 40.8, 81.6},  {},           {.25, .25, .75}, DIFF}, // Rght
++  {1e5,  {50, 40.8, 1e5},          {},           {.75, .75, .75}, DIFF}, // Back
++  {1e5,  {50, 40.8, -1e5 + 170},   {},           {},              DIFF}, // Frnt
++  {1e5,  {50, 1e5, 81.6},          {},           {.75, .75, .75}, DIFF}, // Botm
++  {1e5,  {50, -1e5 + 81.6, 81.6},  {},           {.75, .75, .75}, DIFF}, // Top
++  {16.5, {27, 16.5, 47},           {},           {.999, .999, .999}, SPEC}, // Mirr
++  {16.5, {73, 16.5, 78},           {},           {.999, .999, .999}, REFR}, // Glas
++  {600,  {50, 681.6 - .27, 81.6},  {12, 12, 12}, {},              DIFF}, // Lite
++};
++
++static unsigned rng = 1;
++static inline double rnd() {
++  unsigned x = rng;
++  x ^= x << 13;
++  x ^= x >> 17;
++  x ^= x << 5;
++  rng = x;
++  return x * (1.0 / 4294967296.0);
++}
++
++static inline double clamp(double x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
++
++static inline int intersect(const Vec &o, const Vec &d, double &t) {
++  double inf = t = 1e20;
++  int id = -1;
++  for (int i = 0; i < NUM_SPHERES; i++) {
++    double dist = spheres[i].intersect(o, d);
++    if (dist != 0 && dist < t) { t = dist; id = i; }
++  }
++  return t < inf ? id : -1;
++}
++
++static Vec radiance(Vec o, Vec d) {
++  Vec acc{0, 0, 0}, thr{1, 1, 1};
++  int depth = 0;
++  for (;;) {
++    double t;
++    int id = intersect(o, d, t);
++    if (id < 0) return acc;                    // if miss, return black
++    const Sphere &obj = spheres[id];           // the hit object
++    Vec x = o + d * t, n = (x - obj.p).norm(), nl = n.dot(d) < 0 ? n : n * -1, f = obj.c;
++    double p = f.x > f.y && f.x > f.z ? f.x : f.y > f.z ? f.y : f.z; // max refl
++    acc = acc + thr.mult(obj.e);
++    if (++depth > 5) {
++      if (depth > 128 || !(rnd() < p)) return acc; // R.R.
++      f = f * (1 / p);
++    }
++    thr = thr.mult(f);
++    o = x;
++    if (obj.refl == DIFF) {                    // Ideal DIFFUSE reflection
++      double r1 = 2 * M_PI * rnd(), r2 = rnd(), r2s = sqrt(r2);
++      Vec w = nl, u = ((fabs(w.x) > .1 ? Vec{0, 1, 0} : Vec{1, 0, 0}) % w).norm(), v = w % u;
++      double c = cos(r1) * r2s, s = sin(r1) * r2s, q = sqrt(1 - r2);
++      d = (u * c + v * s + w * q).norm();
++      continue;
++    }
++    Vec rdir = d - n * (2 * n.dot(d));
++    if (obj.refl == SPEC) {                    // Ideal SPECULAR reflection
++      d = rdir;
++      continue;
++    }
++    bool into = n.dot(nl) > 0;                 // Ray from outside going in?
++    double nc = 1, nt = 1.5, nnt = into ? nc / nt : nt / nc, ddn = d.dot(nl), cos2t;
++    if ((cos2t = 1 - nnt * nnt * (1 - ddn * ddn)) < 0) { // Total internal reflection
++      d = rdir;
++      continue;
++    }
++    Vec tdir = (d * nnt - n * ((into ? 1 : -1) * (ddn * nnt + sqrt(cos2t)))).norm();
++    double a = nt - nc, b = nt + nc, R0 = a * a / (b * b), c = 1 - (into ? -ddn : tdir.dot(n));
++    double Re = R0 + (1 - R0) * c * c * c * c * c, Tr = 1 - Re, P = .25 + .5 * Re, RP = Re / P, TP = Tr / (1 - P);
++    if (rnd() < P) { thr = thr * RP; d = rdir; }
++    else           { thr = thr * TP; d = tdir; }
++  }
++}
++
++static const int MAX_W = 640, MAX_H = 480;
++static Vec accum[MAX_W * MAX_H];
++static unsigned char rgba[MAX_W * MAX_H * 4];
++static int W = 0, H = 0, passes = 0;
++
++// Set the image size and clear the accumulation buffer.
++EXPORT void init(int w, int h) {
++  W = w < 1 ? 1 : w > MAX_W ? MAX_W : w;
++  H = h < 1 ? 1 : h > MAX_H ? MAX_H : h;
++  for (int i = 0; i < W * H; i++) accum[i] = Vec{0, 0, 0};
++  passes = 0;
++}
++
++EXPORT void set_color(int i, double r, double g, double b) {
++  if (i >= 0 && i < NUM_SPHERES) spheres[i].c = Vec{r, g, b};
++}
++
++EXPORT int get_passes() { return passes; }
++
++// Add one sample per 2x2 sub-pixel to every pixel.
++EXPORT void render_pass(unsigned seed) {
++  rng = seed ? seed : 1;
++  Vec camo{50, 52, 295.6}, camd = Vec{0, -0.042612, -1}.norm();
++  Vec cx{W * .5135 / H, 0, 0}, cy = (cx % camd).norm() * .5135;
++  for (int y = 0; y < H; y++) {
++    for (int x = 0; x < W; x++) {
++      int i = (H - y - 1) * W + x;
++      for (int sy = 0; sy < 2; sy++) {
++        for (int sx = 0; sx < 2; sx++) {
++          double r1 = 2 * rnd(), dx = r1 < 1 ? sqrt(r1) - 1 : 1 - sqrt(2 - r1);
++          double r2 = 2 * rnd(), dy = r2 < 1 ? sqrt(r2) - 1 : 1 - sqrt(2 - r2);
++          Vec d = cx * (((sx + .5 + dx) / 2 + x) / W - .5) + cy * (((sy + .5 + dy) / 2 + y) / H - .5) + camd;
++          Vec r = radiance(camo + d * 140, d.norm());
++          accum[i] = accum[i] + r * .25; // clamped when displayed, not per sample
++        }
++      }
++    }
++  }
++  passes++;
++}
++
++// Gamma-correct the running average into an RGBA8 buffer (top row first).
++EXPORT unsigned char *get_rgba() {
++  double s = 1.0 / (passes ? passes : 1);
++  for (int i = 0; i < W * H; i++) {
++    rgba[i * 4 + 0] = (int)(pow(clamp(accum[i].x * s), 1 / 2.2) * 255 + .5);
++    rgba[i * 4 + 1] = (int)(pow(clamp(accum[i].y * s), 1 / 2.2) * 255 + .5);
++    rgba[i * 4 + 2] = (int)(pow(clamp(accum[i].z * s), 1 / 2.2) * 255 + .5);
++    rgba[i * 4 + 3] = 255;
++  }
++  return rgba;
++}
+diff --git a/wasm/smallpt.wat b/wasm/smallpt.wat
+new file mode 100644
+index 0000000..cee476f
+--- /dev/null
++++ b/wasm/smallpt.wat
+@@ -0,0 +1,495 @@
++;; smallpt (Kevin Beason, MIT license) as hand-written WebAssembly.
++;;
++;; This is an operation-for-operation port of wasm/smallpt.cpp: same scene,
++;; same xorshift RNG call order and the same floating point evaluation order,
++;; so it produces the same image as the C++ code. tools/check.mjs verifies this
++;; against a native build of smallpt.cpp. It exists so the .wasm can be rebuilt
++;; without emscripten (tools/wat2wasm.mjs); build.sh uses emcc when available.
++;;
++;; Exports match the emcc build: init, set_color, get_passes, render_pass, get_rgba, memory.
++;;
++;; Memory layout:
++;;   0       sphere table, 9 x 88 bytes:
++;;           rad, p.xyz, e.xyz, c.xyz, refl (f64; 0 = DIFF, 1 = SPEC, 2 = REFR)
++;;   1024    accumulation buffer, 640*480 x 3 f64
++;;   7373824 RGBA8 output, 640*480 x 4 bytes
++(module
++  (import "env" "cos" (func $cos (param f64) (result f64)))
++  (import "env" "sin" (func $sin (param f64) (result f64)))
++  (import "env" "pow" (func $pow (param f64 f64) (result f64)))
++
++  (memory (export "memory") 132)
++
++  (global $W (mut i32) (i32.const 0))
++  (global $H (mut i32) (i32.const 0))
++  (global $passes (mut i32) (i32.const 0))
++  (global $rng (mut i32) (i32.const 1))
++
++  (func $sphere (param $i i32) (param $rad f64) (param $px f64) (param $py f64) (param $pz f64)
++                (param $e f64) (param $cx f64) (param $cy f64) (param $cz f64) (param $refl f64)
++    (local $a i32)
++    (local.set $a (i32.mul (local.get $i) (i32.const 88)))
++    (f64.store offset=0 (local.get $a) (local.get $rad))
++    (f64.store offset=8 (local.get $a) (local.get $px))
++    (f64.store offset=16 (local.get $a) (local.get $py))
++    (f64.store offset=24 (local.get $a) (local.get $pz))
++    (f64.store offset=32 (local.get $a) (local.get $e))
++    (f64.store offset=40 (local.get $a) (local.get $e))
++    (f64.store offset=48 (local.get $a) (local.get $e))
++    (f64.store offset=56 (local.get $a) (local.get $cx))
++    (f64.store offset=64 (local.get $a) (local.get $cy))
++    (f64.store offset=72 (local.get $a) (local.get $cz))
++    (f64.store offset=80 (local.get $a) (local.get $refl)))
++
++  (func $setup_scene
++    ;;           i   rad          p.x                 p.y                p.z                   e                 c.x                c.y                c.z               refl
++    (call $sphere (i32.const 0) (f64.const 1e5) (f64.const 100001) (f64.const 40.8) (f64.const 81.6) (f64.const 0) (f64.const 0.75) (f64.const 0.25) (f64.const 0.25) (f64.const 0)) ;; Left
++    (call $sphere (i32.const 1) (f64.const 1e5) (f64.const -99901) (f64.const 40.8) (f64.const 81.6) (f64.const 0) (f64.const 0.25) (f64.const 0.25) (f64.const 0.75) (f64.const 0)) ;; Rght
++    (call $sphere (i32.const 2) (f64.const 1e5) (f64.const 50) (f64.const 40.8) (f64.const 1e5) (f64.const 0) (f64.const 0.75) (f64.const 0.75) (f64.const 0.75) (f64.const 0)) ;; Back
++    (call $sphere (i32.const 3) (f64.const 1e5) (f64.const 50) (f64.const 40.8) (f64.const -99830) (f64.const 0) (f64.const 0) (f64.const 0) (f64.const 0) (f64.const 0)) ;; Frnt
++    (call $sphere (i32.const 4) (f64.const 1e5) (f64.const 50) (f64.const 1e5) (f64.const 81.6) (f64.const 0) (f64.const 0.75) (f64.const 0.75) (f64.const 0.75) (f64.const 0)) ;; Botm
++    (call $sphere (i32.const 5) (f64.const 1e5) (f64.const 50) (f64.const -99918.4) (f64.const 81.6) (f64.const 0) (f64.const 0.75) (f64.const 0.75) (f64.const 0.75) (f64.const 0)) ;; Top
++    (call $sphere (i32.const 6) (f64.const 16.5) (f64.const 27) (f64.const 16.5) (f64.const 47) (f64.const 0) (f64.const 0.999) (f64.const 0.999) (f64.const 0.999) (f64.const 1)) ;; Mirr
++    (call $sphere (i32.const 7) (f64.const 16.5) (f64.const 73) (f64.const 16.5) (f64.const 78) (f64.const 0) (f64.const 0.999) (f64.const 0.999) (f64.const 0.999) (f64.const 2)) ;; Glas
++    (call $sphere (i32.const 8) (f64.const 600) (f64.const 50) (f64.const 681.33) (f64.const 81.6) (f64.const 12) (f64.const 0) (f64.const 0) (f64.const 0) (f64.const 0))) ;; Lite
++  (start $setup_scene)
++
++  ;; xorshift32 -> [0, 1)
++  (func $rnd (result f64)
++    (local $x i32)
++    (local.set $x (global.get $rng))
++    (local.set $x (i32.xor (local.get $x) (i32.shl (local.get $x) (i32.const 13))))
++    (local.set $x (i32.xor (local.get $x) (i32.shr_u (local.get $x) (i32.const 17))))
++    (local.set $x (i32.xor (local.get $x) (i32.shl (local.get $x) (i32.const 5))))
++    (global.set $rng (local.get $x))
++    (f64.mul (f64.convert_i32_u (local.get $x)) (f64.const 2.3283064365386963e-10)))
++
++  (func $clamp (param $x f64) (result f64)
++    (if (result f64) (f64.lt (local.get $x) (f64.const 0))
++      (then (f64.const 0))
++      (else (if (result f64) (f64.gt (local.get $x) (f64.const 1))
++        (then (f64.const 1))
++        (else (local.get $x))))))
++
++  ;; Sphere::intersect: distance along the ray, 0 if no hit.
++  (func $sphere_hit (param $i i32) (param $ox f64) (param $oy f64) (param $oz f64)
++                    (param $dx f64) (param $dy f64) (param $dz f64) (result f64)
++    (local $a i32) (local $opx f64) (local $opy f64) (local $opz f64)
++    (local $b f64) (local $det f64) (local $rad f64) (local $t f64)
++    (local.set $a (i32.mul (local.get $i) (i32.const 88)))
++    (local.set $rad (f64.load offset=0 (local.get $a)))
++    (local.set $opx (f64.sub (f64.load offset=8 (local.get $a)) (local.get $ox)))
++    (local.set $opy (f64.sub (f64.load offset=16 (local.get $a)) (local.get $oy)))
++    (local.set $opz (f64.sub (f64.load offset=24 (local.get $a)) (local.get $oz)))
++    (local.set $b (f64.add (f64.add (f64.mul (local.get $opx) (local.get $dx))
++                                    (f64.mul (local.get $opy) (local.get $dy)))
++                           (f64.mul (local.get $opz) (local.get $dz))))
++    (local.set $det
++      (f64.add
++        (f64.sub (f64.mul (local.get $b) (local.get $b))
++                 (f64.add (f64.add (f64.mul (local.get $opx) (local.get $opx))
++                                   (f64.mul (local.get $opy) (local.get $opy)))
++                          (f64.mul (local.get $opz) (local.get $opz))))
++        (f64.mul (local.get $rad) (local.get $rad))))
++    (if (f64.lt (local.get $det) (f64.const 0)) (then (return (f64.const 0))))
++    (local.set $det (f64.sqrt (local.get $det)))
++    (local.set $t (f64.sub (local.get $b) (local.get $det)))
++    (if (f64.gt (local.get $t) (f64.const 1e-4)) (then (return (local.get $t))))
++    (local.set $t (f64.add (local.get $b) (local.get $det)))
++    (if (f64.gt (local.get $t) (f64.const 1e-4)) (then (return (local.get $t))))
++    (f64.const 0))
++
++  ;; Nearest hit: (t, sphere index) with index -1 on miss.
++  (func $intersect (param $ox f64) (param $oy f64) (param $oz f64)
++                   (param $dx f64) (param $dy f64) (param $dz f64) (result f64 i32)
++    (local $t f64) (local $id i32) (local $i i32) (local $dist f64)
++    (local.set $t (f64.const 1e20))
++    (local.set $id (i32.const -1))
++    (loop $spheres
++      (local.set $dist (call $sphere_hit (local.get $i) (local.get $ox) (local.get $oy) (local.get $oz)
++                                         (local.get $dx) (local.get $dy) (local.get $dz)))
++      (if (f64.ne (local.get $dist) (f64.const 0))
++        (then (if (f64.lt (local.get $dist) (local.get $t))
++          (then (local.set $t (local.get $dist))
++                (local.set $id (local.get $i))))))
++      (local.set $i (i32.add (local.get $i) (i32.const 1)))
++      (br_if $spheres (i32.lt_s (local.get $i) (i32.const 9))))
++    (local.get $t)
++    (local.get $id))
++
++  (func $radiance (param $ox f64) (param $oy f64) (param $oz f64)
++                  (param $dx f64) (param $dy f64) (param $dz f64) (result f64 f64 f64)
++    (local $ax f64) (local $ay f64) (local $az f64)   ;; accumulated radiance
++    (local $tx f64) (local $ty f64) (local $tz f64)   ;; path throughput
++    (local $depth i32) (local $t f64) (local $id i32) (local $a i32)
++    (local $xx f64) (local $xy f64) (local $xz f64)   ;; hit point
++    (local $nx f64) (local $ny f64) (local $nz f64)   ;; surface normal
++    (local $lx f64) (local $ly f64) (local $lz f64)   ;; normal facing the ray
++    (local $fx f64) (local $fy f64) (local $fz f64)   ;; surface color
++    (local $p f64) (local $refl f64) (local $inv f64) (local $k f64)
++    (local $r1 f64) (local $r2 f64) (local $r2s f64)
++    (local $ux f64) (local $uy f64) (local $uz f64)
++    (local $vx f64) (local $vy f64) (local $vz f64)
++    (local $c f64) (local $s f64) (local $q f64)
++    (local $rx f64) (local $ry f64) (local $rz f64)   ;; mirror direction
++    (local $into i32) (local $nnt f64) (local $ddn f64) (local $cos2t f64)
++    (local $gx f64) (local $gy f64) (local $gz f64)   ;; refracted direction
++    (local $re f64) (local $pp f64)
++
++    (local.set $tx (f64.const 1))
++    (local.set $ty (f64.const 1))
++    (local.set $tz (f64.const 1))
++    (loop $bounce
++      (call $intersect (local.get $ox) (local.get $oy) (local.get $oz)
++                       (local.get $dx) (local.get $dy) (local.get $dz))
++      local.set $id
++      local.set $t
++      (if (i32.lt_s (local.get $id) (i32.const 0))
++        (then (return (local.get $ax) (local.get $ay) (local.get $az))))
++      (local.set $a (i32.mul (local.get $id) (i32.const 88)))
++
++      ;; x = o + d*t
++      (local.set $xx (f64.add (local.get $ox) (f64.mul (local.get $dx) (local.get $t))))
++      (local.set $xy (f64.add (local.get $oy) (f64.mul (local.get $dy) (local.get $t))))
++      (local.set $xz (f64.add (local.get $oz) (f64.mul (local.get $dz) (local.get $t))))
++      ;; n = (x - obj.p).norm()
++      (local.set $nx (f64.sub (local.get $xx) (f64.load offset=8 (local.get $a))))
++      (local.set $ny (f64.sub (local.get $xy) (f64.load offset=16 (local.get $a))))
++      (local.set $nz (f64.sub (local.get $xz) (f64.load offset=24 (local.get $a))))
++      (local.set $inv (f64.div (f64.const 1) (f64.sqrt
++        (f64.add (f64.add (f64.mul (local.get $nx) (local.get $nx))
++                          (f64.mul (local.get $ny) (local.get $ny)))
++                 (f64.mul (local.get $nz) (local.get $nz))))))
++      (local.set $nx (f64.mul (local.get $nx) (local.get $inv)))
++      (local.set $ny (f64.mul (local.get $ny) (local.get $inv)))
++      (local.set $nz (f64.mul (local.get $nz) (local.get $inv)))
++      ;; nl = n.dot(d) < 0 ? n : n * -1
++      (if (f64.lt (f64.add (f64.add (f64.mul (local.get $nx) (local.get $dx))
++                                    (f64.mul (local.get $ny) (local.get $dy)))
++                           (f64.mul (local.get $nz) (local.get $dz)))
++                  (f64.const 0))
++        (then (local.set $lx (local.get $nx))
++              (local.set $ly (local.get $ny))
++              (local.set $lz (local.get $nz)))
++        (else (local.set $lx (f64.mul (local.get $nx) (f64.const -1)))
++              (local.set $ly (f64.mul (local.get $ny) (f64.const -1)))
++              (local.set $lz (f64.mul (local.get $nz) (f64.const -1)))))
++      (local.set $fx (f64.load offset=56 (local.get $a)))
++      (local.set $fy (f64.load offset=64 (local.get $a)))
++      (local.set $fz (f64.load offset=72 (local.get $a)))
++      ;; p = max reflectance
++      (local.set $p
++        (if (result f64) (i32.and (f64.gt (local.get $fx) (local.get $fy))
++                                  (f64.gt (local.get $fx) (local.get $fz)))
++          (then (local.get $fx))
++          (else (if (result f64) (f64.gt (local.get $fy) (local.get $fz))
++            (then (local.get $fy))
++            (else (local.get $fz))))))
++      ;; acc = acc + thr.mult(obj.e)
++      (local.set $ax (f64.add (local.get $ax) (f64.mul (local.get $tx) (f64.load offset=32 (local.get $a)))))
++      (local.set $ay (f64.add (local.get $ay) (f64.mul (local.get $ty) (f64.load offset=40 (local.get $a)))))
++      (local.set $az (f64.add (local.get $az) (f64.mul (local.get $tz) (f64.load offset=48 (local.get $a)))))
++      ;; Russian roulette
++      (local.set $depth (i32.add (local.get $depth) (i32.const 1)))
++      (if (i32.gt_s (local.get $depth) (i32.const 5))
++        (then
++          (if (i32.gt_s (local.get $depth) (i32.const 128))
++            (then (return (local.get $ax) (local.get $ay) (local.get $az))))
++          (if (i32.eqz (f64.lt (call $rnd) (local.get $p)))
++            (then (return (local.get $ax) (local.get $ay) (local.get $az))))
++          (local.set $inv (f64.div (f64.const 1) (local.get $p)))
++          (local.set $fx (f64.mul (local.get $fx) (local.get $inv)))
++          (local.set $fy (f64.mul (local.get $fy) (local.get $inv)))
++          (local.set $fz (f64.mul (local.get $fz) (local.get $inv)))))
++      (local.set $tx (f64.mul (local.get $tx) (local.get $fx)))
++      (local.set $ty (f64.mul (local.get $ty) (local.get $fy)))
++      (local.set $tz (f64.mul (local.get $tz) (local.get $fz)))
++      (local.set $ox (local.get $xx))
++      (local.set $oy (local.get $xy))
++      (local.set $oz (local.get $xz))
++      (local.set $refl (f64.load offset=80 (local.get $a)))
++
++      ;; Ideal DIFFUSE reflection
++      (if (f64.eq (local.get $refl) (f64.const 0))
++        (then
++          (local.set $r1 (f64.mul (f64.const 6.283185307179586) (call $rnd)))
++          (local.set $r2 (call $rnd))
++          (local.set $r2s (f64.sqrt (local.get $r2)))
++          ;; u = ((|w.x| > .1 ? (0,1,0) : (1,0,0)) % w).norm(), with w = nl
++          (if (f64.gt (f64.abs (local.get $lx)) (f64.const 0.1))
++            (then (local.set $ux (f64.sub (f64.mul (f64.const 1) (local.get $lz)) (f64.mul (f64.const 0) (local.get $ly))))
++                  (local.set $uy (f64.sub (f64.mul (f64.const 0) (local.get $lx)) (f64.mul (f64.const 0) (local.get $lz))))
++                  (local.set $uz (f64.sub (f64.mul (f64.const 0) (local.get $ly)) (f64.mul (f64.const 1) (local.get $lx)))))
++            (else (local.set $ux (f64.sub (f64.mul (f64.const 0) (local.get $lz)) (f64.mul (f64.const 0) (local.get $ly))))
++                  (local.set $uy (f64.sub (f64.mul (f64.const 0) (local.get $lx)) (f64.mul (f64.const 1) (local.get $lz))))
++                  (local.set $uz (f64.sub (f64.mul (f64.const 1) (local.get $ly)) (f64.mul (f64.const 0) (local.get $lx))))))
++          (local.set $inv (f64.div (f64.const 1) (f64.sqrt
++            (f64.add (f64.add (f64.mul (local.get $ux) (local.get $ux))
++                              (f64.mul (local.get $uy) (local.get $uy)))
++                     (f64.mul (local.get $uz) (local.get $uz))))))
++          (local.set $ux (f64.mul (local.get $ux) (local.get $inv)))
++          (local.set $uy (f64.mul (local.get $uy) (local.get $inv)))
++          (local.set $uz (f64.mul (local.get $uz) (local.get $inv)))
++          ;; v = w % u
++          (local.set $vx (f64.sub (f64.mul (local.get $ly) (local.get $uz)) (f64.mul (local.get $lz) (local.get $uy))))
++          (local.set $vy (f64.sub (f64.mul (local.get $lz) (local.get $ux)) (f64.mul (local.get $lx) (local.get $uz))))
++          (local.set $vz (f64.sub (f64.mul (local.get $lx) (local.get $uy)) (f64.mul (local.get $ly) (local.get $ux))))
++          (local.set $c (f64.mul (call $cos (local.get $r1)) (local.get $r2s)))
++          (local.set $s (f64.mul (call $sin (local.get $r1)) (local.get $r2s)))
++          (local.set $q (f64.sqrt (f64.sub (f64.const 1) (local.get $r2))))
++          ;; d = (u*c + v*s + w*q).norm()
++          (local.set $dx (f64.add (f64.add (f64.mul (local.get $ux) (local.get $c)) (f64.mul (local.get $vx) (local.get $s)))
++                                  (f64.mul (local.get $lx) (local.get $q))))
++          (local.set $dy (f64.add (f64.add (f64.mul (local.get $uy) (local.get $c)) (f64.mul (local.get $vy) (local.get $s)))
++                                  (f64.mul (local.get $ly) (local.get $q))))
++          (local.set $dz (f64.add (f64.add (f64.mul (local.get $uz) (local.get $c)) (f64.mul (local.get $vz) (local.get $s)))
++                                  (f64.mul (local.get $lz) (local.get $q))))
++          (local.set $inv (f64.div (f64.const 1) (f64.sqrt
++            (f64.add (f64.add (f64.mul (local.get $dx) (local.get $dx))
++                              (f64.mul (local.get $dy) (local.get $dy)))
++                     (f64.mul (local.get $dz) (local.get $dz))))))
++          (local.set $dx (f64.mul (local.get $dx) (local.get $inv)))
++          (local.set $dy (f64.mul (local.get $dy) (local.get $inv)))
++          (local.set $dz (f64.mul (local.get $dz) (local.get $inv)))
++          (br $bounce)))
++
++      ;; rdir = d - n * (2 * n.dot(d))
++      (local.set $k (f64.mul (f64.const 2)
++        (f64.add (f64.add (f64.mul (local.get $nx) (local.get $dx))
++                          (f64.mul (local.get $ny) (local.get $dy)))
++                 (f64.mul (local.get $nz) (local.get $dz)))))
++      (local.set $rx (f64.sub (local.get $dx) (f64.mul (local.get $nx) (local.get $k))))
++      (local.set $ry (f64.sub (local.get $dy) (f64.mul (local.get $ny) (local.get $k))))
++      (local.set $rz (f64.sub (local.get $dz) (f64.mul (local.get $nz) (local.get $k))))
++
++      ;; Ideal SPECULAR reflection
++      (if (f64.eq (local.get $refl) (f64.const 1))
++        (then
++          (local.set $dx (local.get $rx))
++          (local.set $dy (local.get $ry))
++          (local.set $dz (local.get $rz))
++          (br $bounce)))
++
++      ;; Ideal dielectric REFRACTION
++      (local.set $into (f64.gt
++        (f64.add (f64.add (f64.mul (local.get $nx) (local.get $lx))
++                          (f64.mul (local.get $ny) (local.get $ly)))
++                 (f64.mul (local.get $nz) (local.get $lz)))
++        (f64.const 0)))
++      (local.set $nnt (if (result f64) (local.get $into)
++        (then (f64.const 0.6666666666666666))
++        (else (f64.const 1.5))))
++      (local.set $ddn
++        (f64.add (f64.add (f64.mul (local.get $dx) (local.get $lx))
++                          (f64.mul (local.get $dy) (local.get $ly)))
++                 (f64.mul (local.get $dz) (local.get $lz))))
++      (local.set $cos2t (f64.sub (f64.const 1)
++        (f64.mul (f64.mul (local.get $nnt) (local.get $nnt))
++                 (f64.sub (f64.const 1) (f64.mul (local.get $ddn) (local.get $ddn))))))
++      (if (f64.lt (local.get $cos2t) (f64.const 0))   ;; total internal reflection
++        (then
++          (local.set $dx (local.get $rx))
++          (local.set $dy (local.get $ry))
++          (local.set $dz (local.get $rz))
++          (br $bounce)))
++      ;; tdir = (d*nnt - n*((into ? 1 : -1) * (ddn*nnt + sqrt(cos2t)))).norm()
++      (local.set $k (f64.mul
++        (if (result f64) (local.get $into) (then (f64.const 1)) (else (f64.const -1)))
++        (f64.add (f64.mul (local.get $ddn) (local.get $nnt)) (f64.sqrt (local.get $cos2t)))))
++      (local.set $gx (f64.sub (f64.mul (local.get $dx) (local.get $nnt)) (f64.mul (local.get $nx) (local.get $k))))
++      (local.set $gy (f64.sub (f64.mul (local.get $dy) (local.get $nnt)) (f64.mul (local.get $ny) (local.get $k))))
++      (local.set $gz (f64.sub (f64.mul (local.get $dz) (local.get $nnt)) (f64.mul (local.get $nz) (local.get $k))))
++      (local.set $inv (f64.div (f64.const 1) (f64.sqrt
++        (f64.add (f64.add (f64.mul (local.get $gx) (local.get $gx))
++                          (f64.mul (local.get $gy) (local.get $gy)))
++                 (f64.mul (local.get $gz) (local.get $gz))))))
++      (local.set $gx (f64.mul (local.get $gx) (local.get $inv)))
++      (local.set $gy (f64.mul (local.get $gy) (local.get $inv)))
++      (local.set $gz (f64.mul (local.get $gz) (local.get $inv)))
++      ;; c = 1 - (into ? -ddn : tdir.dot(n))
++      (local.set $c (f64.sub (f64.const 1)
++        (if (result f64) (local.get $into)
++          (then (f64.neg (local.get $ddn)))
++          (else (f64.add (f64.add (f64.mul (local.get $gx) (local.get $nx))
++                                  (f64.mul (local.get $gy) (local.get $ny)))
++                         (f64.mul (local.get $gz) (local.get $nz)))))))
++      ;; Re = R0 + (1-R0)*c^5 with R0 = .04; P = .25 + .5*Re
++      (local.set $re (f64.add (f64.const 0.04)
++        (f64.mul (f64.mul (f64.mul (f64.mul (f64.mul (f64.const 0.96) (local.get $c))
++                                            (local.get $c)) (local.get $c)) (local.get $c)) (local.get $c))))
++      (local.set $pp (f64.add (f64.const 0.25) (f64.mul (f64.const 0.5) (local.get $re))))
++      (if (f64.lt (call $rnd) (local.get $pp))
++        (then   ;; reflect, weight RP = Re/P
++          (local.set $k (f64.div (local.get $re) (local.get $pp)))
++          (local.set $dx (local.get $rx))
++          (local.set $dy (local.get $ry))
++          (local.set $dz (local.get $rz)))
++        (else   ;; refract, weight TP = Tr/(1-P)
++          (local.set $k (f64.div (f64.sub (f64.const 1) (local.get $re))
++                                 (f64.sub (f64.const 1) (local.get $pp))))
++          (local.set $dx (local.get $gx))
++          (local.set $dy (local.get $gy))
++          (local.set $dz (local.get $gz))))
++      (local.set $tx (f64.mul (local.get $tx) (local.get $k)))
++      (local.set $ty (f64.mul (local.get $ty) (local.get $k)))
++      (local.set $tz (f64.mul (local.get $tz) (local.get $k)))
++      (br $bounce))
++    unreachable)
++
++  ;; Set the image size (max 640x480) and clear the accumulation buffer.
++  (func (export "init") (param $w i32) (param $h i32)
++    (local $i i32) (local $end i32)
++    (global.set $W (if (result i32) (i32.lt_s (local.get $w) (i32.const 1)) (then (i32.const 1))
++      (else (if (result i32) (i32.gt_s (local.get $w) (i32.const 640)) (then (i32.const 640)) (else (local.get $w))))))
++    (global.set $H (if (result i32) (i32.lt_s (local.get $h) (i32.const 1)) (then (i32.const 1))
++      (else (if (result i32) (i32.gt_s (local.get $h) (i32.const 480)) (then (i32.const 480)) (else (local.get $h))))))
++    (local.set $i (i32.const 1024))
++    (local.set $end (i32.add (i32.const 1024)
++      (i32.mul (i32.mul (global.get $W) (global.get $H)) (i32.const 24))))
++    (block $done
++      (loop $clear
++        (br_if $done (i32.ge_u (local.get $i) (local.get $end)))
++        (f64.store (local.get $i) (f64.const 0))
++        (local.set $i (i32.add (local.get $i) (i32.const 8)))
++        (br $clear)))
++    (global.set $passes (i32.const 0)))
++
++  (func (export "set_color") (param $i i32) (param $r f64) (param $g f64) (param $b f64)
++    (local $a i32)
++    (if (i32.and (i32.ge_s (local.get $i) (i32.const 0)) (i32.lt_s (local.get $i) (i32.const 9)))
++      (then
++        (local.set $a (i32.mul (local.get $i) (i32.const 88)))
++        (f64.store offset=56 (local.get $a) (local.get $r))
++        (f64.store offset=64 (local.get $a) (local.get $g))
++        (f64.store offset=72 (local.get $a) (local.get $b)))))
++
++  (func (export "get_passes") (result i32)
++    (global.get $passes))
++
++  ;; Add one sample per 2x2 sub-pixel to every pixel.
++  (func (export "render_pass") (param $seed i32)
++    (local $x i32) (local $y i32) (local $sx i32) (local $sy i32) (local $acc i32)
++    (local $fw f64) (local $fh f64) (local $inv f64)
++    (local $cdx f64) (local $cdy f64) (local $cdz f64)   ;; camera direction
++    (local $cxx f64) (local $cxy f64) (local $cxz f64)   ;; image plane x axis
++    (local $cyx f64) (local $cyy f64) (local $cyz f64)   ;; image plane y axis
++    (local $r1 f64) (local $r2 f64) (local $ddx f64) (local $ddy f64)
++    (local $u f64) (local $v f64) (local $dx f64) (local $dy f64) (local $dz f64)
++    (local $rx f64) (local $ry f64) (local $rz f64)
++
++    (global.set $rng (if (result i32) (local.get $seed) (then (local.get $seed)) (else (i32.const 1))))
++    (local.set $fw (f64.convert_i32_s (global.get $W)))
++    (local.set $fh (f64.convert_i32_s (global.get $H)))
++    ;; camd = Vec(0, -0.042612, -1).norm()
++    (local.set $inv (f64.div (f64.const 1) (f64.sqrt
++      (f64.add (f64.add (f64.mul (f64.const 0) (f64.const 0))
++                        (f64.mul (f64.const -0.042612) (f64.const -0.042612)))
++               (f64.mul (f64.const -1) (f64.const -1))))))
++    (local.set $cdx (f64.mul (f64.const 0) (local.get $inv)))
++    (local.set $cdy (f64.mul (f64.const -0.042612) (local.get $inv)))
++    (local.set $cdz (f64.mul (f64.const -1) (local.get $inv)))
++    ;; cx = (W*.5135/H, 0, 0)
++    (local.set $cxx (f64.div (f64.mul (local.get $fw) (f64.const 0.5135)) (local.get $fh)))
++    ;; cy = (cx % camd).norm() * .5135
++    (local.set $cyx (f64.sub (f64.mul (local.get $cxy) (local.get $cdz)) (f64.mul (local.get $cxz) (local.get $cdy))))
++    (local.set $cyy (f64.sub (f64.mul (local.get $cxz) (local.get $cdx)) (f64.mul (local.get $cxx) (local.get $cdz))))
++    (local.set $cyz (f64.sub (f64.mul (local.get $cxx) (local.get $cdy)) (f64.mul (local.get $cxy) (local.get $cdx))))
++    (local.set $inv (f64.div (f64.const 1) (f64.sqrt
++      (f64.add (f64.add (f64.mul (local.get $cyx) (local.get $cyx))
++                        (f64.mul (local.get $cyy) (local.get $cyy)))
++               (f64.mul (local.get $cyz) (local.get $cyz))))))
++    (local.set $cyx (f64.mul (f64.mul (local.get $cyx) (local.get $inv)) (f64.const 0.5135)))
++    (local.set $cyy (f64.mul (f64.mul (local.get $cyy) (local.get $inv)) (f64.const 0.5135)))
++    (local.set $cyz (f64.mul (f64.mul (local.get $cyz) (local.get $inv)) (f64.const 0.5135)))
++
++    (local.set $y (i32.const 0))
++    (loop $rows
++      (local.set $x (i32.const 0))
++      (loop $cols
++        ;; address of accum[(H - y - 1) * W + x]
++        (local.set $acc (i32.add (i32.const 1024) (i32.mul (i32.const 24)
++          (i32.add (i32.mul (i32.sub (i32.sub (global.get $H) (local.get $y)) (i32.const 1)) (global.get $W))
++                   (local.get $x)))))
++        (local.set $sy (i32.const 0))
++        (loop $suby
++          (local.set $sx (i32.const 0))
++          (loop $subx
++            ;; tent filter
++            (local.set $r1 (f64.mul (f64.const 2) (call $rnd)))
++            (local.set $ddx (if (result f64) (f64.lt (local.get $r1) (f64.const 1))
++              (then (f64.sub (f64.sqrt (local.get $r1)) (f64.const 1)))
++              (else (f64.sub (f64.const 1) (f64.sqrt (f64.sub (f64.const 2) (local.get $r1)))))))
++            (local.set $r2 (f64.mul (f64.const 2) (call $rnd)))
++            (local.set $ddy (if (result f64) (f64.lt (local.get $r2) (f64.const 1))
++              (then (f64.sub (f64.sqrt (local.get $r2)) (f64.const 1)))
++              (else (f64.sub (f64.const 1) (f64.sqrt (f64.sub (f64.const 2) (local.get $r2)))))))
++            ;; u = ((sx + .5 + dx)/2 + x)/W - .5, v likewise
++            (local.set $u (f64.sub (f64.div (f64.add (f64.div (f64.add (f64.add (f64.convert_i32_s (local.get $sx)) (f64.const 0.5))
++                                                                       (local.get $ddx)) (f64.const 2))
++                                                     (f64.convert_i32_s (local.get $x)))
++                                            (local.get $fw))
++                                   (f64.const 0.5)))
++            (local.set $v (f64.sub (f64.div (f64.add (f64.div (f64.add (f64.add (f64.convert_i32_s (local.get $sy)) (f64.const 0.5))
++                                                                       (local.get $ddy)) (f64.const 2))
++                                                     (f64.convert_i32_s (local.get $y)))
++                                            (local.get $fh))
++                                   (f64.const 0.5)))
++            ;; d = cx*u + cy*v + camd
++            (local.set $dx (f64.add (f64.add (f64.mul (local.get $cxx) (local.get $u)) (f64.mul (local.get $cyx) (local.get $v))) (local.get $cdx)))
++            (local.set $dy (f64.add (f64.add (f64.mul (local.get $cxy) (local.get $u)) (f64.mul (local.get $cyy) (local.get $v))) (local.get $cdy)))
++            (local.set $dz (f64.add (f64.add (f64.mul (local.get $cxz) (local.get $u)) (f64.mul (local.get $cyz) (local.get $v))) (local.get $cdz)))
++            (local.set $inv (f64.div (f64.const 1) (f64.sqrt
++              (f64.add (f64.add (f64.mul (local.get $dx) (local.get $dx))
++                                (f64.mul (local.get $dy) (local.get $dy)))
++                       (f64.mul (local.get $dz) (local.get $dz))))))
++            ;; radiance(Ray(cam.o + d*140, d.norm()))
++            (call $radiance
++              (f64.add (f64.const 50) (f64.mul (local.get $dx) (f64.const 140)))
++              (f64.add (f64.const 52) (f64.mul (local.get $dy) (f64.const 140)))
++              (f64.add (f64.const 295.6) (f64.mul (local.get $dz) (f64.const 140)))
++              (f64.mul (local.get $dx) (local.get $inv))
++              (f64.mul (local.get $dy) (local.get $inv))
++              (f64.mul (local.get $dz) (local.get $inv)))
++            local.set $rz
++            local.set $ry
++            local.set $rx
++            (f64.store offset=0 (local.get $acc) (f64.add (f64.load offset=0 (local.get $acc))
++              (f64.mul (local.get $rx) (f64.const 0.25))))
++            (f64.store offset=8 (local.get $acc) (f64.add (f64.load offset=8 (local.get $acc))
++              (f64.mul (local.get $ry) (f64.const 0.25))))
++            (f64.store offset=16 (local.get $acc) (f64.add (f64.load offset=16 (local.get $acc))
++              (f64.mul (local.get $rz) (f64.const 0.25))))
++            (local.set $sx (i32.add (local.get $sx) (i32.const 1)))
++            (br_if $subx (i32.lt_s (local.get $sx) (i32.const 2))))
++          (local.set $sy (i32.add (local.get $sy) (i32.const 1)))
++          (br_if $suby (i32.lt_s (local.get $sy) (i32.const 2))))
++        (local.set $x (i32.add (local.get $x) (i32.const 1)))
++        (br_if $cols (i32.lt_s (local.get $x) (global.get $W))))
++      (local.set $y (i32.add (local.get $y) (i32.const 1)))
++      (br_if $rows (i32.lt_s (local.get $y) (global.get $H))))
++    (global.set $passes (i32.add (global.get $passes) (i32.const 1))))
++
++  (func $to_byte (param $v f64) (result i32)
++    (i32.trunc_f64_s (f64.add (f64.mul (call $pow (call $clamp (local.get $v)) (f64.const 0.45454545454545453))
++                                       (f64.const 255))
++                              (f64.const 0.5))))
++
++  ;; Gamma-correct the running average into an RGBA8 buffer (top row first).
++  (func (export "get_rgba") (result i32)
++    (local $i i32) (local $n i32) (local $acc i32) (local $out i32) (local $s f64)
++    (local.set $s (f64.div (f64.const 1) (f64.convert_i32_s
++      (if (result i32) (global.get $passes) (then (global.get $passes)) (else (i32.const 1))))))
++    (local.set $n (i32.mul (global.get $W) (global.get $H)))
++    (block $done
++      (loop $pixels
++        (br_if $done (i32.ge_s (local.get $i) (local.get $n)))
++        (local.set $acc (i32.add (i32.const 1024) (i32.mul (local.get $i) (i32.const 24))))
++        (local.set $out (i32.add (i32.const 7373824) (i32.shl (local.get $i) (i32.const 2))))
++        (i32.store8 offset=0 (local.get $out) (call $to_byte (f64.mul (f64.load offset=0 (local.get $acc)) (local.get $s))))
++        (i32.store8 offset=1 (local.get $out) (call $to_byte (f64.mul (f64.load offset=8 (local.get $acc)) (local.get $s))))
++        (i32.store8 offset=2 (local.get $out) (call $to_byte (f64.mul (f64.load offset=16 (local.get $acc)) (local.get $s))))
++        (i32.store8 offset=3 (local.get $out) (i32.const 255))
++        (local.set $i (i32.add (local.get $i) (i32.const 1)))
++        (br $pixels)))
++    (i32.const 7373824))
++)

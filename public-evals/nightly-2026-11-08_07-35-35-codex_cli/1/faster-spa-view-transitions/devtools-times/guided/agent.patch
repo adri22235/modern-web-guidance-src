@@ -1,0 +1,211 @@
+diff --git a/README.md b/README.md
+index 4479b53..4ede451 100644
+--- a/README.md
++++ b/README.md
+@@ -9,6 +9,15 @@ pnpm install && pnpm run start
+ 
+ The application will now be running on `http://localhost:11224`.
+ 
++Visited page contents stay mounted across Astro client navigations. The cache in
++`src/scripts/view-cache.ts` keeps at most five views (including the active view),
++keyed by pathname and query string, and evicts the least recently used view.
++Inactive views use `content-visibility: hidden` and `inert`; browsers without
++content visibility fall back to `display: none`. Astro still fetches destinations
++and manages page metadata, history, and scroll restoration. Reloading clears the
++cache. Set `cacheView={false}` on `Layout` to opt a page out, as the sign-in and
++sign-up pages do so credential forms are discarded on departure.
++
+ ## Tech Stack
+ 
+ - **[Astro](https://astro.build/)**: The web framework for building content-driven websites.
+diff --git a/src/layouts/Layout.astro b/src/layouts/Layout.astro
+index dcf9696..ef977d0 100644
+--- a/src/layouts/Layout.astro
++++ b/src/layouts/Layout.astro
+@@ -8,9 +8,10 @@ import { ClientRouter } from "astro:transitions";
+ 
+ export interface Props {
+   title: string;
++  cacheView?: boolean;
+ }
+ 
+-const { title } = Astro.props;
++const { title, cacheView = true } = Astro.props;
+ const baseUrl = import.meta.env.BASE_URL;
+ ---
+ 
+@@ -35,6 +36,9 @@ const baseUrl = import.meta.env.BASE_URL;
+     <link rel="icon" href=`${baseUrl}/favicon.svg` />
+ 
+     <ClientRouter />
++    <script>
++      import "../scripts/view-cache";
++    </script>
+   </head>
+   <body class="bg-gray-100">
+     <div class="mx-auto">
+@@ -45,9 +49,16 @@ const baseUrl = import.meta.env.BASE_URL;
+         <div>
+           <Header />
+         </div>
+-        <main class="bg-white relative">
+-          <slot />
+-        </main>
++        <div data-view-cache transition:persist="page-views" class="relative">
++          <main
++            class="spa-view bg-white relative"
++            data-view-key={Astro.url.pathname + Astro.url.search}
++            data-view-cacheable={String(cacheView)}
++            tabindex="-1"
++          >
++            <slot />
++          </main>
++        </div>
+       </div>
+     </div>
+     <Footer />
+diff --git a/src/pages/signin.astro b/src/pages/signin.astro
+index 6844450..e06ec64 100644
+--- a/src/pages/signin.astro
++++ b/src/pages/signin.astro
+@@ -3,7 +3,7 @@ import Layout from '../layouts/Layout.astro';
+ import SignInForm from '../components/SignInForm';
+ ---
+ 
+-<Layout title="Sign In | The DevTools Times">
++<Layout title="Sign In | The DevTools Times" cacheView={false}>
+   <div class="py-12 px-4 sm:px-6 lg:px-8">
+     <SignInForm client:load />
+   </div>
+diff --git a/src/pages/signup.astro b/src/pages/signup.astro
+index dc93e5d..b2f5b71 100644
+--- a/src/pages/signup.astro
++++ b/src/pages/signup.astro
+@@ -3,7 +3,7 @@ import Layout from '../layouts/Layout.astro';
+ import SignUpForm from '../components/SignUpForm';
+ ---
+ 
+-<Layout title="Sign Up | The DevTools Times">
++<Layout title="Sign Up | The DevTools Times" cacheView={false}>
+   <div class="py-12 px-4 sm:px-6 lg:px-8">
+     <SignUpForm client:load />
+   </div>
+diff --git a/src/scripts/view-cache.ts b/src/scripts/view-cache.ts
+new file mode 100644
+index 0000000..cc6d6c4
+--- /dev/null
++++ b/src/scripts/view-cache.ts
+@@ -0,0 +1,79 @@
++// Astro still fetches each destination and updates its head/history normally.
++// Only the page's rendered contents are reused; the header and footer stay fresh.
++export {};
++
++const MAX_VIEWS = 5;
++const views = new Map<string, HTMLElement>();
++const initialView = document.querySelector<HTMLElement>("[data-view-key]");
++if (initialView?.dataset.viewCacheable === "true") {
++  views.set(initialView.dataset.viewKey!, initialView);
++}
++
++function setInactive(view: HTMLElement, inactive: boolean) {
++  view.classList.toggle("inactive", inactive);
++  view.inert = inactive;
++  if (inactive) view.setAttribute("aria-hidden", "true");
++  else view.removeAttribute("aria-hidden");
++}
++
++document.addEventListener("astro:before-swap", (event) => {
++  const host = document.querySelector<HTMLElement>("[data-view-cache]");
++  const incomingHost = event.newDocument.querySelector<HTMLElement>("[data-view-cache]");
++  const incoming = incomingHost?.querySelector<HTMLElement>("[data-view-key]");
++  if (!host || !incomingHost || !incoming) return;
++
++  const key = event.to.pathname + event.to.search;
++  const current = host.querySelector<HTMLElement>("[data-view-key]:not(.inactive)");
++  const cacheable = incoming.dataset.viewCacheable === "true";
++  // An explicit reload/refresh of the current URL must use the fresh response.
++  const cached = cacheable && current?.dataset.viewKey !== key ? views.get(key) : undefined;
++  const next = cached ?? incoming;
++  const swap = event.swap;
++
++  event.swap = () => {
++    // Do not mutate visible content until Astro actually commits the navigation.
++    const focused = document.activeElement;
++    if (focused instanceof HTMLElement && current?.contains(focused)) {
++      focused.blur();
++    }
++    for (const view of host.querySelectorAll<HTMLElement>("[data-view-key]")) {
++      setInactive(view, true);
++      if (
++        view.dataset.viewCacheable !== "true" ||
++        (view.dataset.viewKey === key && view !== next)
++      ) {
++        views.delete(view.dataset.viewKey!);
++        view.remove();
++      }
++    }
++
++    if (!cached) {
++      // Keep new contents outside the persist placeholder during Astro's swap.
++      // Astro can then initialise fresh islands/media before we move them in.
++      incomingHost.after(incoming);
++      incoming.dataset.viewKey = key;
++    }
++
++    // Touch the destination to maintain least-recently-used insertion order.
++    views.delete(key);
++    if (cacheable) views.set(key, next);
++    while (views.size + (cacheable ? 0 : 1) > MAX_VIEWS) {
++      const oldest = views.keys().next().value!;
++      views.get(oldest)!.remove();
++      views.delete(oldest);
++    }
++
++    swap();
++
++    if (!cached) {
++      // Use an atomic move when available to preserve freshly hydrated state.
++      const parent = host as HTMLElement & {
++        moveBefore?: (node: Node, child: Node | null) => void;
++      };
++      if (parent.moveBefore) parent.moveBefore(next, null);
++      else host.append(next);
++    }
++    setInactive(next, false);
++    next.focus({ preventScroll: true });
++  };
++});
+diff --git a/src/styles/global.css b/src/styles/global.css
+index e9a9abb..46c7740 100644
+--- a/src/styles/global.css
++++ b/src/styles/global.css
+@@ -1,7 +1,27 @@
+ @import "tailwindcss";
+ 
++/* Keep inactive DOM and rendering state without contributing to page height. */
++.spa-view.inactive {
++  content-visibility: hidden;
++  position: absolute;
++  inset: 0 0 auto;
++  block-size: 0;
++  overflow: clip;
++  margin: 0;
++  padding: 0;
++  border: 0;
++  background: none;
++  pointer-events: none;
++}
++
++@supports not (content-visibility: hidden) {
++  .spa-view.inactive {
++    display: none;
++  }
++}
++
+ .font-brand {
+   font-family: "Grenze", serif;
+   font-weight: 500;
+   font-style: normal;
+-}
+\ No newline at end of file
++}

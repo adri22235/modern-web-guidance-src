@@ -1,0 +1,277 @@
+diff --git a/index.html b/index.html
+index 66c9173..33057ae 100644
+--- a/index.html
++++ b/index.html
+@@ -152,6 +152,51 @@
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    /* Inline sign-in */
++    .signin-panel {
++      display: none;
++      background: var(--secondary);
++      padding: 12px 5%;
++    }
++
++    .signin-panel.open,
++    .signin-panel.autofill {
++      display: block;
++    }
++
++    .signin-panel form {
++      display: flex;
++      flex-wrap: wrap;
++      gap: 10px;
++      align-items: center;
++      justify-content: center;
++    }
++
++    .signin-panel input {
++      padding: 8px 10px;
++      border: 1px solid var(--primary);
++      border-radius: 4px;
++      font-size: 0.9rem;
++    }
++
++    .signin-panel .btn {
++      margin-top: 0;
++      border: 0;
++      cursor: pointer;
++      font-size: 0.9rem;
++    }
++
++    .signin-status {
++      width: 100%;
++      text-align: center;
++      font-size: 0.85rem;
++      min-height: 1.2em;
++    }
++
++    [hidden] {
++      display: none !important;
++    }
+   </style>
+ </head>
+ 
+@@ -162,16 +207,28 @@
+     <ul>
+       <li><a href="/menu">Menu</a></li>
+       <li><a href="/locations">Locations</a></li>
+-      <li><a href="/rewards">Rewards</a></li>
+-      <li><a href="/account">My Account</a></li>
+-      <li><a href="/logout" class="logout-link">Logout</a></li>
++      <li><a href="/rewards" data-requires-auth>Rewards</a></li>
++      <li><a href="/account" data-requires-auth>My Account</a></li>
++      <li><a href="/logout" class="logout-link" id="logout-link" hidden>Logout</a></li>
++      <li><a href="#signin" class="logout-link" id="signin-link">Sign In</a></li>
+     </ul>
+   </nav>
+ 
++  <div class="signin-panel" id="signin-panel">
++    <form id="signin-form" action="/api/auth/password" method="post">
++      <!-- "webauthn" token lets the browser offer saved passkeys in the autofill dropdown -->
++      <input type="text" name="username" id="username" placeholder="Email or username" autocomplete="username webauthn" aria-label="Email or username" required>
++      <input type="password" name="password" id="password" placeholder="Password" autocomplete="current-password" aria-label="Password" required>
++      <button type="submit" class="btn">Sign In</button>
++      <button type="button" class="btn" id="passkey-btn">Use a passkey</button>
++      <div class="signin-status" id="signin-status" role="status" aria-live="polite"></div>
++    </form>
++  </div>
++
+   <header class="hero">
+     <h1>Wake Up Your Senses</h1>
+     <p>Ethically sourced, locally roasted, delivered to your cup.</p>
+-    <a href="/order-online" class="btn">Order Now</a>
++    <a href="/order-online" class="btn" data-requires-auth>Order Now</a>
+   </header>
+ 
+   <main class="container">
+@@ -207,6 +264,187 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script>
++    // Inline sign-in using saved passkeys (WebAuthn) or saved passwords, without leaving the page.
++    // Assumed backend endpoints:
++    //   GET  /api/auth/session            -> { authenticated: boolean }
++    //   POST /api/auth/passkey/options    -> PublicKeyCredentialRequestOptions (base64url challenge / credential ids)
++    //   POST /api/auth/passkey/verify     -> verifies the assertion and starts a session
++    //   POST /api/auth/password           -> { username, password } starts a session
++    (function () {
++      var panel = document.getElementById('signin-panel');
++      var form = document.getElementById('signin-form');
++      var statusEl = document.getElementById('signin-status');
++      var signinLink = document.getElementById('signin-link');
++      var logoutLink = document.getElementById('logout-link');
++      var signedIn = false;
++      var conditionalAbort = null;
++
++      function b64uToBuf(str) {
++        str = str.replace(/-/g, '+').replace(/_/g, '/');
++        while (str.length % 4) str += '=';
++        var bin = atob(str), buf = new Uint8Array(bin.length);
++        for (var i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
++        return buf.buffer;
++      }
++
++      function bufToB64u(buf) {
++        var bytes = new Uint8Array(buf), bin = '';
++        for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
++        return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
++      }
++
++      function post(url, body) {
++        return fetch(url, {
++          method: 'POST',
++          credentials: 'same-origin',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify(body || {})
++        });
++      }
++
++      function setSignedIn(value) {
++        signedIn = value;
++        signinLink.hidden = value;
++        logoutLink.hidden = !value;
++        if (value) {
++          panel.classList.remove('open', 'autofill');
++          abortConditional();
++        }
++      }
++
++      function abortConditional() {
++        if (conditionalAbort) {
++          conditionalAbort.abort();
++          conditionalAbort = null;
++        }
++      }
++
++      function openPanel(message) {
++        panel.classList.add('open');
++        statusEl.textContent = message || '';
++        document.getElementById('username').focus();
++      }
++
++      async function getPasskeyAssertion(mediation, signal) {
++        var res = await post('/api/auth/passkey/options');
++        if (!res.ok) throw new Error('options');
++        var opts = await res.json();
++        opts.challenge = b64uToBuf(opts.challenge);
++        (opts.allowCredentials || []).forEach(function (c) { c.id = b64uToBuf(c.id); });
++        var cred = await navigator.credentials.get({ publicKey: opts, mediation: mediation, signal: signal });
++        if (!cred) return false;
++        var r = cred.response;
++        var verify = await post('/api/auth/passkey/verify', {
++          id: cred.id,
++          rawId: bufToB64u(cred.rawId),
++          type: cred.type,
++          response: {
++            clientDataJSON: bufToB64u(r.clientDataJSON),
++            authenticatorData: bufToB64u(r.authenticatorData),
++            signature: bufToB64u(r.signature),
++            userHandle: r.userHandle ? bufToB64u(r.userHandle) : null
++          }
++        });
++        return verify.ok;
++      }
++
++      async function getSavedPassword() {
++        if (!window.PasswordCredential) return false;
++        var cred = await navigator.credentials.get({ password: true, mediation: 'optional' });
++        if (!cred) return false;
++        var res = await post('/api/auth/password', { username: cred.id, password: cred.password });
++        return res.ok;
++      }
++
++      // Try saved passkeys first, then saved passwords. Resolves true if the user ended up signed in.
++      async function trySavedCredentials() {
++        abortConditional();
++        try {
++          if (window.PublicKeyCredential && await getPasskeyAssertion('optional')) return true;
++        } catch (e) { /* cancelled or unsupported */ }
++        try {
++          if (await getSavedPassword()) return true;
++        } catch (e) { /* cancelled or unsupported */ }
++        return false;
++      }
++
++      // Passkey suggestions in the username field's autofill dropdown.
++      async function startConditionalUI() {
++        if (!window.PublicKeyCredential || !PublicKeyCredential.isConditionalMediationAvailable) return;
++        if (!(await PublicKeyCredential.isConditionalMediationAvailable())) return;
++        panel.classList.add('autofill');
++        conditionalAbort = new AbortController();
++        try {
++          if (await getPasskeyAssertion('conditional', conditionalAbort.signal)) {
++            setSignedIn(true);
++          }
++        } catch (e) { /* aborted or dismissed */ }
++      }
++
++      // Sign-in-gated links: prompt in place, then continue to the destination.
++      document.addEventListener('click', async function (ev) {
++        var link = ev.target.closest && ev.target.closest('a[data-requires-auth]');
++        if (!link || signedIn) return;
++        ev.preventDefault();
++        var href = link.href;
++        if (await trySavedCredentials()) {
++          setSignedIn(true);
++          window.location.href = href;
++        } else {
++          openPanel('Please sign in to continue.');
++          form.dataset.next = href;
++        }
++      });
++
++      signinLink.addEventListener('click', function (ev) {
++        ev.preventDefault();
++        panel.classList.toggle('open');
++        if (panel.classList.contains('open')) openPanel();
++      });
++
++      document.getElementById('passkey-btn').addEventListener('click', async function () {
++        statusEl.textContent = '';
++        if (await trySavedCredentials()) {
++          setSignedIn(true);
++          if (form.dataset.next) window.location.href = form.dataset.next;
++        } else {
++          statusEl.textContent = 'No saved passkey was used. Enter your email and password instead.';
++          startConditionalUI();
++        }
++      });
++
++      form.addEventListener('submit', async function (ev) {
++        ev.preventDefault();
++        statusEl.textContent = 'Signing in...';
++        try {
++          var res = await post('/api/auth/password', {
++            username: form.username.value,
++            password: form.password.value
++          });
++          if (!res.ok) throw new Error('bad');
++          // Let the browser offer to save the password.
++          if (window.PasswordCredential) {
++            try { await navigator.credentials.store(new PasswordCredential(form)); } catch (e) { /* ignore */ }
++          }
++          setSignedIn(true);
++          if (form.dataset.next) window.location.href = form.dataset.next;
++        } catch (e) {
++          statusEl.textContent = 'Sign in failed. Check your details and try again.';
++        }
++      });
++
++      // Initial state: check session, then enable passkey autofill for signed-out visitors.
++      fetch('/api/auth/session', { credentials: 'same-origin' })
++        .then(function (r) { return r.ok ? r.json() : { authenticated: false }; })
++        .catch(function () { return { authenticated: false }; })
++        .then(function (data) {
++          setSignedIn(!!data.authenticated);
++          if (!data.authenticated) startConditionalUI();
++        });
++    })();
++  </script>
++
+ </body>
+ 
+ </html>

@@ -1,0 +1,465 @@
+diff --git a/index.html b/index.html
+index 66c9173..459e736 100644
+--- a/index.html
++++ b/index.html
+@@ -5,6 +5,10 @@
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <title>The Daily Grind | Artisanal Coffee</title>
++  <!-- Optional: set content to a URL to beacon interaction-to-paint metrics there. -->
++  <meta name="perf-endpoint" content="">
++  <!-- Loaded synchronously in <head> so the earliest clicks are captured. -->
++  <script src="/perf-monitor.js"></script>
+   <style>
+     :root {
+       --primary: #4e342e;
+@@ -157,7 +161,7 @@
+ 
+ <body>
+ 
+-  <nav>
++  <nav data-perf-track="nav">
+     <div class="logo">THE DAILY GRIND</div>
+     <ul>
+       <li><a href="/menu">Menu</a></li>
+@@ -171,13 +175,13 @@
+   <header class="hero">
+     <h1>Wake Up Your Senses</h1>
+     <p>Ethically sourced, locally roasted, delivered to your cup.</p>
+-    <a href="/order-online" class="btn">Order Now</a>
++    <a href="/order-online" class="btn" data-perf-track="order-now">Order Now</a>
+   </header>
+ 
+   <main class="container">
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+-      <div class="grid">
++      <div class="grid" data-perf-track="seasonal-favorites">
+         <div class="card">
+           <h3>Maple Oat Latte</h3>
+           <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+diff --git a/perf-monitor.js b/perf-monitor.js
+new file mode 100644
+index 0000000..1c0f27d
+--- /dev/null
++++ b/perf-monitor.js
+@@ -0,0 +1,419 @@
++/*
++ * Daily Grind client-side performance monitor
++ * -------------------------------------------
++ * Measures how long it takes from a user interaction until the browser has
++ * painted the resulting visual update ("interaction to next paint").
++ *
++ * Tracked interactions (configured with data-perf-track attributes in the
++ * markup):
++ *   - nav               clicks on navigation bar links
++ *   - order-now         clicks on the hero "Order Now" button
++ *   - seasonal-favorite clicks on any "Seasonal Favorites" card
++ *   - view-switch       client-side view changes (History API / hash changes)
++ *
++ * Measurement strategy
++ *   1. Event Timing API (PerformanceObserver type "event") is the primary
++ *      source. Its `duration` spans from the hardware input timestamp to the
++ *      next paint after all handlers ran, which is exactly what we want. All
++ *      entries that share an interactionId (pointerdown/pointerup/click) are
++ *      combined and the longest is reported, matching how INP is computed.
++ *   2. Event Timing only reports entries >= 16ms and isn't available in every
++ *      browser, so each tracked click also gets a requestAnimationFrame +
++ *      MessageChannel probe, which resolves right after the next frame was
++ *      produced. That value is used when no Event Timing entry shows up.
++ *   3. View switches have no single input event, so they're timed from the
++ *      moment the URL changes until the DOM stops mutating and the final
++ *      mutation has been painted.
++ *
++ * Output
++ *   - performance.measure() entries prefixed "dg:" (visible in DevTools).
++ *   - window.dailyGrindPerf.getEntries() returns everything recorded.
++ *   - A "dailygrind:perf" CustomEvent is dispatched on window per metric.
++ *   - console.debug output when ?perfdebug is in the URL or
++ *     localStorage["dg-perf-debug"] === "1".
++ *   - If <meta name="perf-endpoint" content="/your/endpoint"> exists, metrics
++ *     are batched and sent with navigator.sendBeacon (flushed when the page is
++ *     hidden/unloaded so clicks that navigate away are not lost).
++ */
++(function () {
++  'use strict';
++
++  if (typeof window === 'undefined' || !window.performance || window.dailyGrindPerf) return;
++
++  var perf = window.performance;
++  var now = function () { return perf.now(); };
++
++  // ---------------------------------------------------------------------------
++  // Config
++  // ---------------------------------------------------------------------------
++  var FALLBACK_WAIT_MS = 1000;      // how long to wait for an Event Timing entry
++  var VIEW_SETTLE_MS = 100;         // DOM must be quiet this long to finish a view switch
++  var VIEW_MAX_MS = 5000;           // hard cap on a view switch measurement
++  var MAX_STORED = 200;             // in-memory history cap
++
++  var debug = false;
++  try {
++    debug = /[?&]perfdebug\b/.test(location.search) ||
++      window.localStorage.getItem('dg-perf-debug') === '1';
++  } catch (e) { /* storage may be blocked */ }
++
++  function getEndpoint() {
++    var meta = document.querySelector('meta[name="perf-endpoint"]');
++    return meta && meta.content ? meta.content : null;
++  }
++
++  var supportsEventTiming = (function () {
++    try {
++      return typeof PerformanceObserver !== 'undefined' &&
++        PerformanceObserver.supportedEntryTypes &&
++        PerformanceObserver.supportedEntryTypes.indexOf('event') !== -1;
++    } catch (e) { return false; }
++  })();
++
++  // ---------------------------------------------------------------------------
++  // Helpers
++  // ---------------------------------------------------------------------------
++  // Resolves after the next frame has been rendered: rAF runs right before the
++  // frame is painted, and a message posted from it is delivered after that
++  // frame has been handed off for paint.
++  function afterNextPaint(cb) {
++    requestAnimationFrame(function () {
++      var ch = new MessageChannel();
++      ch.port1.onmessage = function () { cb(now()); };
++      ch.port2.postMessage(null);
++    });
++  }
++
++  function round(n) { return Math.round(n * 10) / 10; }
++
++  function textLabel(el) {
++    if (!el) return '';
++    return (el.getAttribute('data-perf-label') || el.textContent || '')
++      .replace(/\s+/g, ' ').trim().slice(0, 80);
++  }
++
++  // Figure out whether a click target belongs to a tracked region.
++  function classify(target) {
++    if (!target || !target.closest) return null;
++    var region = target.closest('[data-perf-track]');
++    if (!region) return null;
++    var kind = region.getAttribute('data-perf-track');
++
++    if (kind === 'nav') {
++      var link = target.closest('a, button');
++      return { type: 'nav', label: textLabel(link) || 'nav-bar', href: link && link.getAttribute('href') };
++    }
++    if (kind === 'order-now') {
++      return { type: 'order-now', label: textLabel(region), href: region.getAttribute('href') };
++    }
++    if (kind === 'seasonal-favorites') {
++      var card = target.closest('.card');
++      if (!card) return null;
++      var heading = card.querySelector('h3');
++      var a = target.closest('a');
++      return {
++        type: 'seasonal-favorite',
++        label: textLabel(heading) || 'card',
++        href: a ? a.getAttribute('href') : null
++      };
++    }
++    return { type: kind, label: textLabel(region) };
++  }
++
++  // ---------------------------------------------------------------------------
++  // Reporting
++  // ---------------------------------------------------------------------------
++  var stored = [];
++  var outbox = [];
++
++  function report(metric) {
++    metric.page = location.pathname;
++    metric.ts = Date.now();
++
++    stored.push(metric);
++    if (stored.length > MAX_STORED) stored.shift();
++
++    try {
++      perf.measure('dg:' + metric.type + (metric.label ? ':' + metric.label : ''), {
++        start: metric.startTime,
++        end: metric.startTime + metric.duration,
++        detail: metric
++      });
++    } catch (e) { /* older browsers lack measure options */ }
++
++    try {
++      window.dispatchEvent(new CustomEvent('dailygrind:perf', { detail: metric }));
++    } catch (e) { /* ignore */ }
++
++    if (debug) {
++      console.debug('[perf] %s "%s" painted in %sms (%s)',
++        metric.type, metric.label || '', metric.duration, metric.source, metric);
++    }
++
++    if (getEndpoint()) outbox.push(metric);
++  }
++
++  function flush() {
++    var endpoint = getEndpoint();
++    if (!endpoint || !outbox.length) return;
++    var body = JSON.stringify({ metrics: outbox.splice(0, outbox.length) });
++    var sent = false;
++    try {
++      if (navigator.sendBeacon) {
++        sent = navigator.sendBeacon(endpoint, new Blob([body], { type: 'application/json' }));
++      }
++    } catch (e) { /* fall through */ }
++    if (!sent) {
++      try {
++        fetch(endpoint, { method: 'POST', body: body, keepalive: true,
++          headers: { 'Content-Type': 'application/json' } });
++      } catch (e) { /* give up silently */ }
++    }
++  }
++
++  // ---------------------------------------------------------------------------
++  // Click interactions
++  // ---------------------------------------------------------------------------
++  // Pending clicks keyed by event timeStamp (equals PerformanceEventTiming.startTime).
++  var pending = [];
++  // Recent Event Timing entries grouped by interactionId so a click can pick up
++  // the slower pointerdown/pointerup of the same interaction.
++  var byInteraction = {};
++  var interactionOrder = [];
++  var activeClick = null; // click currently being dispatched (for view-switch attribution)
++
++  function rememberEntry(entry) {
++    var id = entry.interactionId;
++    if (!id) return;
++    if (!byInteraction[id]) {
++      byInteraction[id] = [];
++      interactionOrder.push(id);
++      if (interactionOrder.length > 50) delete byInteraction[interactionOrder.shift()];
++    }
++    byInteraction[id].push(entry);
++  }
++
++  function finalizeClick(p, data) {
++    if (p.done) return;
++    p.done = true;
++    clearTimeout(p.timer);
++    var idx = pending.indexOf(p);
++    if (idx !== -1) pending.splice(idx, 1);
++
++    var metric = {
++      type: p.info.type,
++      label: p.info.label,
++      href: p.info.href || null,
++      startTime: round(p.startTime),
++      duration: round(data.duration),
++      source: data.source
++    };
++    if (data.breakdown) metric.breakdown = data.breakdown;
++    if (data.incomplete) metric.incomplete = true;
++    report(metric);
++  }
++
++  function handleEventEntry(entry) {
++    rememberEntry(entry);
++    if (entry.name !== 'click') return;
++
++    for (var i = 0; i < pending.length; i++) {
++      var p = pending[i];
++      if (Math.abs(p.startTime - entry.startTime) < 1) {
++        // Use the slowest event of the whole interaction as the paint time.
++        var group = (entry.interactionId && byInteraction[entry.interactionId]) || [entry];
++        var worst = entry;
++        var start = entry.startTime;
++        for (var j = 0; j < group.length; j++) {
++          if (group[j].startTime < start) start = group[j].startTime;
++          if (group[j].startTime + group[j].duration > worst.startTime + worst.duration) worst = group[j];
++        }
++        var end = worst.startTime + worst.duration;
++        p.startTime = start;
++        finalizeClick(p, {
++          duration: end - start,
++          source: 'event-timing',
++          breakdown: {
++            inputDelay: round(worst.processingStart - worst.startTime),
++            processing: round(worst.processingEnd - worst.processingStart),
++            presentationDelay: round(end - worst.processingEnd)
++          }
++        });
++        return;
++      }
++    }
++  }
++
++  function onClickCapture(e) {
++    var info = classify(e.target);
++    if (!info) return;
++
++    var p = { info: info, startTime: e.timeStamp, done: false, rafEnd: null };
++    pending.push(p);
++    activeClick = p;
++    // Clear after the current dispatch completes (all handlers have run).
++    setTimeout(function () { if (activeClick === p) activeClick = null; }, 0);
++
++    afterNextPaint(function (t) {
++      p.rafEnd = t;
++      if (!supportsEventTiming) {
++        finalizeClick(p, { duration: t - p.startTime, source: 'raf' });
++      }
++    });
++
++    if (supportsEventTiming) {
++      // Entries under 16ms are never reported; fall back to the rAF probe.
++      p.timer = setTimeout(function () {
++        if (p.rafEnd != null) finalizeClick(p, { duration: p.rafEnd - p.startTime, source: 'raf' });
++      }, FALLBACK_WAIT_MS);
++    }
++  }
++
++  document.addEventListener('click', onClickCapture, true);
++
++  if (supportsEventTiming) {
++    try {
++      var eventObserver = new PerformanceObserver(function (list) {
++        list.getEntries().forEach(handleEventEntry);
++      });
++      eventObserver.observe({ type: 'event', durationThreshold: 16, buffered: true });
++    } catch (e) {
++      supportsEventTiming = false;
++    }
++  }
++
++  // ---------------------------------------------------------------------------
++  // Client-side view switches
++  // ---------------------------------------------------------------------------
++  var currentView = null;
++
++  function startViewSwitch(trigger, explicitName) {
++    // A newer switch supersedes an unfinished one.
++    if (currentView && !currentView.done) finishView(currentView, true);
++
++    var v = {
++      startTime: now(),
++      from: currentView ? currentView.to : location.pathname + location.hash,
++      to: explicitName || (location.pathname + location.hash),
++      trigger: trigger,
++      cause: activeClick ? activeClick.info.type : null,
++      lastPaint: null,
++      mutations: 0,
++      done: false,
++      settleTimer: null,
++      maxTimer: null,
++      manual: !!explicitName
++    };
++    // If the switch came from a click, measure from the input timestamp.
++    if (activeClick) v.startTime = activeClick.startTime;
++    currentView = v;
++
++    var schedulePaintProbe = function () {
++      afterNextPaint(function (t) {
++        if (v.done) return;
++        v.lastPaint = t;
++        clearTimeout(v.settleTimer);
++        if (!v.manual) v.settleTimer = setTimeout(function () { finishView(v); }, VIEW_SETTLE_MS);
++      });
++    };
++
++    v.observer = new MutationObserver(function (records) {
++      v.mutations += records.length;
++      schedulePaintProbe();
++    });
++    v.observer.observe(document.body || document.documentElement, {
++      childList: true, subtree: true, attributes: true, characterData: true
++    });
++
++    schedulePaintProbe(); // covers switches that only change state/styles
++    v.maxTimer = setTimeout(function () { finishView(v, true); }, VIEW_MAX_MS);
++    return v;
++  }
++
++  function finishView(v, incomplete) {
++    if (v.done) return;
++    v.done = true;
++    clearTimeout(v.settleTimer);
++    clearTimeout(v.maxTimer);
++    if (v.observer) v.observer.disconnect();
++
++    var end = v.lastPaint != null ? v.lastPaint : now();
++    var metric = {
++      type: 'view-switch',
++      label: v.to,
++      from: v.from,
++      trigger: v.trigger,
++      cause: v.cause,
++      mutations: v.mutations,
++      startTime: round(v.startTime),
++      duration: round(end - v.startTime),
++      source: 'mutation-paint'
++    };
++    if (incomplete) metric.incomplete = true;
++    report(metric);
++  }
++
++  ['pushState', 'replaceState'].forEach(function (method) {
++    var original = history[method];
++    if (typeof original !== 'function') return;
++    history[method] = function () {
++      var before = location.href;
++      var result = original.apply(this, arguments);
++      if (location.href !== before) startViewSwitch(method);
++      return result;
++    };
++  });
++
++  window.addEventListener('popstate', function () { startViewSwitch('popstate'); });
++  window.addEventListener('hashchange', function (e) {
++    // pushState doesn't fire hashchange, so this only covers anchor/hash nav.
++    if (!currentView || currentView.done || currentView.to !== location.pathname + location.hash) {
++      startViewSwitch('hashchange');
++    }
++  });
++
++  // ---------------------------------------------------------------------------
++  // Page lifecycle: make sure nothing is lost when the page goes away
++  // ---------------------------------------------------------------------------
++  function drain() {
++    if (supportsEventTiming && eventObserver) {
++      try { eventObserver.takeRecords().forEach(handleEventEntry); } catch (e) { /* ignore */ }
++    }
++    pending.slice().forEach(function (p) {
++      if (p.rafEnd != null) {
++        finalizeClick(p, { duration: p.rafEnd - p.startTime, source: 'raf' });
++      } else {
++        finalizeClick(p, { duration: now() - p.startTime, source: 'unload', incomplete: true });
++      }
++    });
++    if (currentView && !currentView.done) finishView(currentView, true);
++    flush();
++  }
++
++  document.addEventListener('visibilitychange', function () {
++    if (document.visibilityState === 'hidden') drain();
++  });
++  window.addEventListener('pagehide', drain);
++
++  // ---------------------------------------------------------------------------
++  // Public API
++  // ---------------------------------------------------------------------------
++  window.dailyGrindPerf = {
++    /** All metrics recorded on this page so far. */
++    getEntries: function () { return stored.slice(); },
++    /**
++     * Manually time a view switch (for renderers that don't touch the URL).
++     * Returns a function to call once the new view's DOM is in place; the
++     * metric is reported after that update has been painted.
++     */
++    startViewSwitch: function (name) {
++      var v = startViewSwitch('manual', name || 'view');
++      return function done() {
++        afterNextPaint(function (t) { v.lastPaint = t; finishView(v); });
++      };
++    },
++    /** Force-send any queued metrics to the configured endpoint. */
++    flush: flush,
++    setDebug: function (on) { debug = !!on; }
++  };
++})();

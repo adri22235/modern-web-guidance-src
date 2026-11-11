@@ -1,0 +1,215 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -3,9 +3,20 @@
+ 
+ <head>
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <meta name="referrer" content="strict-origin-when-cross-origin">
+   <title>The Daily Grind | Artisanal Coffee</title>
++  <script type="importmap">
++    {
++      "imports": {
++        "webauthn-polyfills": "https://esm.sh/webauthn-polyfills@0.1.7"
++      },
++      "integrity": {
++        "https://esm.sh/webauthn-polyfills@0.1.7": "sha384-Ma90k5us5yzP8DjA6/u0pRO9XxXAXGkdW1t0gJRcqgr8UrLgL3BsWESlZNB4vbWK"
++      }
++    }
++  </script>
+   <style>
+     :root {
+       --primary: #4e342e;
+       --secondary: #d7ccc8;
+@@ -128,14 +139,42 @@
+       text-decoration: none;
+       border-radius: 5px;
+       margin-top: 15px;
+       transition: background 0.3s;
++      border: none;
++      font: inherit;
++      cursor: pointer;
+     }
+ 
+-    .btn:hover {
++    .btn:hover:not(:disabled) {
+       background: #3e2723;
+     }
+ 
++    .btn:disabled {
++      opacity: 0.5;
++      cursor: not-allowed;
++    }
++
++    .passkey-promo {
++      background: white;
++      padding: 24px;
++      border-radius: 8px;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++      text-align: center;
++      margin-bottom: 40px;
++      border-left: 4px solid var(--accent);
++    }
++
++    .passkey-promo h2 {
++      color: var(--primary);
++      margin-bottom: 8px;
++    }
++
++    .passkey-status {
++      margin-top: 12px;
++      font-size: 0.9rem;
++    }
++
+     footer {
+       background: var(--secondary);
+       text-align: center;
+       padding: 40px 20px;
+@@ -174,8 +213,15 @@
+     <a href="/order-online" class="btn">Order Now</a>
+   </header>
+ 
+   <main class="container">
++    <section class="passkey-promo" aria-labelledby="passkey-heading">
++      <h2 id="passkey-heading">Faster, Safer Sign-In</h2>
++      <p>Skip the password next time and sign in instantly with a passkey.</p>
++      <button type="button" class="btn" data-testid="register-button">Create passkey</button>
++      <p id="passkey-status" class="passkey-status" role="status" aria-live="polite"></p>
++    </section>
++
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+       <div class="grid">
+         <div class="card">
+@@ -206,7 +252,130 @@
+     </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script type="module">
++    try {
++      await import('webauthn-polyfills');
++    } catch {
++      // Proceed with native WebAuthn APIs if CDN is unreachable
++    }
++
++    const registerButton = document.querySelector('[data-testid="register-button"]');
++    const statusEl = document.getElementById('passkey-status');
++
++    function setStatus(message) {
++      if (statusEl) {
++        statusEl.textContent = message;
++      }
++    }
++
++    async function checkPasskeySupport() {
++      if (
++        !window.PublicKeyCredential ||
++        typeof PublicKeyCredential.getClientCapabilities !== 'function'
++      ) {
++        registerButton.disabled = true;
++        return false;
++      }
++
++      try {
++        const capabilities = await PublicKeyCredential.getClientCapabilities();
++        if (
++          !capabilities.passkeyPlatformAuthenticator ||
++          !capabilities.conditionalGet
++        ) {
++          registerButton.disabled = true;
++          return false;
++        }
++        return true;
++      } catch {
++        registerButton.disabled = true;
++        return false;
++      }
++    }
++
++    async function registerPasskey() {
++      const supported = await checkPasskeySupport();
++      if (!supported) {
++        return;
++      }
++
++      setStatus('');
++
++      const optionsResponse = await fetch('/api/register/options', {
++        method: 'POST',
++        headers: {
++          'Content-Type': 'application/json',
++        },
++        body: JSON.stringify({ promotion: true }),
++      });
++
++      const creationOptionsJSON = await optionsResponse.json();
++      const publicKey =
++        PublicKeyCredential.parseCreationOptionsFromJSON(creationOptionsJSON);
++
++      let credential;
++      try {
++        credential = await navigator.credentials.create({ publicKey });
++      } catch (err) {
++        if (err.name === 'InvalidStateError') {
++          console.log('A passkey already exists for this account.');
++          setStatus('A passkey already exists for this account.');
++        } else if (err.name === 'SecurityError') {
++          console.error('Configuration RP ID or Secure Context error.');
++          setStatus('Configuration RP ID or Secure Context error.');
++        } else if (err.name === 'NotAllowedError') {
++          console.log('User cancelled the passkey dialog.');
++          setStatus('Passkey creation was cancelled.');
++        } else if (err.name === 'AbortError') {
++          console.log('The creation operation has been aborted.');
++        }
++        return;
++      }
++
++      if (!credential) {
++        return;
++      }
++
++      const encodedResponse = credential.toJSON();
++      try {
++        const response = await fetch('/api/register/verify', {
++          method: 'POST',
++          headers: {
++            'Content-Type': 'application/json',
++          },
++          body: JSON.stringify(encodedResponse),
++        });
++        if (!response.ok) {
++          setStatus('Failed to verify passkey registration.');
++          if (PublicKeyCredential.signalUnknownCredential) {
++            await PublicKeyCredential.signalUnknownCredential({
++              rpId: publicKey.rp.id,
++              credentialId: encodedResponse.id,
++            });
++          }
++        } else {
++          setStatus('Passkey created successfully.');
++        }
++      } catch (serverErr) {
++        console.error('Server verification network failure:', serverErr);
++        setStatus('Network error while verifying passkey.');
++        if (PublicKeyCredential.signalUnknownCredential) {
++          await PublicKeyCredential.signalUnknownCredential({
++            rpId: publicKey.rp.id,
++            credentialId: encodedResponse.id,
++          });
++        }
++      }
++    }
++
++    if (registerButton) {
++      checkPasskeySupport();
++      registerButton.addEventListener('click', () => {
++        registerPasskey();
++      });
++    }
++  </script>
+ </body>
+ 
+ </html>

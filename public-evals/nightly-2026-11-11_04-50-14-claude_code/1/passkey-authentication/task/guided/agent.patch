@@ -1,0 +1,279 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -151,9 +151,94 @@
+       color: var(--text);
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    /* Passkey sign-in */
++    .signin {
++      max-width: 420px;
++      margin: 40px auto 0;
++      padding: 24px;
++      background: white;
++      border-radius: 8px;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++    }
++
++    .signin h2 {
++      color: var(--primary);
++      margin-bottom: 4px;
++    }
++
++    .signin p {
++      font-size: 0.9rem;
++      margin-bottom: 16px;
++    }
++
++    .signin label {
++      display: block;
++      font-weight: 600;
++      margin-bottom: 6px;
++    }
++
++    .signin input {
++      width: 100%;
++      padding: 10px 12px;
++      font: inherit;
++      border: 1px solid #bcaaa4;
++      border-radius: 5px;
++    }
++
++    .signin input:focus-visible {
++      outline: 2px solid var(--accent);
++      outline-offset: 1px;
++    }
++
++    .signin button {
++      width: 100%;
++      margin-top: 14px;
++      padding: 10px 20px;
++      font: inherit;
++      color: white;
++      background: var(--primary);
++      border: 0;
++      border-radius: 5px;
++      cursor: pointer;
++    }
++
++    .signin button:hover {
++      background: #3e2723;
++    }
++
++    .signin button:disabled {
++      opacity: 0.6;
++      cursor: progress;
++    }
++
++    .auth-status {
++      margin-top: 12px;
++      font-size: 0.9rem;
++      min-height: 1.4em;
++    }
++
++    .auth-status[data-state="success"] {
++      color: #2e7d32;
++      font-weight: 600;
++    }
++
++    .auth-status[data-state="error"] {
++      color: #c62828;
++    }
+   </style>
++  <script type="importmap">
++    {
++      "imports": {
++        "webauthn-polyfills": "https://esm.sh/webauthn-polyfills@0.1.7/es2022/webauthn-polyfills.bundle.mjs"
++      },
++      "integrity": {
++        "https://esm.sh/webauthn-polyfills@0.1.7/es2022/webauthn-polyfills.bundle.mjs": "sha384-EBLK1vCYl7ILfHGSetlZN/n8TaV5nbYKx9JrMwcJvy5NTITz1Q9HDYqCG4NxzuR0"
++      }
++    }
++  </script>
+ </head>
+ 
+ <body>
+ 
+@@ -174,8 +259,19 @@
+     <a href="/order-online" class="btn">Order Now</a>
+   </header>
+ 
+   <main class="container">
++    <section class="signin" aria-labelledby="signin-heading">
++      <h2 id="signin-heading">Sign in to Rewards</h2>
++      <p id="signin-hint">Choose a saved passkey from the username field, or use the button to sign in with your fingerprint, face, or screen lock.</p>
++      <form id="signin-form" novalidate>
++        <label for="username">Username</label>
++        <input id="username" type="text" name="username" autocomplete="username webauthn"
++          autocapitalize="none" spellcheck="false" aria-describedby="signin-hint" data-testid="username-field">
++        <button type="button" id="auth-button" data-testid="auth-button">Sign in with passkey</button>
++      </form>
++      <p class="auth-status" id="auth-status" data-testid="auth-status" role="status" aria-live="polite"></p>
++    </section>
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+       <div class="grid">
+         <div class="card">
+@@ -206,7 +302,160 @@
+     </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script type="module">
++    // Polyfills parseRequestOptionsFromJSON / toJSON / getClientCapabilities where missing.
++    try {
++      await import('webauthn-polyfills');
++    } catch (err) {
++      console.warn('WebAuthn polyfills failed to load:', err);
++    }
++
++    const usernameField = document.querySelector('[data-testid="username-field"]');
++    const authButton = document.querySelector('[data-testid="auth-button"]');
++    const authStatus = document.querySelector('[data-testid="auth-status"]');
++    const form = document.getElementById('signin-form');
++
++    let autofillAbortController = new AbortController();
++    let authenticated = false;
++
++    function setStatus(message, state = '') {
++      authStatus.textContent = message;
++      if (state) authStatus.dataset.state = state;
++      else authStatus.removeAttribute('data-state');
++    }
++
++    async function fetchLoginOptions() {
++      const res = await fetch('/api/login/options', {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
++        credentials: 'same-origin',
++        body: '{}',
++      });
++      if (!res.ok) throw new Error(`Failed to fetch login options (${res.status})`);
++      const json = await res.json();
++      // Accept either the bare options object or one wrapped as { publicKey: {...} }.
++      return PublicKeyCredential.parseRequestOptionsFromJSON(json.publicKey ?? json);
++    }
++
++    async function verifyCredential(credential, publicKey) {
++      const encoded = credential.toJSON();
++      let res;
++      try {
++        res = await fetch('/api/login/verify', {
++          method: 'POST',
++          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
++          credentials: 'same-origin',
++          body: JSON.stringify(encoded),
++        });
++      } catch (err) {
++        console.error('Verification request error:', err);
++        setStatus('Could not reach the server. Please try again.', 'error');
++        return;
++      }
++
++      if (res.ok) {
++        let data = {};
++        try { data = await res.json(); } catch { /* empty body is fine */ }
++        const name = data.username ?? data.user?.username ?? data.user?.name ?? data.name;
++        authenticated = true;
++        autofillAbortController.abort();
++        setStatus(name ? `Signed in as ${name}` : 'Signed in successfully', 'success');
++        return;
++      }
++
++      if (res.status === 404) {
++        // Credential unknown to the server: let the passkey provider hide it (pre-auth path).
++        if (PublicKeyCredential.signalUnknownCredential && publicKey.rpId) {
++          try {
++            await PublicKeyCredential.signalUnknownCredential({
++              rpId: publicKey.rpId,
++              credentialId: encoded.id,
++            });
++          } catch (err) {
++            console.warn('signalUnknownCredential failed:', err);
++          }
++        }
++        setStatus('This passkey is no longer registered. Please choose another.', 'error');
++        return;
++      }
++
++      setStatus('Sign-in failed. Please try again.', 'error');
++    }
++
++    async function initializeConditionalAutofill() {
++      if (authenticated || !window.PublicKeyCredential?.getClientCapabilities) return;
++      let capabilities;
++      try {
++        capabilities = await PublicKeyCredential.getClientCapabilities();
++      } catch {
++        return;
++      }
++      if (capabilities.conditionalGet !== true) return;
++
++      try {
++        const publicKey = await fetchLoginOptions();
++        const credential = await navigator.credentials.get({
++          publicKey,
++          signal: autofillAbortController.signal,
++          mediation: 'conditional',
++        });
++        if (credential) await verifyCredential(credential, publicKey);
++      } catch (err) {
++        if (err.name === 'NotAllowedError' || err.name === 'AbortError') return;
++        console.error('Unexpected conditional get error:', err);
++      }
++    }
++
++    async function triggerButtonAuthentication() {
++      if (!window.PublicKeyCredential) {
++        setStatus('Passkeys are not supported in this browser.', 'error');
++        return;
++      }
++
++      // Abort any pending conditional request so the explicit prompt can open.
++      autofillAbortController.abort();
++      autofillAbortController = new AbortController();
++
++      authButton.disabled = true;
++      setStatus('Waiting for your passkey…');
++
++      let publicKey;
++      let credential;
++      try {
++        publicKey = await fetchLoginOptions();
++        credential = await navigator.credentials.get({
++          publicKey,
++          signal: autofillAbortController.signal,
++        });
++      } catch (err) {
++        authButton.disabled = false;
++        if (err.name === 'NotAllowedError') {
++          setStatus('Passkey sign-in was cancelled.');
++        } else if (err.name === 'AbortError') {
++          setStatus('');
++        } else {
++          console.error('Passkey sign-in error:', err);
++          setStatus('Something went wrong. Please try again.', 'error');
++        }
++        initializeConditionalAutofill(); // Re-arm autofill suggestions.
++        return;
++      }
++
++      await verifyCredential(credential, publicKey);
++      authButton.disabled = false;
++      if (!authenticated) initializeConditionalAutofill();
++    }
++
++    authButton.addEventListener('click', triggerButtonAuthentication);
++    form.addEventListener('submit', (event) => {
++      event.preventDefault();
++      triggerButtonAuthentication();
++    });
++
++    initializeConditionalAutofill();
++  </script>
++
+ </body>
+ 
+ </html>

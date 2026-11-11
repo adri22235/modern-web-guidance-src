@@ -1,0 +1,187 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -151,8 +151,30 @@
+       color: var(--text);
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++    /* Promotion countdown */
++    .promo-timer {
++      margin-top: 12px;
++      padding: 10px 12px;
++      background: #fff3e0;
++      border: 1px solid var(--accent);
++      border-radius: 6px;
++      font-size: 0.9rem;
++    }
++
++    .promo-timer p + p {
++      margin-top: 4px;
++    }
++
++    .promo-timer strong {
++      color: var(--primary);
++    }
++
++    .promo-timer[data-state="ended"] {
++      background: #efebe9;
++      border-color: var(--secondary);
++    }
+   </style>
+ </head>
+ 
+ <body>
+@@ -180,8 +202,21 @@
+       <div class="grid">
+         <div class="card">
+           <h3>Maple Oat Latte</h3>
+           <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
++          <!--
++            Promotion window, interpreted in the visitor's local time zone.
++            Dates are plain calendar dates (YYYY-MM-DD); each boundary is the
++            midnight that begins that day. Edit these to change the promotion.
++          -->
++          <div class="promo-timer" id="maple-promo"
++               data-promo-start="2025-11-01"
++               data-promo-end="2026-03-01">
++            <p class="promo-remaining" aria-live="polite">
++              Offer ends <time datetime="2026-03-01">March 1, 2026</time> at midnight.
++            </p>
++            <p class="promo-elapsed"></p>
++          </div>
+           <a href="/menu/seasonal" class="btn">View Details</a>
+         </div>
+         <div class="card">
+           <h3>Dark Roast Espresso</h3>
+@@ -206,7 +241,130 @@
+     </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script>
++    (function () {
++      'use strict';
++
++      var HOUR_MS = 60 * 60 * 1000;
++
++      function parseDate(iso) {
++        var parts = iso.split('-').map(Number);
++        return { year: parts[0], month: parts[1], day: parts[2] };
++      }
++
++      function plural(n, word) {
++        return n + ' ' + word + (n === 1 ? '' : 's');
++      }
++
++      function formatSpan(span) {
++        return plural(span.days, 'day') + ' and ' + plural(span.hours, 'hour');
++      }
++
++      // Each "clock" below exposes span(from, to) -> { days, hours }: whole
++      // local calendar days plus leftover whole hours, so DST transitions
++      // don't skew the result.
++
++      // Preferred: the Temporal API (Chrome 144+, Firefox 139+). It does
++      // time-zone- and DST-aware calendar arithmetic natively.
++      function makeTemporalClock(T) {
++        var tz = T.Now.timeZoneId();
++        function midnight(d) {
++          // startOfDay() handles zones where midnight is skipped by DST.
++          return T.PlainDate.from(d).toZonedDateTime({ timeZone: tz }).startOfDay();
++        }
++        function span(from, to) {
++          var dur = from.until(to, { largestUnit: 'day', smallestUnit: 'hour', roundingMode: 'trunc' });
++          return { days: dur.days, hours: dur.hours };
++        }
++        return {
++          now: function () { return T.Now.zonedDateTimeISO(tz); },
++          midnight: midnight,
++          compare: function (a, b) { return T.ZonedDateTime.compare(a, b); },
++          span: span,
++          label: function (zdt) {
++            return zdt.toLocaleString(undefined, { dateStyle: 'long', timeStyle: 'short' });
++          }
++        };
++      }
++
++      // Fallback for browsers without Temporal: legacy Date, which already
++      // uses the local time zone for its component constructors/getters.
++      function makeDateClock() {
++        function midnight(d) {
++          return new Date(d.year, d.month - 1, d.day, 0, 0, 0, 0);
++        }
++        function addDays(date, n) {
++          var r = new Date(date.getTime());
++          r.setDate(r.getDate() + n); // calendar-aware, keeps local wall time
++          return r;
++        }
++        function span(from, to) {
++          // Estimate, then correct for DST-length days.
++          var days = Math.floor((to - from) / (24 * HOUR_MS));
++          while (days > 0 && addDays(from, days) > to) days--;
++          while (addDays(from, days + 1) <= to) days++;
++          var hours = Math.floor((to - addDays(from, days)) / HOUR_MS);
++          return { days: days, hours: hours };
++        }
++        return {
++          now: function () { return new Date(); },
++          midnight: midnight,
++          compare: function (a, b) { return a - b; },
++          span: span,
++          label: function (date) {
++            return date.toLocaleString(undefined, { dateStyle: 'long', timeStyle: 'short' });
++          }
++        };
++      }
++
++      function getClock() {
++        if (typeof Temporal !== 'undefined' && Temporal.Now &&
++            typeof Temporal.Now.zonedDateTimeISO === 'function') {
++          try { return makeTemporalClock(Temporal); } catch (e) { /* fall through */ }
++        }
++        return makeDateClock();
++      }
++
++      function render() {
++        var el = document.getElementById('maple-promo');
++        if (!el) return;
++
++        var clock = getClock();
++        var start = clock.midnight(parseDate(el.dataset.promoStart));
++        var end = clock.midnight(parseDate(el.dataset.promoEnd));
++        var now = clock.now();
++
++        var remainingEl = el.querySelector('.promo-remaining');
++        var elapsedEl = el.querySelector('.promo-elapsed');
++        var endLabel = clock.label(end);
++        var startLabel = clock.label(start);
++
++        if (clock.compare(now, start) < 0) {
++          el.dataset.state = 'upcoming';
++          remainingEl.innerHTML = 'Starts in <strong>' + formatSpan(clock.span(now, start)) +
++            '</strong> (' + startLabel + ').';
++          elapsedEl.textContent = 'Available until ' + endLabel + '.';
++        } else if (clock.compare(now, end) < 0) {
++          el.dataset.state = 'active';
++          remainingEl.innerHTML = '<strong>' + formatSpan(clock.span(now, end)) +
++            '</strong> left &mdash; offer ends ' + endLabel + '.';
++          elapsedEl.textContent = 'Running for ' + formatSpan(clock.span(start, now)) +
++            ' since ' + startLabel + '.';
++        } else {
++          el.dataset.state = 'ended';
++          remainingEl.innerHTML = '<strong>This offer has ended</strong> (' + endLabel + ').';
++          elapsedEl.textContent = formatSpan(clock.span(start, now)) +
++            ' since the promotion began on ' + startLabel + '.';
++        }
++      }
++
++      // pageshow fires on the initial load and when the page is restored
++      // from the back/forward cache, so the numbers are never stale.
++      window.addEventListener('pageshow', render);
++    })();
++  </script>
++
+ </body>
+ 
+ </html>

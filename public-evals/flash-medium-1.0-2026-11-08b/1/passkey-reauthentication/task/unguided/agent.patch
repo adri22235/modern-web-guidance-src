@@ -1,0 +1,359 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -162,9 +162,9 @@
+     <ul>
+       <li><a href="/menu">Menu</a></li>
+       <li><a href="/locations">Locations</a></li>
+       <li><a href="/rewards">Rewards</a></li>
+-      <li><a href="/account">My Account</a></li>
++      <li><a href="#account-security">My Account</a></li>
+       <li><a href="/logout" class="logout-link">Logout</a></li>
+     </ul>
+   </nav>
+ 
+@@ -194,10 +194,344 @@
+           <a href="/menu/cold-brew" class="btn">View Details</a>
+         </div>
+       </div>
+     </section>
++
++    <!-- Account Security & Sensitive Changes Section -->
++    <section id="account-security" style="margin-top: 50px;">
++      <h2 style="text-align: center; margin-bottom: 20px;">Account Security</h2>
++      <div class="card" style="max-width: 650px; margin: 0 auto; text-align: left; padding: 25px;">
++        <h3 style="margin-bottom: 10px; color: var(--primary);">Sensitive Account Management</h3>
++        <p style="margin-bottom: 15px; color: #555;">
++          To protect against phishing and unauthorized account changes, identity re-confirmation via a phishing-resistant passkey or security key is required before updating sensitive account settings.
++        </p>
++
++        <div style="margin-bottom: 20px;">
++          <button
++            type="button"
++            id="reauth-button"
++            data-testid="reauth-button"
++            class="btn"
++            style="cursor: pointer; border: none; font-size: 1rem; padding: 12px 24px;"
++          >
++            Re-confirm Identity
++          </button>
++        </div>
++
++        <div
++          id="reauth-status"
++          role="status"
++          aria-live="polite"
++          style="margin-bottom: 20px; font-weight: 500; font-size: 0.95rem; display: none; padding: 10px 14px; border-radius: 4px;"
++        ></div>
++
++        <div id="sensitive-settings-panel" style="border-top: 1px solid var(--secondary); padding-top: 20px;">
++          <h4 style="margin-bottom: 12px; color: var(--primary); font-size: 1.1rem;">Sensitive Account Details</h4>
++          <p id="settings-locked-msg" style="margin-bottom: 15px; font-size: 0.85rem; color: #777;">
++            Locked. Re-confirm identity above to enable edits.
++          </p>
++
++          <form id="sensitive-action-form" onsubmit="event.preventDefault();">
++            <div style="margin-bottom: 15px;">
++              <label for="sensitive-email" style="display: block; margin-bottom: 6px; font-weight: 600; font-size: 0.9rem;">
++                Email Address
++              </label>
++              <input
++                type="email"
++                id="sensitive-email"
++                value="customer@dailygrind.example"
++                disabled
++                style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; background: #eee;"
++              />
++            </div>
++
++            <div style="margin-bottom: 20px;">
++              <label for="sensitive-billing" style="display: block; margin-bottom: 6px; font-weight: 600; font-size: 0.9rem;">
++                Billing & Payout Method
++              </label>
++              <input
++                type="text"
++                id="sensitive-billing"
++                value="•••• •••• •••• 4242"
++                disabled
++                style="width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; background: #eee;"
++              />
++            </div>
++
++            <button
++              type="submit"
++              id="save-sensitive-btn"
++              class="btn"
++              disabled
++              style="opacity: 0.5; cursor: not-allowed; border: none; padding: 10px 20px;"
++            >
++              Save Changes
++            </button>
++          </form>
++        </div>
++      </div>
++    </section>
+   </main>
+ 
++  <script>
++    // Utility functions for WebAuthn Buffer/Base64URL conversions
++    function stringToBuffer(str) {
++      try {
++        let base64 = str.replace(/-/g, '+').replace(/_/g, '/');
++        while (base64.length % 4 !== 0) {
++          base64 += '=';
++        }
++        const binary = atob(base64);
++        const bytes = new Uint8Array(binary.length);
++        for (let i = 0; i < binary.length; i++) {
++          bytes[i] = binary.charCodeAt(i);
++        }
++        return bytes.buffer;
++      } catch (e) {
++        return new TextEncoder().encode(str).buffer;
++      }
++    }
++
++    function toBuffer(val) {
++      if (!val) return val;
++      if (val instanceof ArrayBuffer) return val;
++      if (ArrayBuffer.isView(val)) return val.buffer.slice(val.byteOffset, val.byteOffset + val.byteLength);
++      if (Array.isArray(val)) return new Uint8Array(val).buffer;
++      if (typeof val === 'string') return stringToBuffer(val);
++      return val;
++    }
++
++    function bufferToBase64url(buffer) {
++      if (!buffer) return null;
++      const bytes = new Uint8Array(buffer);
++      let binary = '';
++      for (let i = 0; i < bytes.byteLength; i++) {
++        binary += String.fromCharCode(bytes[i]);
++      }
++      return btoa(binary)
++        .replace(/\+/g, '-')
++        .replace(/\//g, '_')
++        .replace(/=+$/, '');
++    }
++
++    function preparePublicKeyOptions(opts) {
++      let options = opts;
++      if (options && options.publicKey) {
++        options = options.publicKey;
++      }
++      if (options && options.options) {
++        options = options.options;
++      }
++      if (options && options.publicKey) {
++        options = options.publicKey;
++      }
++
++      if (typeof PublicKeyCredential !== 'undefined' && typeof PublicKeyCredential.parseRequestOptionsFromJSON === 'function') {
++        try {
++          return PublicKeyCredential.parseRequestOptionsFromJSON(options);
++        } catch (e) {
++          console.warn('parseRequestOptionsFromJSON failed, falling back to manual parsing:', e);
++        }
++      }
++
++      const parsed = Object.assign({}, options);
++      if (parsed.challenge) {
++        parsed.challenge = toBuffer(parsed.challenge);
++      }
++      if (Array.isArray(parsed.allowCredentials)) {
++        parsed.allowCredentials = parsed.allowCredentials.map(function(cred) {
++          const copy = Object.assign({}, cred);
++          if (copy.id) {
++            copy.id = toBuffer(copy.id);
++          }
++          return copy;
++        });
++      }
++      return parsed;
++    }
++
++    function serializeAssertionCredential(credential) {
++      let json = null;
++      if (typeof credential.toJSON === 'function') {
++        try {
++          json = credential.toJSON();
++        } catch (e) {
++          console.warn('credential.toJSON() error:', e);
++        }
++      }
++
++      const id = (json && json.id) || credential.id || '';
++      const rawId = (json && json.rawId) || (credential.rawId ? bufferToBase64url(credential.rawId) : id);
++      const type = (json && json.type) || credential.type || 'public-key';
++
++      const responseObj = (json && json.response) || {};
++      const clientDataJSON = responseObj.clientDataJSON || (credential.response && credential.response.clientDataJSON ? bufferToBase64url(credential.response.clientDataJSON) : '');
++      const authenticatorData = responseObj.authenticatorData || (credential.response && credential.response.authenticatorData ? bufferToBase64url(credential.response.authenticatorData) : '');
++      const signature = responseObj.signature || (credential.response && credential.response.signature ? bufferToBase64url(credential.response.signature) : '');
++      const userHandle = responseObj.userHandle !== undefined ? responseObj.userHandle : (credential.response && credential.response.userHandle && credential.response.userHandle.byteLength > 0 ? bufferToBase64url(credential.response.userHandle) : null);
++
++      const clientExtensionResults = (json && json.clientExtensionResults) || (typeof credential.getClientExtensionResults === 'function' ? credential.getClientExtensionResults() : {});
++      const authenticatorAttachment = (json && json.authenticatorAttachment) || credential.authenticatorAttachment;
++
++      const result = {
++        id: id,
++        rawId: rawId,
++        type: type,
++        response: {
++          clientDataJSON: clientDataJSON,
++          authenticatorData: authenticatorData,
++          signature: signature,
++          userHandle: userHandle,
++        },
++        clientExtensionResults: clientExtensionResults,
++      };
++
++      if (authenticatorAttachment) {
++        result.authenticatorAttachment = authenticatorAttachment;
++      }
++
++      return result;
++    }
++
++    let isAuthenticating = false;
++
++    async function handleReauth(event) {
++      if (event && event.preventDefault) {
++        event.preventDefault();
++      }
++      if (isAuthenticating) {
++        return;
++      }
++
++      const reauthButton = document.querySelector('[data-testid="reauth-button"]');
++      const statusEl = document.getElementById('reauth-status');
++      const sensitiveForm = document.getElementById('sensitive-action-form');
++      const settingsMsg = document.getElementById('settings-locked-msg');
++      const sensitiveInputs = sensitiveForm ? sensitiveForm.querySelectorAll('input, select, textarea, button') : [];
++
++      if (statusEl) {
++        statusEl.style.display = 'block';
++        statusEl.style.background = '#e3f2fd';
++        statusEl.style.color = '#0d47a1';
++        statusEl.textContent = 'Requesting server authentication challenge...';
++      }
++
++      isAuthenticating = true;
++      if (reauthButton) {
++        reauthButton.disabled = true;
++      }
++
++      try {
++        // 1. Fetch challenge from POST /api/reauth/options scoped to pre-registered credentials
++        const optionsRes = await fetch('/api/reauth/options', {
++          method: 'POST',
++          headers: {
++            'Content-Type': 'application/json',
++            'Accept': 'application/json',
++          },
++          body: JSON.stringify({}),
++        });
++
++        if (!optionsRes.ok) {
++          throw new Error('Failed to fetch reauth options (' + optionsRes.status + ' ' + optionsRes.statusText + ')');
++        }
++
++        const optionsData = await optionsRes.json();
++
++        if (statusEl) {
++          statusEl.textContent = 'Awaiting passkey confirmation...';
++        }
++
++        // 2. Complete verification ceremony in browser using WebAuthn
++        const publicKeyOptions = preparePublicKeyOptions(optionsData);
++
++        if (!navigator.credentials || !navigator.credentials.get) {
++          throw new Error('WebAuthn authentication is not supported in this browser.');
++        }
++
++        const assertion = await navigator.credentials.get({
++          publicKey: publicKeyOptions,
++        });
++
++        if (!assertion) {
++          throw new Error('Authentication ceremony was cancelled or returned no credentials.');
++        }
++
++        if (statusEl) {
++          statusEl.textContent = 'Submitting verification response to server...';
++        }
++
++        // 3. Submit ceremony result to POST /api/reauth/verify
++        const serialized = serializeAssertionCredential(assertion);
++
++        const verifyRes = await fetch('/api/reauth/verify', {
++          method: 'POST',
++          headers: {
++            'Content-Type': 'application/json',
++            'Accept': 'application/json',
++          },
++          body: JSON.stringify(serialized),
++        });
++
++        if (!verifyRes.ok) {
++          const errText = await verifyRes.text().catch(function() { return ''; });
++          throw new Error('Verification failed (' + verifyRes.status + '): ' + errText);
++        }
++
++        await verifyRes.json().catch(function() { return {}; });
++
++        // Update UI on successful verification
++        if (statusEl) {
++          statusEl.style.background = '#e8f5e9';
++          statusEl.style.color = '#2e7d32';
++          statusEl.textContent = 'Identity confirmed successfully! Sensitive account changes are unlocked.';
++        }
++
++        if (reauthButton) {
++          reauthButton.textContent = 'Identity Confirmed ✓';
++        }
++
++        if (settingsMsg) {
++          settingsMsg.textContent = 'Unlocked. You may now modify sensitive account settings.';
++          settingsMsg.style.color = '#2e7d32';
++        }
++
++        sensitiveInputs.forEach(function(input) {
++          input.disabled = false;
++          input.style.background = '#fff';
++          input.style.opacity = '1';
++          input.style.cursor = 'default';
++        });
++
++      } catch (err) {
++        console.error('Re-authentication ceremony failed:', err);
++        if (statusEl) {
++          statusEl.style.background = '#ffebee';
++          statusEl.style.color = '#c62828';
++          statusEl.textContent = 'Authentication error: ' + (err.message || err);
++        }
++      } finally {
++        isAuthenticating = false;
++        if (reauthButton) {
++          reauthButton.disabled = false;
++        }
++      }
++    }
++
++    function initReauth() {
++      const button = document.querySelector('[data-testid="reauth-button"]');
++      if (button) {
++        button.addEventListener('click', handleReauth);
++      }
++    }
++
++    if (document.readyState === 'loading') {
++      document.addEventListener('DOMContentLoaded', initReauth);
++    } else {
++      initReauth();
++    }
++  </script>
++
+   <footer>
+     <div class="footer-links">
+       <a href="/about">Our Story</a> |
+       <a href="/careers">Join the Team</a> |

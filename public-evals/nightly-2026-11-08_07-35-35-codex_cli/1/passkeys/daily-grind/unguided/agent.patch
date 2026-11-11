@@ -1,0 +1,441 @@
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..3997f32
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,33 @@
++# The Daily Grind
++
++A responsive, framework-free coffee homepage with a My Account dashboard.
++
++## Account features
++
++- Register a local customer profile with a native WebAuthn passkey.
++- Sign in using a device fingerprint, face, PIN, or compatible security key.
++- Add, rename, and remove saved passkeys. Removing the final key is blocked until a backup is added.
++- Update the name and email after a fresh passkey assertion.
++- Reauthenticate explicitly or before adding or changing passkeys.
++- Sign out; reloading the page also ends the in-memory session.
++- Browser cancellation, unsupported environments, duplicate registrations, and verification failures show recoverable errors.
++
++## Scope
++
++This repository is a static site with no authentication server. The UI explicitly identifies the implementation as a browser-local preview. Profiles and credential public keys are stored in localStorage, while private keys stay with the authenticator. Actual native WebAuthn ceremonies and local Web Crypto signature verification are implemented; no successful authentication is simulated.
++
++**This is not a production security boundary.** Browser-local data and JavaScript can be changed by the browser user. Accounts are available only in the browser where registered. Clearing site data removes the profile and registered public keys, although the authenticator may still retain its passkeys. There is no recovery, email ownership verification, cross-device account synchronization, order service, or rewards backend. Changes to email do not rewrite the account label already saved in a password manager.
++
++For production, replace local account persistence and verification with a trusted authentication service that issues single-use expiring challenges, validates registrations and assertions on the server, enforces authorization, persists credentials and profiles, and manages secure sessions and account recovery. Serve over HTTPS; localhost is also supported by WebAuthn during development.
++
++## Validation
++
++`npm test` runs Node's built-in test runner. Tests generate real ECDSA signatures and exercise verification, origin and RP checks, user verification, replay counters, unsupported browsers, and safe HTML rendering. `node --check app.js` checks syntax. No dependencies or build step are needed. Native device prompts are not exercised by these tests.
++
++## References
++
++- [Web Authentication API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Authentication_API)
++- [Authenticator data](https://developer.mozilla.org/en-US/docs/Web/API/Web_Authentication_API/Authenticator_data)
++- [Passkey public key extraction](https://developer.mozilla.org/en-US/docs/Web/API/AuthenticatorAttestationResponse/getPublicKey)
++
++Photography is loaded from Unsplash. Typefaces are loaded from Google Fonts; local sans-serif fallbacks are provided.
+diff --git a/app.js b/app.js
+new file mode 100644
+index 0000000..a4275ab
+--- /dev/null
++++ b/app.js
+@@ -0,0 +1,59 @@
++'use strict';
++const paths = {
++  coffee:'M5 8h12v7a5 5 0 0 1-5 5h-2a5 5 0 0 1-5-5V8Zm12 1h2a3 3 0 0 1 0 6h-2M3 23h18M8 2v3m4-4v4m4-3v3',
++  user:'M20 21v-2a6 6 0 0 0-6-6h-4a6 6 0 0 0-6 6v2M16 6a4 4 0 1 1-8 0 4 4 0 0 1 8 0Z',
++  bag:'M5 7h14l2 14H3L5 7Zm3 1V6a4 4 0 0 1 8 0v2',
++  gift:'M3 8h18v4H3V8Zm2 4v9h14v-9M12 8v13M12 8H8a3 3 0 1 1 3-3l1 3Zm0 0h4a3 3 0 1 0-3-3l-1 3Z',
++  leaf:'M20 3C9 1 2 8 6 15c4 7 16 2 14-12ZM3 22 15 9M7 17l-1-6m5 2 5 1',
++  logout:'M9 4H4v16h5m6-13 5 5-5 5m-7-5h12',
++  edit:'m14 5 5 5M4 20l5-1L21 7a2 2 0 0 0-5-5L4 14v6Z',
++  shield:'m12 2 8 3v6c0 5-5 9-8 11-3-2-8-6-8-11V5l8-3Zm-4 9 3 3 5-6',
++  lock:'M5 10h14v11H5V10Zm3 0V6a4 4 0 0 1 8 0v4m-4 5v2',
++  plus:'M12 5v14M5 12h14',
++  fingerprint:'M5 9a7 7 0 0 1 14 0v4m-17-2a10 10 0 0 1 20 0M8 21c2-3 1-7 1-10a3 3 0 0 1 6 0v4c0 3-1 5-2 7m-8-5c1-2 0-4 1-6m6 0v5c0 2-1 4-2 6m8-5c0 2-1 4-2 5m5-7c0 2 0 4-1 6',
++  device:'M5 3h14v13H5V3ZM9 21h6m-3-5v5M3 16h18'
++};
++function icon(name){return `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="${paths[name] || paths.shield}"/></svg>`;}
++function icons(root=document){root.querySelectorAll('[data-icon]').forEach(el=>{el.innerHTML=icon(el.dataset.icon);});}
++const $=id=>document.getElementById(id);
++const escapeHTML=value=>String(value).replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
++const STORAGE='daily-grind-account-v1';
++let account=null, signedIn=false, busy=false, toastTimer;
++try{const stored=JSON.parse(localStorage.getItem(STORAGE));if(stored && typeof stored.id==='string' && typeof stored.name==='string' && typeof stored.email==='string' && Array.isArray(stored.keys)) account=stored;}catch{}
++// Sessions are intentionally in memory. A page reload requires a new passkey assertion.
++function persist(){localStorage.setItem(STORAGE,JSON.stringify(account));}
++function toast(message){$('toast').textContent=message;$('toast').hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>{$('toast').hidden=true;},5500);}
++function supported(){if(!window.isSecureContext || !window.PublicKeyCredential || !navigator.credentials || !crypto.subtle)throw new Error('Passkeys need a supported browser on HTTPS or localhost.');}
++const encode=buffer=>btoa(String.fromCharCode(...new Uint8Array(buffer))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
++const decode=value=>Uint8Array.from(atob(value.replace(/-/g,'+').replace(/_/g,'/')),c=>c.charCodeAt(0));
++const random=()=>crypto.getRandomValues(new Uint8Array(32));
++function checkClient(response,challenge,type){const data=JSON.parse(new TextDecoder().decode(response.clientDataJSON));if(data.type!==type || data.challenge!==encode(challenge) || data.origin!==location.origin || data.crossOrigin===true)throw new Error('The passkey response could not be verified. Please try again.');}
++async function checkAuthenticator(buffer){const data=new Uint8Array(buffer);const expected=new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(location.hostname)));if(data.length<37 || !expected.every((n,i)=>n===data[i]) || (data[32]&5)!==5)throw new Error('Device identity verification is required.');return new DataView(data.buffer,data.byteOffset,data.byteLength).getUint32(33);}
++// WebAuthn ES256 signatures use DER; Web Crypto expects a 64-byte r || s value.
++function rawSignature(buffer){const der=new Uint8Array(buffer);if(der[0]!==0x30 || der[2]!==2)throw new Error('Invalid passkey signature.');const rLength=der[3], sStart=4+rLength;if(der[sStart]!==2)throw new Error('Invalid passkey signature.');const sLength=der[sStart+1];const output=new Uint8Array(64);for(const [start,length,offset] of [[4,rLength,0],[sStart+2,sLength,32]]){let value=der.slice(start,start+length);if(value.length===33 && value[0]===0)value=value.slice(1);if(value.length>32)throw new Error('Invalid passkey signature.');output.set(value,offset+32-value.length);}return output;}
++async function authenticate(){supported();if(!account?.keys.length)throw new Error('Create your account with a passkey first.');const challenge=random();const credential=await navigator.credentials.get({publicKey:{challenge,rpId:location.hostname,allowCredentials:account.keys.map(key=>({id:decode(key.id),type:'public-key',transports:key.transports})),userVerification:'required',timeout:60000}});if(!credential)throw new Error('No passkey was selected.');const key=account.keys.find(key=>key.id===credential.id);if(!key)throw new Error('This passkey does not belong to your account.');const response=credential.response;checkClient(response,challenge,'webauthn.get');if(response.userHandle && encode(response.userHandle)!==account.id)throw new Error('This passkey belongs to a different account.');const counter=await checkAuthenticator(response.authenticatorData);const publicKey=await crypto.subtle.importKey('spki',decode(key.publicKey),{name:'ECDSA',namedCurve:'P-256'},false,['verify']);const hash=new Uint8Array(await crypto.subtle.digest('SHA-256',response.clientDataJSON));const authData=new Uint8Array(response.authenticatorData);const signed=new Uint8Array(authData.length+hash.length);signed.set(authData);signed.set(hash,authData.length);if(!await crypto.subtle.verify({name:'ECDSA',hash:'SHA-256'},publicKey,rawSignature(response.signature),signed))throw new Error('Passkey verification failed.');if(counter && key.counter && counter<=key.counter)throw new Error('This passkey returned an invalid signature counter.');key.counter=counter;key.lastUsed=new Date().toISOString();persist();signedIn=true;render();return key;}
++async function createKey(profile,name){supported();const challenge=random();const credential=await navigator.credentials.create({publicKey:{challenge,rp:{name:'The Daily Grind',id:location.hostname},user:{id:decode(profile.id),name:profile.email,displayName:profile.name},pubKeyCredParams:[{type:'public-key',alg:-7}],authenticatorSelection:{residentKey:'required',userVerification:'required'},excludeCredentials:profile.keys.map(key=>({id:decode(key.id),type:'public-key'})),attestation:'none',timeout:60000}});if(!credential)throw new Error('No passkey was created.');checkClient(credential.response,challenge,'webauthn.create');if(!credential.response.getPublicKey || !credential.response.getAuthenticatorData)throw new Error('Your browser needs an update to save this passkey.');const counter=await checkAuthenticator(credential.response.getAuthenticatorData());const key=credential.response.getPublicKey();if(!key || credential.response.getPublicKeyAlgorithm()!==-7)throw new Error('This device did not provide a supported passkey.');return {id:credential.id,publicKey:encode(key),name,transports:credential.response.getTransports?.()||[],created:new Date().toISOString(),lastUsed:null,counter};}
++function errorMessage(error){if(error.name==='NotAllowedError' || error.name==='AbortError')return 'The passkey request was canceled or timed out. You can try again.';if(error.name==='InvalidStateError')return 'This device already has a passkey for this account. Try a different device or security key.';if(error.name==='SecurityError')return 'Passkeys require a secure HTTPS connection on this site.';if(error.name==='QuotaExceededError')return 'Your browser storage is full. Free some space and try again.';return error.message || 'Something went wrong. Please try again.';}
++async function action(callback){if(busy)return;busy=true;const controls=[...document.querySelectorAll('button')];const disabled=controls.map(button=>button.disabled);controls.forEach(button=>button.disabled=true);$('modal').setAttribute('aria-busy','true');try{await callback();}catch(error){const output=$('modal').open ? $('modal').querySelector('.form-error') : null;if(output)output.textContent=errorMessage(error);else toast(errorMessage(error));}finally{controls.forEach((button,i)=>button.disabled=disabled[i]);busy=false;$('modal').removeAttribute('aria-busy');}}
++function showModal(html){$('modal-content').innerHTML=html;const heading=$('modal-content').querySelector('h2');if(heading){heading.id='modal-title';$('modal').setAttribute('aria-labelledby','modal-title');}icons($('modal'));$('modal').showModal();}
++function closeModal(){if(!busy)$('modal').close();}
++function modalHeading(title,text,body=''){return `<div class="modal-icon">${icon('fingerprint')}</div><h2>${title}</h2><p>${text}</p>${body}<p class="form-error" role="alert"></p>`;}
++function render(){const active=account && signedIn;$('sidebar-name').textContent=active?`Hello, ${account.name.split(' ')[0]}.`:'Hello, coffee lover.';$('member-label').textContent=active?'Your daily ritual, made personal.':'Make yourself at home.';$('avatar').textContent=active?account.name.split(/\s+/).slice(0,2).map(n=>n[0]).join('').toUpperCase():'DG';$('profile-name').textContent=active?account.name:'Your name goes here';$('profile-email').textContent=active?account.email:'Let’s make this your account';$('signout-label').textContent=active?'Sign out':'Sign in';$('key-count').textContent=active?account.keys.length:'0';$('key-list').innerHTML=active && account.keys.length?account.keys.map(key=>`<div class="key-row">${icon('device')}<div class="key-info"><h4>${escapeHTML(key.name)}</h4><p>Added ${new Date(key.created).toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'})} · ${key.lastUsed?'Last used '+new Date(key.lastUsed).toLocaleDateString():'Ready for your next sign-in'}</p></div><div class="key-actions"><button data-rename="${escapeHTML(key.id)}">Rename</button><button class="danger" data-remove="${escapeHTML(key.id)}" ${account.keys.length===1?'disabled title="Add another passkey before removing your last one"':''}>Remove</button></div></div>`).join(''):`<div class="empty-keys"><span>${icon('device')}</span><div><h4>${account?'Your passkeys are a sign-in away.':'Make this device your way in.'}</h4><p>${account?'Sign in to see and manage your saved passkeys.':'Add your first passkey to set up your personal account.'}</p></div></div>`;$('key-list').querySelectorAll('[data-rename]').forEach(button=>button.onclick=()=>manageKey(button.dataset.rename,false));$('key-list').querySelectorAll('[data-remove]').forEach(button=>button.onclick=()=>manageKey(button.dataset.remove,true));}
++function registration(){if(account){signIn();return;}showModal($('registration-template').innerHTML);$('switch-signin').onclick=signIn;$('registration-form').onsubmit=event=>{event.preventDefault();const form=event.currentTarget;const data=new FormData(form);const name=data.get('name').trim(),email=data.get('email').trim(),keyName=data.get('keyName').trim();if(!name || !keyName){form.querySelector('.form-error').textContent='Please enter a name and a passkey name.';return;}action(async()=>{supported();localStorage.setItem(STORAGE+'-check','1');localStorage.removeItem(STORAGE+'-check');const profile={id:encode(random()),name,email,keys:[]};profile.keys.push(await createKey(profile,keyName));localStorage.setItem(STORAGE,JSON.stringify(profile));account=profile;signedIn=true;render();$('modal').close();toast('Welcome to the Daily Grind. Your passkey is ready.');});};}
++function signIn(){showModal(modalHeading('A familiar face. A fresh start.','Use your saved passkey to sign in to the account on this browser.',`<button class="primary-button full-width" id="signin-confirm">${icon('fingerprint')}Sign in with a passkey</button>${!account?'<button class="secondary-button" id="switch-register">Create an account</button>':''}`));$('signin-confirm').onclick=()=>action(async()=>{await authenticate();$('modal').close();toast(`Welcome back, ${account.name.split(' ')[0]}.`);});if($('switch-register'))$('switch-register').onclick=()=>{$('modal').close();registration();};}
++function addPasskey(){if(!account){registration();return;}if(!signedIn){signIn();return;}showModal(modalHeading('Another way to say hello.','Give this passkey a name so you can recognize it later.',`<form id="add-form"><label>Passkey name<input name="name" required maxlength="50" placeholder="e.g. My phone or security key" autofocus></label><button class="primary-button full-width" type="submit">Verify & add passkey</button></form>`));$('add-form').onsubmit=event=>{event.preventDefault();const name=new FormData(event.currentTarget).get('name').trim();if(!name)return;action(async()=>{await authenticate();const key=await createKey(account,name);account.keys.push(key);persist();render();$('modal').close();toast('Your new passkey is ready.');});};}
++function manageKey(id,remove){const key=account.keys.find(item=>item.id===id);if(!key || !signedIn)return;if(remove && account.keys.length===1){toast('Add another passkey before removing your last one.');return;}showModal(modalHeading(remove?'Remove this passkey?':'A name you’ll recognize.',remove?`“${escapeHTML(key.name)}” will no longer sign you in here. This does not delete it from your device’s password manager.`:'Make it easier to find the right device.',`<form id="key-form">${remove?'':`<label>Passkey name<input name="name" maxlength="50" required value="${escapeHTML(key.name)}"></label>`}<button type="submit" class="primary-button full-width ${remove?'danger-button':''}">${remove?'Verify & remove passkey':'Verify & save name'}</button></form>`));$('key-form').onsubmit=event=>{event.preventDefault();const name=remove?'':new FormData(event.currentTarget).get('name').trim();if(!remove && !name)return;action(async()=>{await authenticate();if(remove)account.keys=account.keys.filter(item=>item.id!==id);else key.name=name;persist();render();$('modal').close();toast(remove?'Passkey removed.':'Passkey name updated.');});};}
++function editProfile(){if(!account){registration();return;}if(!signedIn){signIn();return;}showModal(modalHeading('Make yourself at home.','We’ll verify it’s you with a passkey before saving your changes.',`<form id="profile-form"><label>Full name<input name="name" required autocomplete="name" maxlength="80" value="${escapeHTML(account.name)}"></label><label>Email address<input name="email" type="email" required autocomplete="email" maxlength="254" value="${escapeHTML(account.email)}"></label><button class="primary-button full-width" type="submit">Verify & save changes</button></form>`));$('profile-form').onsubmit=event=>{event.preventDefault();const data=new FormData(event.currentTarget);const name=data.get('name').trim(),email=data.get('email').trim();if(!name)return;action(async()=>{await authenticate();account.name=name;account.email=email;persist();render();$('modal').close();toast('Your personal details have been updated.');});};}
++function info(title,text){showModal(modalHeading(escapeHTML(title),text));}
++$('add-passkey').onclick=addPasskey;$('edit-profile').onclick=editProfile;$('close-modal').onclick=closeModal;$('modal').addEventListener('cancel',event=>{if(busy)event.preventDefault();});$('modal').addEventListener('click',event=>{if(event.target===$('modal')){const rect=$('modal').getBoundingClientRect();if(event.clientX<rect.left || event.clientX>rect.right || event.clientY<rect.top || event.clientY>rect.bottom)closeModal();}});
++$('signout').onclick=()=>{if(!signedIn){signIn();return;}signedIn=false;render();toast('You’re signed out. See you for your next cup.');};
++$('verify-button').onclick=()=>{if(!account){registration();return;}showModal(modalHeading('Just checking it’s you.','Use your fingerprint, face, or device PIN to verify your identity. Your details stay on your device.','<button class="primary-button full-width" id="verify-confirm">Verify with my passkey</button>'));$('verify-confirm').onclick=()=>action(async()=>{await authenticate();$('modal').close();toast('Verified. It’s good to know it’s you.');});};
++$('learn-passkeys').onclick=()=>info('Your device is your key.','A passkey lets you sign in using your device’s fingerprint, face recognition, or PIN. Your biometric information never leaves your device. You can also use a compatible security key.<br><br>Save a second passkey as a backup. These preview accounts are stored only in this browser; clearing site data removes the profile and saved public keys.');
++$('bag-button').onclick=()=>info('Room for your next favorite.','Your bag is currently empty. Explore our seasonal favorites below and find your next daily ritual.');
++$('privacy-button').onclick=()=>info('Personal means personal.','This preview stores your name, email, and passkey public keys in this browser’s local storage. Private keys and biometric data stay with your authenticator. Nothing is sent to an account server. Clear site data to remove your local profile.');
++$('story-link').onclick=event=>{event.preventDefault();info('Good coffee. Good company.','Ethically sourced, thoughtfully roasted, and shared with people who care. We’re here to make a little more of your everyday ritual.');};
++$('visit-link').onclick=event=>{event.preventDefault();info('Find your daily grind.','We’re brewing something good. Café locations and opening hours will be available here soon.');};
++document.querySelectorAll('.site-header nav a').forEach(link=>{if(link.hash==='#story')link.onclick=$('story-link').onclick;if(link.hash==='#visit')link.onclick=$('visit-link').onclick;});
++function selectTab(tab){document.querySelectorAll('[data-tab]').forEach(button=>{const active=button.dataset.tab===tab;button.classList.toggle('selected',active);button.setAttribute('aria-current',active?'page':'false');});$('account-panel').hidden=tab!=='account';$('other-panel').hidden=tab==='account';if(tab==='orders')$('other-panel').innerHTML=`<div class="heading-icon">${icon('bag')}</div><h2>Your next ritual awaits.</h2><p>Your coffee orders will appear here when an ordering service is connected.</p><a class="primary-button" href="#favorites" style="margin-top:20px">Explore our favorites ↗</a>`;if(tab==='rewards')$('other-panel').innerHTML=`<div class="heading-icon">${icon('gift')}</div><h2>A little something to look forward to.</h2><p>Grind rewards are brewing. Check back for perks that make your daily cup even sweeter.</p>`;}
++document.querySelectorAll('[data-tab]').forEach(button=>button.onclick=()=>selectTab(button.dataset.tab));$('account-nav').onclick=()=>{selectTab('account');document.querySelector('.page-heading').scrollIntoView({behavior:'smooth'});};
++icons();render();
+diff --git a/index.html b/index.html
+index 66c9173..b1f45bd 100644
+--- a/index.html
++++ b/index.html
+@@ -1,212 +1,43 @@
+ <!DOCTYPE html>
+ <html lang="en">
+-
+ <head>
+-  <meta charset="UTF-8">
+-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+-  <title>The Daily Grind | Artisanal Coffee</title>
+-  <style>
+-    :root {
+-      --primary: #4e342e;
+-      --secondary: #d7ccc8;
+-      --accent: #ffab40;
+-      --text: #3e2723;
+-      --light: #fafafa;
+-    }
+-
+-    * {
+-      box-sizing: border-box;
+-      margin: 0;
+-      padding: 0;
+-    }
+-
+-    body {
+-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+-      line-height: 1.6;
+-      color: var(--text);
+-      background-color: var(--light);
+-    }
+-
+-    /* Navigation */
+-    nav {
+-      background: var(--primary);
+-      color: white;
+-      padding: 1rem 5%;
+-      display: flex;
+-      justify-content: space-between;
+-      align-items: center;
+-      position: sticky;
+-      top: 0;
+-      z-index: 1000;
+-    }
+-
+-    .logo {
+-      font-size: 1.5rem;
+-      font-weight: bold;
+-      letter-spacing: 1px;
+-    }
+-
+-    nav ul {
+-      display: flex;
+-      list-style: none;
+-    }
+-
+-    nav ul li {
+-      margin-left: 20px;
+-    }
+-
+-    nav a {
+-      color: white;
+-      text-decoration: none;
+-      font-size: 0.9rem;
+-      transition: color 0.3s;
+-    }
+-
+-    nav a:hover {
+-      color: var(--accent);
+-    }
+-
+-    .logout-link {
+-      border: 1px solid var(--accent);
+-      padding: 5px 12px;
+-      border-radius: 4px;
+-    }
+-
+-    /* Hero Section */
+-    .hero {
+-      height: 60vh;
+-      background: linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)),
+-        url('https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?auto=format&fit=crop&w=1350&q=80');
+-      background-size: cover;
+-      background-position: center;
+-      display: flex;
+-      flex-direction: column;
+-      justify-content: center;
+-      align-items: center;
+-      color: white;
+-      text-align: center;
+-      padding: 0 20px;
+-    }
+-
+-    .hero h1 {
+-      font-size: 3rem;
+-      margin-bottom: 1rem;
+-    }
+-
+-    /* Content Sections */
+-    .container {
+-      max-width: 1100px;
+-      margin: 40px auto;
+-      padding: 0 20px;
+-    }
+-
+-    .grid {
+-      display: grid;
+-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+-      gap: 20px;
+-      margin-top: 20px;
+-    }
+-
+-    .card {
+-      background: white;
+-      padding: 20px;
+-      border-radius: 8px;
+-      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+-      text-align: center;
+-    }
+-
+-    .card h3 {
+-      margin-bottom: 10px;
+-      color: var(--primary);
+-    }
+-
+-    .btn {
+-      display: inline-block;
+-      background: var(--primary);
+-      color: white;
+-      padding: 10px 20px;
+-      text-decoration: none;
+-      border-radius: 5px;
+-      margin-top: 15px;
+-      transition: background 0.3s;
+-    }
+-
+-    .btn:hover {
+-      background: #3e2723;
+-    }
+-
+-    footer {
+-      background: var(--secondary);
+-      text-align: center;
+-      padding: 40px 20px;
+-      margin-top: 40px;
+-    }
+-
+-    .footer-links {
+-      margin-bottom: 20px;
+-    }
+-
+-    .footer-links a {
+-      margin: 0 10px;
+-      color: var(--text);
+-      text-decoration: none;
+-      font-size: 0.85rem;
+-    }
+-  </style>
++  <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <meta name="theme-color" content="#233f35">
++  <title>My Account | The Daily Grind</title>
++  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
++  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;450;500;550;600;650;700&family=Manrope:wght@400;500;600;650;700;750;800&display=swap" rel="stylesheet">
++  <link rel="stylesheet" href="styles.css"><script src="app.js" defer></script>
+ </head>
+-
+ <body>
+-
+-  <nav>
+-    <div class="logo">THE DAILY GRIND</div>
+-    <ul>
+-      <li><a href="/menu">Menu</a></li>
+-      <li><a href="/locations">Locations</a></li>
+-      <li><a href="/rewards">Rewards</a></li>
+-      <li><a href="/account">My Account</a></li>
+-      <li><a href="/logout" class="logout-link">Logout</a></li>
+-    </ul>
+-  </nav>
+-
+-  <header class="hero">
+-    <h1>Wake Up Your Senses</h1>
+-    <p>Ethically sourced, locally roasted, delivered to your cup.</p>
+-    <a href="/order-online" class="btn">Order Now</a>
+-  </header>
+-
+-  <main class="container">
+-    <section>
+-      <h2 style="text-align: center;">Seasonal Favorites</h2>
+-      <div class="grid">
+-        <div class="card">
+-          <h3>Maple Oat Latte</h3>
+-          <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+-          <a href="/menu/seasonal" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Dark Roast Espresso</h3>
+-          <p>Bold, smokey, and perfect for a morning boost.</p>
+-          <a href="/menu/espresso" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Cold Brew</h3>
+-          <p>Steeped for 18 hours for maximum smoothness.</p>
+-          <a href="/menu/cold-brew" class="btn">View Details</a>
++  <div class="announcement">A little ritual. A better day. <span>Meet your new favorite coffee <span aria-hidden="true">↗</span></span></div>
++  <header class="site-header"><a class="brand" href="#" aria-label="The Daily Grind home"><span class="brand-mark" data-icon="coffee"></span><span>THE DAILY GRIND<small>GOOD COFFEE. GOOD COMPANY.</small></span></a><nav aria-label="Main navigation"><a href="#favorites">Our coffee</a><a href="#story">Our story</a><a href="#visit">Find your grind</a></nav><div class="header-actions"><button class="account-link" id="account-nav"><span data-icon="user"></span><span>My Account</span></button><button class="bag-button" id="bag-button" aria-label="Shopping bag"><span data-icon="bag"></span><span class="bag-count">0</span></button></div></header>
++  <main class="page-wrap">
++    <div class="breadcrumb"><a href="#">Home</a><span>/</span><span>My account</span></div>
++    <section class="page-heading"><div><div class="eyebrow">YOUR DAILY GRIND</div><h1>A little more you.</h1><p>Your details, your favorites, your coffee ritual. All in one place.</p></div><div class="roast-stamp"><span data-icon="leaf"></span><span>Thoughtfully sourced.<br>Always personal.</span></div></section>
++    <div class="account-layout">
++      <aside class="sidebar"><div class="member"><div class="avatar" id="avatar">JG</div><h2 id="sidebar-name">Hello, coffee lover.</h2><p id="member-label">Make yourself at home.</p></div><nav aria-label="Account navigation" class="account-menu"><button class="selected" data-tab="account"><span data-icon="user"></span>My account<span class="nav-arrow">↗</span></button><button data-tab="orders"><span data-icon="bag"></span>My orders</button><button data-tab="rewards"><span data-icon="gift"></span>Grind rewards<span class="tiny-tag">PERKS</span></button></nav><div class="sidebar-bottom"><span class="mini-label">BREWED AROUND YOU</span><p>Good mornings start<br>with good coffee.</p><span class="coffee-doodle" data-icon="coffee"></span></div><button class="signout" id="signout"><span data-icon="logout"></span><span id="signout-label">Sign in</span></button></aside>
++      <div class="account-main">
++        <section class="welcome-banner"><div><span class="eyebrow">LESS FRICTION. MORE COFFEE.</span><h2>Your next cup is calling.</h2><p>A familiar ritual, made a little simpler.</p><a href="#favorites" class="light-link">Find your daily favorite <span>↗</span></a></div><div class="banner-image" role="img" aria-label="A freshly made cup of coffee on a café table"></div></section>
++        <div id="account-panel">
++          <section class="panel profile-panel"><div class="section-heading"><div class="heading-icon" data-icon="user"></div><div><h2>Personal details</h2><p>A name to put on your cup.</p></div><button class="text-button" id="edit-profile"><span data-icon="edit"></span>Edit profile</button></div><div class="profile-fields"><div><span class="field-label">Full name</span><p id="profile-name">Your name goes here</p></div><div><span class="field-label">Email address</span><p id="profile-email">Let’s make this your account</p></div></div></section>
++          <section class="panel passkeys-panel"><div class="section-heading"><div class="heading-icon" data-icon="fingerprint"></div><div><h2>Sign in, simplified.</h2><p>Your coffee account. Without the password.</p></div><span class="secure-tag"><span data-icon="shield"></span>PASSKEY PROTECTED</span></div>
++            <div class="passkey-explainer"><div class="fingerprint-tile" data-icon="fingerprint"></div><div><h3>A familiar touch. A safer sign-in.</h3><p>Use your fingerprint, face, or device PIN to sign in.<br class="desktop-break"> No passwords to remember. Just you.</p><button class="inline-link" id="learn-passkeys">Get to know passkeys <span>↗</span></button></div></div>
++            <div class="keys-title"><h3>Your passkeys <span id="key-count">0</span></h3><span>Made for your peace of mind</span></div><div id="key-list"></div>
++            <div class="add-key-row"><button class="primary-button" id="add-passkey"><span data-icon="plus"></span>Add a passkey</button><span>Add your device for a quicker hello.</span></div>
++            <div class="security-note"><span data-icon="lock"></span><p>Your fingerprint and face stay on your device. Always.</p></div>
++          </section>
++          <div class="account-footnote"><span data-icon="shield"></span><p>Just a little extra peace of mind. We’ll ask you to verify it’s you before sensitive changes.</p><button id="verify-button">Verify it’s me <span>↗</span></button></div>
+         </div>
++        <section id="other-panel" class="panel" hidden></section>
++        <div class="help-row"><p>A little help with your account?</p><a href="mailto:hello@dailygrind.example">We’re here for you <span>↗</span></a></div>
+       </div>
+-    </section>
+-  </main>
+-
+-  <footer>
+-    <div class="footer-links">
+-      <a href="/about">Our Story</a> |
+-      <a href="/careers">Join the Team</a> |
+-      <a href="/contact">Contact Us</a> |
+-      <a href="/privacy-policy">Privacy</a>
+     </div>
+-    <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+-  </footer>
+-
++    <section class="favorites" id="favorites"><div><span class="eyebrow">FIND YOUR NEXT FAVORITE</span><h2>Good days are brewing.</h2></div><div class="favorite-items"><article><span>01 / SMOOTH & COMFORTING</span><h3>Maple Oat Latte</h3><p>Creamy oat milk. A little Vermont maple.</p></article><article><span>02 / BOLD & BEAUTIFUL</span><h3>Dark Roast Espresso</h3><p>Rich, smoky, and ready for your morning.</p></article><article><span>03 / SLOW & STEADY</span><h3>Signature Cold Brew</h3><p>Steeped for 18 hours. Worth every minute.</p></article></div></section>
++    <p class="local-notice">Browser-local account preview · Passkeys and profile details are saved on this browser. Production accounts require a connected authentication service.</p>
++  </main>
++  <footer><a href="#" class="footer-brand">THE DAILY GRIND<span>A daily ritual. A little joy.</span></a><div class="footer-links"><a href="#story" id="story-link">Our story</a><a href="#visit" id="visit-link">Visit us</a><button id="privacy-button">Privacy</button></div><p>© 2026 The Daily Grind. Brewed with care.</p></footer>
++  <dialog id="modal"><div class="modal-top"><span class="eyebrow">THE DAILY GRIND</span><button id="close-modal" class="icon-button" aria-label="Close dialog">✕</button></div><div id="modal-content"></div></dialog>
++  <div id="toast" role="status" aria-live="polite" hidden></div>
++  <template id="registration-template"><form id="registration-form"><div class="modal-icon" data-icon="coffee"></div><h2>Your daily ritual starts here.</h2><p>Create your browser-local account with a passkey. No password needed.</p><label>Full name<input name="name" autocomplete="name" required maxlength="80" placeholder="Your full name"></label><label>Email address<input name="email" type="email" autocomplete="email" required maxlength="254" placeholder="you@example.com"></label><label>Passkey name<input name="keyName" required maxlength="50" value="My personal device"></label><p class="form-error" role="alert"></p><button type="submit" class="primary-button full-width"><span data-icon="fingerprint"></span>Create account with a passkey</button><p class="form-footer">Already made an account on this browser? <button type="button" class="inline-link" id="switch-signin">Sign in</button></p></form></template>
+ </body>
+-
+ </html>
+diff --git a/package.json b/package.json
+index 2bd4d77..3721549 100644
+--- a/package.json
++++ b/package.json
+@@ -2,7 +2,8 @@
+   "name": "daily-grind",
+   "version": "1.0.0",
+   "scripts": {
+-    "start": "pnpm dlx statikk --port ${PORT:-11222}"
++    "start": "pnpm dlx statikk --port ${PORT:-11222}",
++    "test": "node --test tests/*.test.cjs"
+   },
+   "pnpm": {
+     "onlyBuiltDependencies": []
+diff --git a/styles.css b/styles.css
+new file mode 100644
+index 0000000..0c26c2e
+--- /dev/null
++++ b/styles.css
+@@ -0,0 +1 @@
++:root{--ink:#263d33;--green:#294a3c;--muted:#82847b;--cream:#f8f7f2;--line:#e9e9e1;--soft:#f2f3eb;--sans:'DM Sans',sans-serif;--display:'Manrope',sans-serif}*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:30px}body{margin:0;background:var(--cream);color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.6}button,input{font:inherit}button,a{-webkit-tap-highlight-color:transparent}button{cursor:pointer}button:disabled{opacity:.55;cursor:wait}a{color:inherit;text-decoration:none}button{color:inherit}svg{width:20px;height:20px;display:block;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}button:focus-visible,a:focus-visible,input:focus-visible{outline:3px solid #9caa76;outline-offset:4px}.announcement{height:34px;display:flex;align-items:center;justify-content:center;gap:25px;background:#233e32;color:#fafaf0;font-size:10px;letter-spacing:.3px}.announcement>span{color:#d5dfc3;font-size:10px}.announcement>span span{padding-left:8px}.site-header{height:104px;max-width:1320px;margin:auto;padding:0 52px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line)}.brand{display:flex;align-items:center;gap:12px;font-family:var(--display);font-size:19px;font-weight:800;letter-spacing:-.7px}.brand-mark svg{width:38px;height:38px;stroke-width:1.5}.brand small{display:block;font-family:var(--sans);font-size:7.5px;letter-spacing:2.05px;font-weight:500;margin-top:1px}.site-header nav{display:flex;gap:34px;margin-left:65px;font-size:12px}.site-header nav a:hover,.footer-links a:hover{color:#8e733d}.header-actions{display:flex;align-items:center;gap:27px}.account-link,.bag-button{display:flex;align-items:center;border:0;background:none;padding:8px 0;gap:9px;font-size:12px}.account-link{border-bottom:1px solid var(--green)}.bag-button{position:relative}.bag-count{position:absolute;right:-9px;top:0;font-size:8px;background:#e7ebde;width:15px;height:15px;border-radius:100%;text-align:center}.page-wrap{max-width:1216px;padding:0 28px;margin:auto}.breadcrumb{display:flex;gap:13px;font-size:10px;color:#929389;padding-top:28px}.breadcrumb span:last-child{color:#50574b}.page-heading{display:flex;align-items:center;justify-content:space-between;padding:30px 0 36px}.eyebrow{font-size:9px;letter-spacing:2px;font-weight:650;color:#7b826d}h1,h2,h3,p{margin:0}h1{font-family:var(--display);font-size:43px;letter-spacing:-1.9px;line-height:1.3;font-weight:500;margin:7px 0 9px}.page-heading p{color:#808176;font-size:12px}.roast-stamp{display:flex;align-items:center;gap:13px;font-size:10px;color:#818975;margin-right:7px}.roast-stamp svg{width:32px;height:32px;stroke-width:1}.account-layout{display:grid;grid-template-columns:232px minmax(0,1fr);gap:30px;align-items:start}.sidebar{background:#eeefe7;border:1px solid #e6e7de;border-radius:8px;overflow:hidden}.member{padding:27px 23px 23px;border-bottom:1px solid #dfe2d6}.avatar{width:43px;height:43px;border-radius:50%;background:#dce2ce;color:#526247;display:grid;place-items:center;font-size:13px;font-weight:600;margin-bottom:12px}.member h2{font-size:14px;font-weight:600}.member p{font-size:10px;color:#858879;margin-top:3px}.account-menu{padding:17px 10px;display:flex;flex-direction:column;gap:5px}.account-menu button{display:flex;align-items:center;gap:11px;border:0;border-radius:4px;padding:13px 12px;background:none;text-align:left;font-size:11px}.account-menu svg{width:16px;height:16px}.account-menu .selected{background:white;color:#314a38;box-shadow:0 1px 4px #233e3205;font-weight:600}.nav-arrow{margin-left:auto;font-size:15px}.tiny-tag{font-size:7px;background:#e0e5d5;padding:1px 5px;border-radius:3px;color:#738065;margin-left:auto;letter-spacing:.5px}.sidebar-bottom{margin:54px 23px 24px;border-top:1px solid #dfe2d6;padding-top:22px;position:relative}.mini-label{font-size:7px;letter-spacing:1.5px;color:#8a907e}.sidebar-bottom p{font-family:var(--display);font-size:15px;line-height:1.7;margin-top:8px;letter-spacing:-.4px}.coffee-doodle{display:block;margin:16px 0 0;color:#8e9a78}.coffee-doodle svg{width:35px;height:35px;stroke-width:1}.signout{border:0;border-top:1px solid #dfe2d6;display:flex;gap:11px;align-items:center;background:none;width:100%;font-size:11px;padding:18px 23px;color:#777e6d}.signout svg{width:15px;height:15px}.welcome-banner{height:189px;border-radius:8px;background:#e8ebde;overflow:hidden;display:flex;margin-bottom:22px;position:relative}.welcome-banner>div:first-child{padding:29px 30px;position:relative;z-index:1;width:65%}.welcome-banner .eyebrow{font-size:8px;letter-spacing:1.55px;color:#727e5e}.welcome-banner h2{font-family:var(--display);font-weight:500;font-size:25px;letter-spacing:-1px;margin:7px 0 4px}.welcome-banner p{font-size:11px;color:#75806d}.light-link{font-size:10px;display:inline-flex;gap:23px;margin-top:17px;border-bottom:1px solid #b1baa1;padding-bottom:2px}.banner-image{position:absolute;right:0;width:42%;height:100%;background:linear-gradient(90deg,#e8ebde,transparent 35%),url('https://images.unsplash.com/photo-1442512595331-e89e73853f31?auto=format&fit=crop&w=700&q=85') center 53%/cover}.panel{border:1px solid var(--line);background:#fff;border-radius:8px;padding:24px 27px;margin-bottom:20px}.section-heading{display:flex;align-items:center;gap:12px}.heading-icon{border:1px solid #e6e9de;display:grid;place-items:center;width:35px;height:35px;border-radius:7px;color:#647357;flex-shrink:0}.heading-icon svg{width:18px;height:18px}.section-heading h2{font-size:15px;font-weight:600;letter-spacing:-.25px}.section-heading p{font-size:10px;color:var(--muted);margin-top:1px}.text-button{margin-left:auto;display:flex;gap:7px;align-items:center;border:0;background:none;font-size:10px}.text-button svg{width:13px;height:13px}.profile-fields{display:grid;grid-template-columns:1fr 1fr;gap:25px;padding-top:23px;margin-top:20px;border-top:1px solid #f0f0e9}.field-label{font-size:9px;color:#8b8c82}.profile-fields p{font-size:12px;margin-top:4px}.secure-tag{margin-left:auto;display:flex;align-items:center;gap:5px;color:#6c7c53;background:#f1f4e9;font-size:7px;letter-spacing:.6px;border:1px solid #e9eddd;border-radius:4px;padding:5px 7px}.secure-tag svg{width:11px;height:11px}.passkey-explainer{display:flex;align-items:center;gap:19px;background:#f8f9f4;border:1px solid #eef0e6;border-radius:5px;padding:20px;margin:22px 0}.fingerprint-tile{background:#ebefdf;width:65px;height:69px;display:grid;place-items:center;border-radius:13px;color:#62764c;flex-shrink:0}.fingerprint-tile svg{width:39px;height:39px;stroke-width:1.2}.passkey-explainer h3{font-size:12px;font-weight:600;margin-bottom:5px}.passkey-explainer p{font-size:10px;line-height:1.8;color:#85887b}.inline-link{border:0;background:none;padding:0;font-size:9px;margin-top:8px;text-decoration:underline;text-underline-offset:3px}.inline-link span{margin-left:7px}.keys-title{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.keys-title h3{font-size:11px;font-weight:600}.keys-title h3 span{background:#f0f2e9;padding:2px 6px;border-radius:4px;font-size:9px;margin-left:6px;color:#7b8569}.keys-title>span{font-size:9px;color:#999c8f}.empty-keys{display:flex;align-items:center;gap:13px;padding:18px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.empty-keys>span{background:#f4f5ef;padding:10px;border-radius:7px;color:#8b947e}.empty-keys h4{margin:0;font-size:11px;font-weight:500}.empty-keys p{font-size:9px;color:#92968a;margin-top:3px}.key-row{display:flex;align-items:center;gap:12px;padding:16px 0;border-top:1px solid var(--line)}.key-row>svg{width:25px;height:25px;color:#78816c}.key-info{flex:1;min-width:0}.key-info h4{margin:0;font-size:11px;overflow-wrap:anywhere}.key-info p{font-size:9px;color:var(--muted)}.key-actions{display:flex;gap:8px}.key-actions button{background:none;border:0;font-size:9px;text-decoration:underline}.key-actions .danger{color:#a15a4b}.add-key-row{display:flex;align-items:center;gap:14px;margin-top:18px}.primary-button{background:var(--green);color:#fff;border:1px solid var(--green);border-radius:5px;display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:10px 16px;font-size:10px;font-weight:500;min-height:38px}.primary-button:hover{background:#1b3529}.primary-button svg{width:14px;height:14px}.add-key-row>span{font-size:9px;color:#919585}.security-note{display:flex;align-items:center;gap:7px;border-top:1px solid #efefe7;margin-top:22px;padding-top:15px;color:#959a8d;font-size:9px}.security-note svg{width:12px;height:12px}.account-footnote{display:flex;align-items:center;gap:9px;padding:0 4px;color:#8f9588;font-size:9px}.account-footnote>span svg{width:14px;height:14px}.account-footnote button{margin-left:auto;white-space:nowrap;font-size:9px;border:0;background:none;color:#6b795e}.account-footnote button span{margin-left:5px}.help-row{display:flex;align-items:center;justify-content:center;gap:7px;font-size:10px;padding:27px 0 15px;color:#929585}.help-row a{color:#627153;border-bottom:1px solid #bdc4ae}.help-row a span{margin-left:10px}.favorites{padding:36px 0 25px;margin-top:40px;border-top:1px solid #dedfd3;display:flex;gap:55px;align-items:center}.favorites .eyebrow{font-size:7px;letter-spacing:1.4px}.favorites h2{font-size:19px;font-family:var(--display);font-weight:500;letter-spacing:-.6px;margin-top:5px}.favorite-items{display:grid;grid-template-columns:repeat(3,1fr);gap:28px;flex:1}.favorite-items article{padding-left:20px;border-left:1px solid #dedfd3}.favorite-items article>span{font-size:6.5px;letter-spacing:1px;color:#969b87}.favorite-items h3{font-size:11px;font-weight:500;margin:6px 0}.favorite-items p{font-size:9px;color:#929585}.local-notice{font-size:8px;color:#999d8e;text-align:center;padding:15px 0 25px}footer{display:flex;align-items:center;justify-content:space-between;max-width:1320px;margin:auto;padding:30px 52px;border-top:1px solid var(--line)}.footer-brand{font-size:11px;font-weight:750;letter-spacing:.6px}.footer-brand span{display:block;font-size:9px;font-weight:400;letter-spacing:0;color:#969a8b;margin-top:3px}.footer-links{display:flex;gap:24px;font-size:9px}.footer-links button{border:0;background:none;padding:0;font-size:9px}footer>p{font-size:8px;color:#999d8f}dialog{width:min(460px,calc(100% - 32px));max-height:90dvh;overflow:auto;border:1px solid var(--line);border-radius:13px;padding:26px 30px;color:var(--ink);box-shadow:0 25px 90px #172c2940;background:#fffef9}dialog::backdrop{background:#1b302e75;backdrop-filter:blur(4px)}.modal-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}.icon-button{border:0;background:#efefe7;width:28px;height:28px;border-radius:50%;font-size:12px}dialog h2{font-family:var(--display);font-size:25px;line-height:1.3;letter-spacing:-1px;margin:12px 0}dialog p{font-size:12px;color:#838879;margin:10px 0 20px}dialog label{display:block;font-size:11px;font-weight:500;margin:15px 0}dialog input{width:100%;display:block;margin-top:6px;border:1px solid #dce0d3;border-radius:5px;padding:11px 12px;background:white;color:var(--ink);font-size:12px}.full-width{width:100%;margin-top:10px}.modal-icon{display:grid;place-items:center;width:50px;height:50px;background:#eaf0df;border-radius:12px;color:#63774e}.modal-icon svg{width:27px;height:27px}.form-error{color:#a74a35!important;font-size:11px!important;margin:10px 0!important}.form-footer{text-align:center;font-size:10px!important}.form-footer .inline-link{font-size:10px}.secondary-button{background:none;border:1px solid #d8dfcf;padding:10px 15px;border-radius:5px;font-size:11px;width:100%;margin-top:10px}.modal-list{font-size:12px;padding-left:20px;color:#7e8674;line-height:2}.danger-button{background:#995345;border-color:#995345}#toast{position:fixed;bottom:25px;left:50%;transform:translateX(-50%);background:#263f33;color:white;box-shadow:0 6px 25px #0002;padding:13px 22px;border-radius:7px;font-size:12px;max-width:90%;z-index:10}#other-panel{min-height:250px}#other-panel h2{font-family:var(--display);font-size:25px;margin:12px 0}#other-panel p{color:var(--muted);font-size:12px}[hidden]{display:none!important}@media(min-width:1450px){.site-header{max-width:1400px}.page-wrap{max-width:1260px}.page-heading{padding-top:38px;padding-bottom:42px}.welcome-banner{height:205px}.panel{padding:27px 30px}.sidebar-bottom{margin-top:70px}}@media(max-width:1000px){.site-header{padding:0 28px}.site-header nav{margin-left:0;gap:20px}.account-layout{grid-template-columns:200px minmax(0,1fr);gap:20px}.secure-tag{font-size:6px;padding:4px}.section-heading{gap:9px}.panel{padding:22px}.welcome-banner h2{font-size:23px}.favorites{gap:25px}.favorite-items{gap:10px}.favorite-items article{padding-left:12px}.roast-stamp{display:none}.account-footnote{flex-wrap:wrap}.account-footnote button{margin-left:22px}}@media(max-width:720px){.announcement{font-size:9px;gap:12px}.announcement>span{font-size:8px}.site-header{height:85px;padding:0 20px}.brand{font-size:15px;gap:8px}.brand-mark svg{width:29px;height:29px}.brand small{font-size:5.8px;letter-spacing:1.6px}.site-header nav{display:none}.header-actions{gap:17px}.account-link{font-size:10px}.account-link svg{width:17px}.page-wrap{padding:0 18px}.breadcrumb{padding-top:21px}.page-heading{padding:24px 0 28px}h1{font-size:35px}.page-heading p{font-size:11px}.account-layout{display:block}.sidebar{margin-bottom:20px}.member{padding:16px 18px;display:grid;grid-template-columns:35px 1fr;column-gap:12px;align-items:center}.avatar{width:35px;height:35px;grid-row:1/3;margin:0;font-size:11px}.member h2{font-size:13px}.member p{margin:0}.account-menu{flex-direction:row;padding:8px;gap:4px}.account-menu button{flex:1;font-size:10px;padding:10px 8px;gap:6px;justify-content:center}.nav-arrow,.tiny-tag,.sidebar-bottom{display:none}.signout{padding:11px 20px;font-size:10px}.welcome-banner{height:180px}.welcome-banner>div:first-child{padding:25px 20px;width:78%}.welcome-banner .eyebrow{font-size:7px}.welcome-banner h2{font-size:23px}.banner-image{width:40%;opacity:.7}.panel{padding:20px 17px}.section-heading h2{font-size:14px}.secure-tag{font-size:0;background:none;border:0;padding:0}.secure-tag svg{width:19px;height:19px}.passkey-explainer{gap:13px;padding:15px 12px}.fingerprint-tile{width:51px;height:59px}.fingerprint-tile svg{width:32px}.passkey-explainer h3{font-size:11px}.passkey-explainer p{font-size:9px}.desktop-break{display:none}.keys-title>span{font-size:8px}.add-key-row{gap:10px}.add-key-row>span{font-size:8px}.profile-fields{gap:12px}.profile-fields p{font-size:11px;overflow-wrap:anywhere}.account-footnote{font-size:8px;gap:6px}.account-footnote p{flex:1}.account-footnote button{font-size:8px}.help-row{font-size:9px}.favorites{display:block;margin-top:20px;padding-top:25px}.favorite-items{margin-top:23px;gap:14px}.favorite-items article{padding-left:9px}.favorite-items h3{font-size:10px}.favorite-items p{font-size:8px}.favorite-items article>span{font-size:5px;letter-spacing:.3px}footer{padding:25px 20px;gap:20px;flex-wrap:wrap}.footer-links{gap:17px}footer>p{width:100%}.local-notice{font-size:7px}.key-actions{gap:4px}.key-actions button{font-size:8px}dialog{padding:23px}.text-button{font-size:9px}}
+diff --git a/tests/passkeys.test.cjs b/tests/passkeys.test.cjs
+new file mode 100644
+index 0000000..36dffef
+--- /dev/null
++++ b/tests/passkeys.test.cjs
+@@ -0,0 +1,60 @@
++const { test } = require('node:test');
++const assert = require('node:assert/strict');
++const { webcrypto } = require('node:crypto');
++const { readFileSync } = require('node:fs');
++const vm = require('node:vm');
++
++function setup() {
++  const elements = new Map();
++  const element = () => ({ textContent: '', innerHTML: '', hidden: false, dataset: {}, classList: { toggle() {} }, querySelectorAll: () => [], setAttribute() {}, removeAttribute() {}, addEventListener() {}, scrollIntoView() {} });
++  const document = { getElementById: id => { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); }, querySelectorAll: () => [], querySelector: element };
++  const store = new Map();
++  const context = vm.createContext({ document, window: { isSecureContext: true, PublicKeyCredential: function() {} }, navigator: { credentials: {} }, location: { origin: 'https://coffee.example', hostname: 'coffee.example' }, crypto: webcrypto, localStorage: { getItem: key => store.get(key) || null, setItem: (key, value) => store.set(key, value), removeItem: key => store.delete(key) }, TextEncoder, TextDecoder, Uint8Array, DataView, btoa, atob, setTimeout, clearTimeout, console });
++  vm.runInContext(readFileSync('app.js', 'utf8'), context);
++  return { context, run: code => vm.runInContext(code, context) };
++}
++function toDER(raw) {
++  const part = bytes => { let n = Buffer.from(bytes); while (n.length > 1 && n[0] === 0) n = n.subarray(1); if (n[0] & 128) n = Buffer.concat([Buffer.from([0]), n]); return Buffer.concat([Buffer.from([2, n.length]), n]); };
++  const content = Buffer.concat([part(raw.subarray(0, 32)), part(raw.subarray(32))]);
++  return Buffer.concat([Buffer.from([0x30, content.length]), content]);
++}
++async function fixture(mode = 'valid') {
++  const env = setup();
++  const pair = await webcrypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
++  const spki = await webcrypto.subtle.exportKey('spki', pair.publicKey);
++  env.context.publicKeyFixture = spki;
++  env.run(`account={id:encode(new Uint8Array([1,2,3])),name:'Coffee Lover',email:'coffee@example.com',keys:[{id:'AQID',name:'Test device',publicKey:encode(publicKeyFixture),created:new Date().toISOString(),counter:0}]}`);
++  env.context.navigator.credentials.get = async ({ publicKey }) => {
++    const clientDataJSON = new TextEncoder().encode(JSON.stringify({ type: 'webauthn.get', challenge: Buffer.from(publicKey.challenge).toString('base64url'), origin: mode === 'origin' ? 'https://evil.example' : 'https://coffee.example', crossOrigin: false }));
++    const authData = new Uint8Array(37);
++    authData.set(new Uint8Array(await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode(mode === 'rp' ? 'evil.example' : 'coffee.example'))));
++    authData[32] = mode === 'unverified' ? 1 : 5;
++    new DataView(authData.buffer).setUint32(33, 1);
++    const hash = new Uint8Array(await webcrypto.subtle.digest('SHA-256', clientDataJSON));
++    const message = new Uint8Array(authData.length + hash.length); message.set(authData); message.set(hash, authData.length);
++    const raw = new Uint8Array(await webcrypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, pair.privateKey, message));
++    if (mode === 'signature') raw[0] ^= 1;
++    return { id: 'AQID', response: { clientDataJSON, authenticatorData: authData.buffer, signature: toDER(raw), userHandle: new Uint8Array([1,2,3]).buffer } };
++  };
++  return env;
++}
++
++test('valid signed passkey signs in and persists last-used information', async () => {
++  const env = await fixture(); await env.run('authenticate()');
++  assert.equal(env.run('signedIn'), true); assert.equal(env.run('account.keys[0].counter'), 1);
++  assert.ok(env.run('account.keys[0].lastUsed'));
++});
++for (const [mode, message] of [['origin', /could not be verified/], ['rp', /identity verification/], ['unverified', /identity verification/], ['signature', /verification failed/]]) {
++  test(`rejects ${mode} assertion without signing in`, async () => { const env = await fixture(mode); await assert.rejects(env.run('authenticate()'), message); assert.equal(env.run('signedIn'), false); });
++}
++test('rejects a replayed signature counter', async () => {
++  const env = await fixture(); env.run('account.keys[0].counter=1');
++  await assert.rejects(env.run('authenticate()'), /invalid signature counter/);
++});
++test('unsupported browsers receive an actionable error', () => {
++  const env = setup(); env.context.window.isSecureContext = false;
++  assert.throws(() => env.run('supported()'), /HTTPS or localhost/);
++});
++test('stored account content is escaped before HTML rendering', () => {
++  const env = setup(); assert.equal(env.run(`escapeHTML('<img src=x onerror="alert(1)">')`), '&lt;img src=x onerror=&quot;alert(1)&quot;&gt;');
++});

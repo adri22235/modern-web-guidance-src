@@ -1,0 +1,428 @@
+diff --git a/index.html b/index.html
+index 66c9173..d6620fb 100644
+--- a/index.html
++++ b/index.html
+@@ -146,6 +146,20 @@
+       margin-bottom: 20px;
+     }
+ 
++    .view {
++      min-height: 50vh;
++      text-align: center;
++    }
++
++    .view h1 {
++      color: var(--primary);
++      margin-bottom: 1rem;
++    }
++
++    .logo a {
++      color: inherit;
++    }
++
+     .footer-links a {
+       margin: 0 10px;
+       color: var(--text);
+@@ -153,49 +167,55 @@
+       font-size: 0.85rem;
+     }
+   </style>
++  <script type="module" src="/perf-monitor.js"></script>
++  <script type="module" src="/router.js"></script>
+ </head>
+ 
+ <body>
+ 
+   <nav>
+-    <div class="logo">THE DAILY GRIND</div>
++    <div class="logo"><a href="/" data-route data-perf-source="nav:home">THE DAILY GRIND</a></div>
+     <ul>
+-      <li><a href="/menu">Menu</a></li>
+-      <li><a href="/locations">Locations</a></li>
+-      <li><a href="/rewards">Rewards</a></li>
+-      <li><a href="/account">My Account</a></li>
+-      <li><a href="/logout" class="logout-link">Logout</a></li>
++      <li><a href="/menu" data-route data-perf-source="nav:menu">Menu</a></li>
++      <li><a href="/locations" data-route data-perf-source="nav:locations">Locations</a></li>
++      <li><a href="/rewards" data-route data-perf-source="nav:rewards">Rewards</a></li>
++      <li><a href="/account" data-route data-perf-source="nav:account">My Account</a></li>
++      <li><a href="/logout" class="logout-link" data-perf-source="nav:logout">Logout</a></li>
+     </ul>
+   </nav>
+ 
++  <div id="home-view">
+   <header class="hero">
+     <h1>Wake Up Your Senses</h1>
+     <p>Ethically sourced, locally roasted, delivered to your cup.</p>
+-    <a href="/order-online" class="btn">Order Now</a>
++    <a href="/order-online" class="btn" data-route data-perf-source="cta:order-now">Order Now</a>
+   </header>
+ 
+   <main class="container">
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+       <div class="grid">
+-        <div class="card">
++        <div class="card" data-perf-source="seasonal:maple-oat-latte">
+           <h3>Maple Oat Latte</h3>
+           <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+-          <a href="/menu/seasonal" class="btn">View Details</a>
++          <a href="/menu/seasonal" class="btn" data-route>View Details</a>
+         </div>
+-        <div class="card">
++        <div class="card" data-perf-source="seasonal:dark-roast-espresso">
+           <h3>Dark Roast Espresso</h3>
+           <p>Bold, smokey, and perfect for a morning boost.</p>
+-          <a href="/menu/espresso" class="btn">View Details</a>
++          <a href="/menu/espresso" class="btn" data-route>View Details</a>
+         </div>
+-        <div class="card">
++        <div class="card" data-perf-source="seasonal:cold-brew">
+           <h3>Cold Brew</h3>
+           <p>Steeped for 18 hours for maximum smoothness.</p>
+-          <a href="/menu/cold-brew" class="btn">View Details</a>
++          <a href="/menu/cold-brew" class="btn" data-route>View Details</a>
+         </div>
+       </div>
+     </section>
+   </main>
++  </div>
++
++  <main id="route-view" class="container view" hidden></main>
+ 
+   <footer>
+     <div class="footer-links">
+diff --git a/perf-monitor.js b/perf-monitor.js
+new file mode 100644
+index 0000000..8797e4b
+--- /dev/null
++++ b/perf-monitor.js
+@@ -0,0 +1,258 @@
++// Client-side interaction paint monitoring for The Daily Grind.
++//
++// Measures how long clicks on tracked elements (anything with a
++// `data-perf-source` attribute) and client-side view switches take to finish
++// painting their visual updates.
++//
++// - `interaction-contentful-paint` (where supported) attributes async paints
++//   back to the interaction that caused them.
++// - `soft-navigation` (where supported) reports client-side view switches.
++// - Event Timing (`event`) gives time-to-next-paint for every browser that
++//   supports it, and is the primary measurement where the above are missing.
++// - A rAF-based estimate is used as a last resort.
++//
++// Reports are logged to the console, exposed on `window.__dailyGrindPerf`, and
++// beaconed to `<html data-rum-endpoint="...">` when the page is hidden (if set).
++
++const TRACKED_SELECTOR = '[data-perf-source]';
++// Interactions keep producing larger paints for a while (e.g. after fetches);
++// report once no new entries have arrived for this long.
++const SETTLE_MS = 5000;
++// Event Timing `startTime` for a click equals the click event's `timeStamp`.
++const CLICK_MATCH_TOLERANCE_MS = 1;
++const MAX_PENDING = 100;
++
++const supports = (type) =>
++  typeof PerformanceObserver !== 'undefined' &&
++  PerformanceObserver.supportedEntryTypes?.includes(type);
++
++const hasEventTiming = supports('event');
++const hasInteractionPaint = supports('interaction-contentful-paint');
++const hasSoftNavigation = supports('soft-navigation');
++
++const records = new Map(); // interactionId -> record
++const pendingClicks = []; // { timeStamp, source }
++const reports = [];
++const beaconQueue = [];
++const endpoint = document.documentElement.dataset.rumEndpoint || null;
++
++window.__dailyGrindPerf = reports;
++
++const round = (ms) => (ms == null ? null : Math.round(ms));
++
++function describeElement(el) {
++  if (!el) return null;
++  let desc = el.tagName.toLowerCase();
++  if (el.id) desc += `#${el.id}`;
++  if (el.classList.length) desc += `.${[...el.classList].join('.')}`;
++  return desc;
++}
++
++function emit(report) {
++  reports.push(report);
++  beaconQueue.push(report);
++  console.info(
++    `[perf] ${report.source}: ${report.visualUpdate}ms to paint (${report.method})`,
++    report,
++  );
++}
++
++function flush() {
++  if (!endpoint || !beaconQueue.length) return;
++  navigator.sendBeacon(endpoint, JSON.stringify(beaconQueue.splice(0)));
++}
++
++function getRecord(interactionId) {
++  let rec = records.get(interactionId);
++  if (!rec) {
++    rec = {
++      interactionId,
++      source: null,
++      startTime: Infinity,
++      nextPaint: null,
++      contentfulPaint: null,
++      largestElement: null,
++      view: null,
++      viewFirstPaint: null,
++      timer: 0,
++    };
++    records.set(interactionId, rec);
++    pruneRecords();
++  }
++  return rec;
++}
++
++// Untracked interactions (clicks elsewhere on the page) are never reported;
++// drop the oldest so the map can't grow without bound.
++function pruneRecords() {
++  if (records.size <= MAX_PENDING) return;
++  for (const [id, rec] of records) {
++    if (!rec.source) records.delete(id);
++    if (records.size <= MAX_PENDING) return;
++  }
++}
++
++function touch(rec) {
++  if (!rec.source) return;
++  clearTimeout(rec.timer);
++  rec.timer = setTimeout(() => finalize(rec), SETTLE_MS);
++}
++
++function finalize(rec) {
++  clearTimeout(rec.timer);
++  records.delete(rec.interactionId);
++  if (!rec.source) return;
++
++  const visualUpdate = rec.contentfulPaint ?? rec.viewFirstPaint ?? rec.nextPaint;
++  if (visualUpdate == null) return;
++
++  emit({
++    source: rec.source,
++    interactionId: rec.interactionId,
++    startTime: round(rec.startTime),
++    // Interaction start -> final contentful paint on screen.
++    visualUpdate: round(visualUpdate),
++    // Interaction start -> very next frame (INP-style).
++    nextPaint: round(rec.nextPaint),
++    contentfulPaint: round(rec.contentfulPaint),
++    largestElement: rec.largestElement,
++    view: rec.view,
++    viewFirstPaint: round(rec.viewFirstPaint),
++    method: rec.contentfulPaint != null ? 'interaction-contentful-paint' : 'event-timing',
++  });
++}
++
++function finalizeAll() {
++  for (const rec of [...records.values()]) finalize(rec);
++}
++
++function afterNextPaint(callback) {
++  requestAnimationFrame(() => setTimeout(callback, 0));
++}
++
++function emitEstimate(source, event, view = null) {
++  afterNextPaint(() => {
++    const visualUpdate = round(performance.now() - event.timeStamp);
++    emit({
++      source,
++      interactionId: null,
++      startTime: round(event.timeStamp),
++      visualUpdate,
++      nextPaint: visualUpdate,
++      contentfulPaint: null,
++      largestElement: null,
++      view,
++      viewFirstPaint: view ? visualUpdate : null,
++      method: 'raf-estimate',
++    });
++  });
++}
++
++function applyInteractionPaint(rec, entry) {
++  rec.startTime = Math.min(rec.startTime, entry.startTime);
++  if (entry.duration > (rec.contentfulPaint ?? -1)) {
++    // duration = presentationTime - interaction startTime.
++    rec.contentfulPaint = entry.duration;
++    rec.largestElement = describeElement(entry.largestContentfulPaint?.element);
++  }
++}
++
++function onClick(event) {
++  const tracked = event.target.closest?.(TRACKED_SELECTOR);
++  if (!tracked) return;
++
++  // A new tracked interaction ends the measurement window for earlier ones.
++  finalizeAll();
++  const source = tracked.dataset.perfSource;
++
++  if (!hasEventTiming) {
++    emitEstimate(source, event);
++    return;
++  }
++
++  const cutoff = event.timeStamp - 10_000;
++  while (pendingClicks.length && pendingClicks[0].timeStamp < cutoff) pendingClicks.shift();
++  pendingClicks.push({ timeStamp: event.timeStamp, source });
++}
++
++function observeEventTiming() {
++  new PerformanceObserver((list) => {
++    for (const entry of list.getEntries()) {
++      if (!entry.interactionId) continue;
++      const rec = getRecord(entry.interactionId);
++      rec.startTime = Math.min(rec.startTime, entry.startTime);
++      rec.nextPaint = Math.max(rec.nextPaint ?? 0, entry.duration);
++
++      // Match by timestamp rather than entry.target: the clicked element may
++      // already be hidden or detached by the time the entry is delivered.
++      if (!rec.source && entry.name === 'click') {
++        const i = pendingClicks.findIndex(
++          (c) => Math.abs(c.timeStamp - entry.startTime) < CLICK_MATCH_TOLERANCE_MS,
++        );
++        if (i !== -1) {
++          rec.source = pendingClicks[i].source;
++          pendingClicks.splice(i, 1);
++        }
++      }
++      touch(rec);
++    }
++    // 16ms is the minimum threshold; the default (104ms) would hide fast clicks.
++  }).observe({ type: 'event', durationThreshold: 16, buffered: true });
++}
++
++function observeInteractionPaints() {
++  new PerformanceObserver((list) => {
++    for (const entry of list.getEntries()) {
++      const rec = getRecord(entry.interactionId);
++      applyInteractionPaint(rec, entry);
++      touch(rec);
++    }
++  }).observe({ type: 'interaction-contentful-paint', buffered: true });
++}
++
++function observeSoftNavigations() {
++  new PerformanceObserver((list) => {
++    for (const entry of list.getEntries()) {
++      const rec = getRecord(entry.interactionId);
++      rec.view = entry.name;
++      // duration = first contentful paint of the new view - interaction start.
++      rec.viewFirstPaint = entry.duration;
++      rec.source ??= 'view-switch';
++      // Include paints that happened before the URL was updated.
++      const seed = entry.getLargestInteractionContentfulPaint?.();
++      if (seed) applyInteractionPaint(rec, seed);
++      touch(rec);
++    }
++  }).observe({ type: 'soft-navigation', buffered: true });
++}
++
++/**
++ * Called by the router after it renders a new view.
++ * Only needed as a fallback where `soft-navigation` isn't supported; clicks are
++ * already covered by Event Timing, so this handles e.g. back/forward.
++ *
++ * @param {string} url
++ * @param {Event} triggerEvent The event that caused the view switch.
++ */
++export function noteViewSwitch(url, triggerEvent) {
++  if (hasSoftNavigation) return;
++  if (triggerEvent.type === 'click') {
++    // Tracked clicks are already measured via onClick / Event Timing.
++    if (triggerEvent.target.closest?.(TRACKED_SELECTOR)) return;
++  } else {
++    finalizeAll();
++  }
++  emitEstimate('view-switch', triggerEvent, url);
++}
++
++document.addEventListener('click', onClick, { capture: true });
++if (hasEventTiming) observeEventTiming();
++if (hasInteractionPaint) observeInteractionPaints();
++if (hasSoftNavigation) observeSoftNavigations();
++
++document.addEventListener('visibilitychange', () => {
++  if (document.visibilityState === 'hidden') {
++    finalizeAll();
++    flush();
++  }
++});
+diff --git a/router.js b/router.js
+new file mode 100644
+index 0000000..933fcdb
+--- /dev/null
++++ b/router.js
+@@ -0,0 +1,64 @@
++// Minimal client-side view switching for links marked with `data-route`.
++import { noteViewSwitch } from './perf-monitor.js';
++
++const VIEWS = {
++  '/menu': ['Menu', 'Espresso classics, pour-overs, teas, and fresh pastries baked every morning.'],
++  '/locations': ['Locations', 'Find a Daily Grind cafe near you, open 6am to 8pm every day.'],
++  '/rewards': ['Rewards', 'Earn a bean for every dollar spent and redeem them for free drinks.'],
++  '/account': ['My Account', 'Manage your profile, saved orders, and payment methods.'],
++  '/order-online': ['Order Online', 'Pick your drink, customize it, and skip the line at pickup.'],
++  '/menu/seasonal': ['Maple Oat Latte', 'Creamy oat milk with a hint of Vermont maple syrup. Available through winter.'],
++  '/menu/espresso': ['Dark Roast Espresso', 'Bold, smokey, and perfect for a morning boost. Pulled as a double shot.'],
++  '/menu/cold-brew': ['Cold Brew', 'Steeped for 18 hours for maximum smoothness. Served over ice.'],
++};
++
++const HOME_TITLE = document.title;
++const homeView = document.getElementById('home-view');
++const routeView = document.getElementById('route-view');
++
++function render(path, triggerEvent) {
++  if (path === '/') {
++    homeView.hidden = false;
++    routeView.hidden = true;
++    document.title = HOME_TITLE;
++  } else {
++    const [title, body] = VIEWS[path] ?? ['Page Not Found', "We couldn't find that page."];
++    const heading = document.createElement('h1');
++    heading.textContent = title;
++    heading.tabIndex = -1;
++    const text = document.createElement('p');
++    text.textContent = body;
++    const back = document.createElement('a');
++    back.href = '/';
++    back.className = 'btn';
++    back.dataset.route = '';
++    back.textContent = 'Back to Home';
++
++    routeView.replaceChildren(heading, text, back);
++    homeView.hidden = true;
++    routeView.hidden = false;
++    document.title = `${title} | The Daily Grind`;
++    heading.focus({ preventScroll: true });
++  }
++  window.scrollTo(0, 0);
++  if (triggerEvent) noteViewSwitch(location.href, triggerEvent);
++}
++
++document.addEventListener('click', (event) => {
++  const link = event.target.closest('a[data-route]');
++  if (
++    !link ||
++    event.defaultPrevented ||
++    event.button !== 0 ||
++    event.metaKey || event.ctrlKey || event.shiftKey || event.altKey
++  ) return;
++
++  event.preventDefault();
++  const url = new URL(link.href);
++  if (url.pathname !== location.pathname) history.pushState(null, '', url);
++  render(url.pathname, event);
++});
++
++window.addEventListener('popstate', (event) => render(location.pathname, event));
++
++if (location.pathname !== '/' && location.pathname !== '/index.html') render(location.pathname);

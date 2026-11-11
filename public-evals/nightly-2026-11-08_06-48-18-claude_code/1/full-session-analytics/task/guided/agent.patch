@@ -1,0 +1,118 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -4,8 +4,114 @@
+ <head>
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <title>Demo</title>
++  <script type="module">
++    // Core Web Vitals monitoring.
++    // Metrics are queued with fetchLater() so the browser sends the latest
++    // snapshot only when the user leaves the page (tab close, navigation, or
++    // the page entering bfcache). No unload/beforeunload listeners are used.
++    import { onCLS, onINP, onLCP } from 'https://unpkg.com/web-vitals@5?module';
++
++    const ANALYTICS_ENDPOINT = '/path/to/analytics/endpoint';
++
++    // Minimal fetchLater() polyfill for browsers without native support
++    // (Firefox, Safari). Delivers on `visibilitychange` -> hidden using fetch
++    // keepalive, falling back to navigator.sendBeacon().
++    globalThis.fetchLater ??= function fetchLater(url, init = {}) {
++      let timeoutHandle;
++      let activated = false;
++
++      function sendNow() {
++        if (!(init.signal && init.signal.aborted)) {
++          if (
++            'keepalive' in Request.prototype ||
++            init.method !== 'POST' ||
++            init.headers
++          ) {
++            fetch(url, Object.assign({}, init, { keepalive: true }));
++            activated = true;
++          } else {
++            activated = navigator.sendBeacon(url, init.body);
++          }
++        }
++        destroy();
++      }
++
++      function destroy() {
++        document.removeEventListener('visibilitychange', sendNow);
++        clearTimeout(timeoutHandle);
++      }
++
++      if (document.visibilityState === 'hidden') {
++        queueMicrotask(sendNow);
++      } else {
++        document.addEventListener('visibilitychange', sendNow);
++        if (typeof init.activateAfter === 'number' && init.activateAfter >= 0) {
++          timeoutHandle = setTimeout(sendNow, init.activateAfter);
++        }
++      }
++
++      if (init.signal) {
++        init.signal.addEventListener('abort', destroy);
++      }
++
++      return {
++        get activated() {
++          return activated;
++        },
++      };
++    };
++
++    // Latest value of each metric that hasn't been delivered yet.
++    const pendingMetrics = new Map();
++    let controller = null;
++    let pendingResult = null;
++
++    function queueBeacon(metric) {
++      // If the previously scheduled beacon was already sent (e.g. the page was
++      // hidden or entered bfcache and was later restored), its metrics have
++      // been delivered — start a fresh batch so nothing is double-reported.
++      if (pendingResult && pendingResult.activated) {
++        pendingMetrics.clear();
++        pendingResult = null;
++      }
++
++      pendingMetrics.set(metric.name, {
++        name: metric.name,
++        id: metric.id,
++        value: metric.value,
++        delta: metric.delta,
++        rating: metric.rating,
++        navigationType: metric.navigationType,
++      });
++
++      // Replace any pending beacon with one carrying the updated snapshot.
++      controller?.abort();
++      controller = new AbortController();
++
++      try {
++        pendingResult = fetchLater(ANALYTICS_ENDPOINT, {
++          method: 'POST',
++          headers: { 'content-type': 'application/json' },
++          body: JSON.stringify({
++            page: location.pathname,
++            metrics: [...pendingMetrics.values()],
++          }),
++          signal: controller.signal,
++        });
++      } catch (error) {
++        // Quota exceeded or other scheduling error; drop this update.
++        pendingResult = null;
++      }
++    }
++
++    // reportAllChanges keeps the queued payload current with every update, so
++    // whatever is pending when the user leaves holds the final values.
++    onCLS(queueBeacon, { reportAllChanges: true });
++    onINP(queueBeacon, { reportAllChanges: true });
++    onLCP(queueBeacon, { reportAllChanges: true });
++  </script>
+   <style>
+     :root {
+       --primary: #2563eb;
+       --bg: #f8fafc;

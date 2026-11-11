@@ -1,0 +1,543 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -151,9 +151,487 @@
+       color: var(--text);
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    /* Script Performance Monitor Styles */
++    .perf-monitor {
++      background: white;
++      border: 1px solid var(--secondary);
++      border-radius: 8px;
++      padding: 20px;
++      margin-top: 30px;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.08);
++    }
++
++    .perf-monitor-header {
++      display: flex;
++      justify-content: space-between;
++      align-items: center;
++      flex-wrap: wrap;
++      gap: 10px;
++      border-bottom: 1px solid var(--secondary);
++      padding-bottom: 12px;
++      margin-bottom: 15px;
++    }
++
++    .perf-monitor-header h2 {
++      color: var(--primary);
++      font-size: 1.35rem;
++    }
++
++    .perf-controls {
++      display: flex;
++      gap: 10px;
++      align-items: center;
++    }
++
++    .btn-sm {
++      background: var(--primary);
++      color: white;
++      border: none;
++      padding: 6px 12px;
++      border-radius: 4px;
++      cursor: pointer;
++      font-size: 0.85rem;
++    }
++
++    .btn-sm.secondary {
++      background: #795548;
++    }
++
++    .btn-sm:hover {
++      opacity: 0.9;
++    }
++
++    .perf-stats {
++      display: grid;
++      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
++      gap: 12px;
++      margin-bottom: 15px;
++    }
++
++    .perf-stat-card {
++      background: var(--light);
++      border: 1px solid var(--secondary);
++      border-radius: 6px;
++      padding: 10px 14px;
++    }
++
++    .perf-stat-label {
++      font-size: 0.78rem;
++      color: #6d4c41;
++      text-transform: uppercase;
++      letter-spacing: 0.5px;
++    }
++
++    .perf-stat-value {
++      font-size: 1.3rem;
++      font-weight: bold;
++      color: var(--primary);
++    }
++
++    .perf-log-table-wrapper {
++      overflow-x: auto;
++    }
++
++    .perf-log-table {
++      width: 100%;
++      border-collapse: collapse;
++      font-size: 0.88rem;
++    }
++
++    .perf-log-table th,
++    .perf-log-table td {
++      text-align: left;
++      padding: 8px 10px;
++      border-bottom: 1px solid var(--secondary);
++    }
++
++    .perf-log-table th {
++      background: var(--light);
++      color: var(--primary);
++      font-weight: 600;
++    }
++
++    .perf-empty {
++      text-align: center;
++      color: #6d4c41;
++      padding: 16px;
++      font-style: italic;
++    }
+   </style>
++  <script>
++    (function () {
++      const STORAGE_KEY = 'daily_grind_script_perf_history';
++      const MAX_RECORDS = 100;
++      const FRAME_DELAY_THRESHOLD_MS = 50;
++      const SCRIPT_DURATION_THRESHOLD_MS = 5;
++
++      function loadPastOccurrences() {
++        try {
++          const raw = localStorage.getItem(STORAGE_KEY);
++          if (!raw) return [];
++          const parsed = JSON.parse(raw);
++          return Array.isArray(parsed) ? parsed : [];
++        } catch (e) {
++          return [];
++        }
++      }
++
++      function saveOccurrences(records) {
++        try {
++          localStorage.setItem(STORAGE_KEY, JSON.stringify(records.slice(0, MAX_RECORDS)));
++        } catch (e) {
++          // Ignore storage quota or privacy mode errors
++        }
++      }
++
++      const state = {
++        occurrences: loadPastOccurrences(),
++        seenEntryKeys: new Set(),
++        observers: []
++      };
++
++      function createOccurrenceKey(entryType, startTime, duration, scriptIndex) {
++        return `${entryType}:${Math.round(startTime * 100)}:${Math.round(duration * 100)}:${scriptIndex || 0}`;
++      }
++
++      function recordOccurrence(occurrence) {
++        state.occurrences.unshift(occurrence);
++        if (state.occurrences.length > MAX_RECORDS) {
++          state.occurrences.length = MAX_RECORDS;
++        }
++        saveOccurrences(state.occurrences);
++        updateUI();
++        window.dispatchEvent(new CustomEvent('slow-script-detected', { detail: occurrence }));
++      }
++
++      function processLongAnimationFrameEntry(entry) {
++        const frameDuration = entry.duration || 0;
++        if (frameDuration < FRAME_DELAY_THRESHOLD_MS) return;
++
++        const scripts = Array.isArray(entry.scripts) ? entry.scripts : [];
++        const renderDelay = entry.renderStart > 0
++          ? Math.max(0, entry.renderStart - entry.startTime)
++          : frameDuration;
++        const styleAndLayoutDuration = (entry.renderStart > 0 && entry.styleAndLayoutStart > 0)
++          ? Math.max(0, (entry.startTime + entry.duration) - entry.styleAndLayoutStart)
++          : 0;
++
++        if (scripts.length > 0) {
++          scripts.forEach(function (script, index) {
++            const scriptDuration = script.duration || 0;
++            if (scriptDuration < SCRIPT_DURATION_THRESHOLD_MS && scripts.length > 1) {
++              return;
++            }
++            const key = createOccurrenceKey('long-animation-frame', entry.startTime, frameDuration, index);
++            if (state.seenEntryKeys.has(key)) return;
++            state.seenEntryKeys.add(key);
++
++            recordOccurrence({
++              id: key,
++              timestamp: new Date(performance.timeOrigin + entry.startTime).toISOString(),
++              entryType: 'long-animation-frame',
++              frameStartTime: Math.round(entry.startTime * 100) / 100,
++              frameDuration: Math.round(frameDuration * 100) / 100,
++              blockingDuration: Math.round((entry.blockingDuration || 0) * 100) / 100,
++              renderDelay: Math.round(renderDelay * 100) / 100,
++              styleAndLayoutDuration: Math.round(styleAndLayoutDuration * 100) / 100,
++              firstUIEventTimestamp: entry.firstUIEventTimestamp || 0,
++              script: {
++                invoker: script.invoker || 'anonymous',
++                invokerType: script.invokerType || 'unknown',
++                sourceURL: script.sourceURL || window.location.href,
++                sourceFunctionName: script.sourceFunctionName || '(anonymous)',
++                sourceCharPosition: typeof script.sourceCharPosition === 'number' ? script.sourceCharPosition : -1,
++                executionStart: Math.round((script.executionStart || entry.startTime) * 100) / 100,
++                duration: Math.round(scriptDuration * 100) / 100,
++                forcedStyleAndLayoutDuration: Math.round((script.forcedStyleAndLayoutDuration || 0) * 100) / 100,
++                pauseDuration: Math.round((script.pauseDuration || 0) * 100) / 100,
++                windowAttribution: script.windowAttribution || 'self'
++              }
++            });
++          });
++        } else {
++          const key = createOccurrenceKey('long-animation-frame', entry.startTime, frameDuration, -1);
++          if (state.seenEntryKeys.has(key)) return;
++          state.seenEntryKeys.add(key);
++
++          recordOccurrence({
++            id: key,
++            timestamp: new Date(performance.timeOrigin + entry.startTime).toISOString(),
++            entryType: 'long-animation-frame',
++            frameStartTime: Math.round(entry.startTime * 100) / 100,
++            frameDuration: Math.round(frameDuration * 100) / 100,
++            blockingDuration: Math.round((entry.blockingDuration || 0) * 100) / 100,
++            renderDelay: Math.round(renderDelay * 100) / 100,
++            styleAndLayoutDuration: Math.round(styleAndLayoutDuration * 100) / 100,
++            firstUIEventTimestamp: entry.firstUIEventTimestamp || 0,
++            script: {
++              invoker: entry.name || 'frame-task',
++              invokerType: 'frame',
++              sourceURL: window.location.href,
++              sourceFunctionName: '(unattributed)',
++              sourceCharPosition: -1,
++              executionStart: Math.round(entry.startTime * 100) / 100,
++              duration: Math.round(frameDuration * 100) / 100,
++              forcedStyleAndLayoutDuration: 0,
++              pauseDuration: 0,
++              windowAttribution: 'self'
++            }
++          });
++        }
++      }
++
++      function processLongTaskEntry(entry) {
++        const duration = entry.duration || 0;
++        if (duration < FRAME_DELAY_THRESHOLD_MS) return;
++
++        const key = createOccurrenceKey('longtask', entry.startTime, duration, 0);
++        if (state.seenEntryKeys.has(key)) return;
++        state.seenEntryKeys.add(key);
++
++        const attribution = Array.isArray(entry.attribution) && entry.attribution[0] ? entry.attribution[0] : {};
++        recordOccurrence({
++          id: key,
++          timestamp: new Date(performance.timeOrigin + entry.startTime).toISOString(),
++          entryType: 'longtask',
++          frameStartTime: Math.round(entry.startTime * 100) / 100,
++          frameDuration: Math.round(duration * 100) / 100,
++          blockingDuration: Math.round(Math.max(0, duration - 50) * 100) / 100,
++          renderDelay: Math.round(duration * 100) / 100,
++          styleAndLayoutDuration: 0,
++          firstUIEventTimestamp: 0,
++          script: {
++            invoker: attribution.containerName || attribution.name || entry.name || 'longtask',
++            invokerType: attribution.containerType || 'script',
++            sourceURL: attribution.containerSrc || window.location.href,
++            sourceFunctionName: attribution.name || '(longtask)',
++            sourceCharPosition: -1,
++            executionStart: Math.round(entry.startTime * 100) / 100,
++            duration: Math.round(duration * 100) / 100,
++            forcedStyleAndLayoutDuration: 0,
++            pauseDuration: 0,
++            windowAttribution: entry.name || 'self'
++          }
++        });
++      }
++
++      function initPerformanceMonitoring() {
++        if (typeof PerformanceObserver === 'undefined') return;
++
++        const supportedTypes = Array.isArray(PerformanceObserver.supportedEntryTypes)
++          ? PerformanceObserver.supportedEntryTypes
++          : [];
++
++        // Observe Long Animation Frames (LoAF) with buffered: true to capture past occurrences
++        if (supportedTypes.includes('long-animation-frame')) {
++          try {
++            const loafObserver = new PerformanceObserver(function (list) {
++              list.getEntries().forEach(processLongAnimationFrameEntry);
++            });
++            loafObserver.observe({ type: 'long-animation-frame', buffered: true });
++            state.observers.push(loafObserver);
++          } catch (e) {
++            // Fallback if observe fails
++          }
++        } else {
++          // Try observing long-animation-frame even if supportedEntryTypes is incomplete, fallback to longtask
++          try {
++            const loafObserver = new PerformanceObserver(function (list) {
++              list.getEntries().forEach(processLongAnimationFrameEntry);
++            });
++            loafObserver.observe({ type: 'long-animation-frame', buffered: true });
++            state.observers.push(loafObserver);
++          } catch (e) {
++            // Ignore if unsupported
++          }
++        }
++
++        // Also observe longtask with buffered: true if long-animation-frame is unavailable
++        if (!supportedTypes.includes('long-animation-frame') && supportedTypes.includes('longtask')) {
++          try {
++            const longTaskObserver = new PerformanceObserver(function (list) {
++              list.getEntries().forEach(processLongTaskEntry);
++            });
++            longTaskObserver.observe({ type: 'longtask', buffered: true });
++            state.observers.push(longTaskObserver);
++          } catch (e) {
++            // Ignore if unsupported
++          }
++        }
++
++        // Also inspect any already-buffered entries via performance.getEntriesByType
++        if (typeof performance !== 'undefined' && typeof performance.getEntriesByType === 'function') {
++          try {
++            const bufferedLoaf = performance.getEntriesByType('long-animation-frame') || [];
++            bufferedLoaf.forEach(processLongAnimationFrameEntry);
++          } catch (e) {}
++        }
++      }
++
++      function formatSource(script) {
++        if (!script) return 'unknown';
++        const fn = script.sourceFunctionName && script.sourceFunctionName !== '(anonymous)'
++          ? `${script.sourceFunctionName}()`
++          : script.invoker || 'anonymous';
++        const url = script.sourceURL ? script.sourceURL.split('/').pop() || script.sourceURL : 'inline';
++        const pos = typeof script.sourceCharPosition === 'number' && script.sourceCharPosition >= 0
++          ? `:${script.sourceCharPosition}`
++          : '';
++        return `${fn} (${url}${pos})`;
++      }
++
++      function updateUI() {
++        const totalEl = document.getElementById('perf-total-count');
++        const maxDurationEl = document.getElementById('perf-max-duration');
++        const totalBlockingEl = document.getElementById('perf-total-blocking');
++        const tbody = document.getElementById('perf-occurrences-body');
++
++        if (!tbody) return;
++
++        const records = state.occurrences;
++        const totalCount = records.length;
++        const maxFrameDuration = records.reduce(function (max, r) {
++          return Math.max(max, r.frameDuration || 0);
++        }, 0);
++        const totalBlocking = records.reduce(function (sum, r) {
++          return sum + (r.blockingDuration || 0);
++        }, 0);
++
++        if (totalEl) totalEl.textContent = String(totalCount);
++        if (maxDurationEl) maxDurationEl.textContent = `${Math.round(maxFrameDuration)} ms`;
++        if (totalBlockingEl) totalBlockingEl.textContent = `${Math.round(totalBlocking)} ms`;
++
++        tbody.innerHTML = '';
++        if (records.length === 0) {
++          const tr = document.createElement('tr');
++          const td = document.createElement('td');
++          td.colSpan = 6;
++          td.className = 'perf-empty';
++          td.textContent = 'No slow scripts or frame delays (>50ms) recorded yet.';
++          tr.appendChild(td);
++          tbody.appendChild(tr);
++          return;
++        }
++
++        records.forEach(function (item) {
++          const tr = document.createElement('tr');
++
++          const timeTd = document.createElement('td');
++          const date = item.timestamp ? new Date(item.timestamp) : null;
++          timeTd.textContent = date && !isNaN(date.getTime())
++            ? date.toLocaleTimeString()
++            : `${item.frameStartTime} ms`;
++
++          const invokerTd = document.createElement('td');
++          invokerTd.textContent = item.script
++            ? `${item.script.invoker} (${item.script.invokerType})`
++            : 'unknown';
++
++          const sourceTd = document.createElement('td');
++          sourceTd.textContent = formatSource(item.script);
++
++          const scriptDurTd = document.createElement('td');
++          scriptDurTd.textContent = `${item.script ? item.script.duration : item.frameDuration} ms`;
++
++          const frameDurTd = document.createElement('td');
++          frameDurTd.textContent = `${item.frameDuration} ms`;
++
++          const blockingTd = document.createElement('td');
++          blockingTd.textContent = `${item.blockingDuration || 0} ms`;
++
++          tr.appendChild(timeTd);
++          tr.appendChild(invokerTd);
++          tr.appendChild(sourceTd);
++          tr.appendChild(scriptDurTd);
++          tr.appendChild(frameDurTd);
++          tr.appendChild(blockingTd);
++          tbody.appendChild(tr);
++        });
++      }
++
++      function simulateSlowScript(durationMs) {
++        const targetMs = typeof durationMs === 'number' && durationMs > 0 ? durationMs : 85;
++        const startPerf = performance.now();
++        while (performance.now() - startPerf < targetMs) {
++          // Busy wait to simulate slow synchronous script causing frame delay
++        }
++        const actualDuration = performance.now() - startPerf;
++
++        // If browser does not emit a LoAF/longtask entry within 150ms (e.g. unsupported environment), record directly
++        setTimeout(function () {
++          const recentlyRecorded = state.occurrences.some(function (r) {
++            return Math.abs(r.frameStartTime - startPerf) < 100;
++          });
++          if (!recentlyRecorded) {
++            const key = createOccurrenceKey('manual-probe', startPerf, actualDuration, 0);
++            if (!state.seenEntryKeys.has(key)) {
++              state.seenEntryKeys.add(key);
++              recordOccurrence({
++                id: key,
++                timestamp: new Date(performance.timeOrigin + startPerf).toISOString(),
++                entryType: 'long-animation-frame',
++                frameStartTime: Math.round(startPerf * 100) / 100,
++                frameDuration: Math.round(actualDuration * 100) / 100,
++                blockingDuration: Math.round(Math.max(0, actualDuration - 50) * 100) / 100,
++                renderDelay: Math.round(actualDuration * 100) / 100,
++                styleAndLayoutDuration: 0,
++                firstUIEventTimestamp: 0,
++                script: {
++                  invoker: 'BUTTON#simulate-slow-script.onclick',
++                  invokerType: 'event-listener',
++                  sourceURL: window.location.href,
++                  sourceFunctionName: 'simulateSlowScript',
++                  sourceCharPosition: 0,
++                  executionStart: Math.round(startPerf * 100) / 100,
++                  duration: Math.round(actualDuration * 100) / 100,
++                  forcedStyleAndLayoutDuration: 0,
++                  pauseDuration: 0,
++                  windowAttribution: 'self'
++                }
++              });
++            }
++          }
++        }, 150);
++      }
++
++      function clearHistory() {
++        state.occurrences = [];
++        state.seenEntryKeys.clear();
++        saveOccurrences([]);
++        updateUI();
++      }
++
++      window.scriptPerformanceMonitor = {
++        getOccurrences: function () {
++          return state.occurrences.slice();
++        },
++        recordOccurrence: recordOccurrence,
++        simulateSlowScript: simulateSlowScript,
++        clearHistory: clearHistory
++      };
++
++      initPerformanceMonitoring();
++
++      window.addEventListener('DOMContentLoaded', function () {
++        updateUI();
++
++        const simBtn = document.getElementById('simulate-slow-script');
++        if (simBtn) {
++          simBtn.addEventListener('click', function () {
++            simulateSlowScript(85);
++          });
++        }
++
++        const clearBtn = document.getElementById('clear-perf-history');
++        if (clearBtn) {
++          clearBtn.addEventListener('click', clearHistory);
++        }
++      });
++    })();
++  </script>
+ </head>
+ 
+ <body>
+ 
+@@ -194,8 +672,51 @@
+           <a href="/menu/cold-brew" class="btn">View Details</a>
+         </div>
+       </div>
+     </section>
++
++    <section class="perf-monitor" id="script-performance-monitor" aria-label="Script Performance Monitor">
++      <div class="perf-monitor-header">
++        <h2>Script Performance Monitor</h2>
++        <div class="perf-controls">
++          <button type="button" id="simulate-slow-script" class="btn-sm">Simulate Slow Script</button>
++          <button type="button" id="clear-perf-history" class="btn-sm secondary">Clear History</button>
++        </div>
++      </div>
++      <div class="perf-stats">
++        <div class="perf-stat-card">
++          <div class="perf-stat-label">Recorded Occurrences</div>
++          <div class="perf-stat-value" id="perf-total-count">0</div>
++        </div>
++        <div class="perf-stat-card">
++          <div class="perf-stat-label">Max Frame Duration</div>
++          <div class="perf-stat-value" id="perf-max-duration">0 ms</div>
++        </div>
++        <div class="perf-stat-card">
++          <div class="perf-stat-label">Total Blocking Time</div>
++          <div class="perf-stat-value" id="perf-total-blocking">0 ms</div>
++        </div>
++      </div>
++      <div class="perf-log-table-wrapper">
++        <table class="perf-log-table">
++          <thead>
++            <tr>
++              <th>Timestamp</th>
++              <th>Invoker</th>
++              <th>Script Source</th>
++              <th>Script Duration</th>
++              <th>Frame Duration</th>
++              <th>Blocking Duration</th>
++            </tr>
++          </thead>
++          <tbody id="perf-occurrences-body">
++            <tr>
++              <td colspan="6" class="perf-empty">No slow scripts or frame delays (&gt;50ms) recorded yet.</td>
++            </tr>
++          </tbody>
++        </table>
++      </div>
++    </section>
+   </main>
+ 
+   <footer>
+     <div class="footer-links">

@@ -1,0 +1,206 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -134,8 +134,49 @@
+     .btn:hover {
+       background: #3e2723;
+     }
+ 
++    .signin {
++      max-width: 380px;
++      margin: 0 auto 40px;
++      background: white;
++      padding: 24px;
++      border-radius: 8px;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++    }
++
++    .signin h2 {
++      text-align: center;
++      margin-bottom: 12px;
++    }
++
++    .signin label {
++      display: block;
++      font-size: 0.85rem;
++      margin-top: 10px;
++    }
++
++    .signin input {
++      width: 100%;
++      padding: 8px 10px;
++      border: 1px solid var(--secondary);
++      border-radius: 4px;
++      font: inherit;
++    }
++
++    .signin button {
++      width: 100%;
++      border: 0;
++      cursor: pointer;
++      font: inherit;
++    }
++
++    #signin-error {
++      color: #b71c1c;
++      font-size: 0.85rem;
++      margin-top: 10px;
++    }
++
+     footer {
+       background: var(--secondary);
+       text-align: center;
+       padding: 40px 20px;
+@@ -174,8 +215,20 @@
+     <a href="/order-online" class="btn">Order Now</a>
+   </header>
+ 
+   <main class="container">
++    <section class="signin">
++      <h2>Sign In</h2>
++      <form id="signin-form" method="post" action="/api/signin">
++        <label for="signin-username">Email or username</label>
++        <input id="signin-username" name="username" type="text" autocomplete="username webauthn" required>
++        <label for="signin-password">Password</label>
++        <input id="signin-password" name="password" type="password" autocomplete="current-password" required>
++        <p id="signin-error" role="alert" hidden></p>
++        <button type="submit" class="btn" data-testid="signin-button">Sign In</button>
++      </form>
++    </section>
++
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+       <div class="grid">
+         <div class="card">
+@@ -206,7 +259,131 @@
+     </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script>
++    // --- base64url helpers ---
++    const b64uToBuf = (s) => {
++      const b64 = s.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(s.length / 4) * 4, '=');
++      return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)).buffer;
++    };
++    const bufToB64u = (buf) =>
++      btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
++
++    // Can this browser silently create a passkey? Any failure => false.
++    async function canRegisterPasskey() {
++      try {
++        if (!window.isSecureContext || !window.PublicKeyCredential || !navigator.credentials?.create) return false;
++        if (PublicKeyCredential.getClientCapabilities) {
++          const caps = await PublicKeyCredential.getClientCapabilities();
++          if (caps && caps.userVerifyingPlatformAuthenticator === false) return false;
++          if (caps && caps.passkeyPlatformAuthenticator === false) return false;
++        }
++        if (PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable) {
++          return await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
++        }
++        return false;
++      } catch {
++        return false;
++      }
++    }
++
++    function toCreationOptions(json) {
++      if (PublicKeyCredential.parseCreationOptionsFromJSON) {
++        return PublicKeyCredential.parseCreationOptionsFromJSON(json);
++      }
++      return {
++        ...json,
++        challenge: b64uToBuf(json.challenge),
++        user: { ...json.user, id: b64uToBuf(json.user.id) },
++        excludeCredentials: (json.excludeCredentials || []).map((c) => ({ ...c, id: b64uToBuf(c.id) })),
++      };
++    }
++
++    // Remove a credential the server never accepted, where the browser supports signalling it.
++    async function cleanupOrphan(rpId, credentialId) {
++      try {
++        if (PublicKeyCredential.signalUnknownCredential) {
++          await PublicKeyCredential.signalUnknownCredential({ rpId, credentialId });
++        }
++      } catch { /* best effort */ }
++    }
++
++    // Runs after a successful password sign-in. Never throws, never shows UI of its own.
++    async function silentPasskeyRegistration() {
++      try {
++        if (!(await canRegisterPasskey())) return;
++
++        const optRes = await fetch('/api/register/options', {
++          method: 'POST',
++          credentials: 'same-origin',
++          headers: { 'Content-Type': 'application/json' },
++          body: '{}',
++        });
++        if (!optRes.ok) return;
++        const optionsJSON = await optRes.json();
++
++        const credential = await navigator.credentials.create({ publicKey: toCreationOptions(optionsJSON) });
++        if (!credential) return;
++
++        const rpId = optionsJSON.rp?.id || location.hostname;
++        let verified = false;
++        try {
++          const verifyRes = await fetch('/api/register/verify', {
++            method: 'POST',
++            credentials: 'same-origin',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({
++              id: credential.id,
++              rawId: bufToB64u(credential.rawId),
++              type: credential.type,
++              authenticatorAttachment: credential.authenticatorAttachment,
++              response: {
++                clientDataJSON: bufToB64u(credential.response.clientDataJSON),
++                attestationObject: bufToB64u(credential.response.attestationObject),
++                transports: credential.response.getTransports ? credential.response.getTransports() : [],
++              },
++              clientExtensionResults: credential.getClientExtensionResults(),
++            }),
++          });
++          verified = verifyRes.ok;
++        } catch {
++          verified = false;
++        }
++        if (!verified) await cleanupOrphan(rpId, bufToB64u(credential.rawId));
++      } catch {
++        // Silent by design (user cancelled, unsupported, network, etc.)
++      }
++    }
++
++    document.getElementById('signin-form').addEventListener('submit', async (e) => {
++      e.preventDefault();
++      const form = e.currentTarget;
++      const errorEl = document.getElementById('signin-error');
++      const button = form.querySelector('[data-testid="signin-button"]');
++      errorEl.hidden = true;
++      button.disabled = true;
++      try {
++        const res = await fetch(form.action, {
++          method: 'POST',
++          credentials: 'same-origin',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify({
++            username: form.username.value,
++            password: form.password.value,
++          }),
++        });
++        if (!res.ok) throw new Error('Sign-in failed');
++        form.password.value = '';
++        // Fire and forget: must not delay or affect the sign-in outcome.
++        silentPasskeyRegistration();
++      } catch {
++        errorEl.textContent = 'Sign-in failed. Check your credentials and try again.';
++        errorEl.hidden = false;
++      } finally {
++        button.disabled = false;
++      }
++    });
++  </script>
+ </body>
+ 
+ </html>

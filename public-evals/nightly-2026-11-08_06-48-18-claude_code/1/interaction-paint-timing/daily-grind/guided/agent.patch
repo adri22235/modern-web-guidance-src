@@ -1,0 +1,246 @@
+diff --git a/index.html b/index.html
+index 66c9173..59ef9c9 100644
+--- a/index.html
++++ b/index.html
+@@ -153,11 +153,12 @@
+       font-size: 0.85rem;
+     }
+   </style>
++  <script type="module" src="/perf-monitor.js"></script>
+ </head>
+ 
+ <body>
+ 
+-  <nav>
++  <nav data-perf-region="nav">
+     <div class="logo">THE DAILY GRIND</div>
+     <ul>
+       <li><a href="/menu">Menu</a></li>
+@@ -171,11 +172,11 @@
+   <header class="hero">
+     <h1>Wake Up Your Senses</h1>
+     <p>Ethically sourced, locally roasted, delivered to your cup.</p>
+-    <a href="/order-online" class="btn">Order Now</a>
++    <a href="/order-online" class="btn" data-perf-region="order-now">Order Now</a>
+   </header>
+ 
+   <main class="container">
+-    <section>
++    <section data-perf-region="seasonal-favorites">
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+       <div class="grid">
+         <div class="card">
+diff --git a/perf-monitor.js b/perf-monitor.js
+new file mode 100644
+index 0000000..8f97448
+--- /dev/null
++++ b/perf-monitor.js
+@@ -0,0 +1,208 @@
++/**
++ * Daily Grind client-side performance monitoring.
++ *
++ * Measures how long it takes from a user interaction until the resulting
++ * visual update is painted on screen, for:
++ *   - clicks in the navigation bar          (data-perf-region="nav")
++ *   - the hero "Order Now" button           (data-perf-region="order-now")
++ *   - the "Seasonal Favorites" cards        (data-perf-region="seasonal-favorites")
++ *   - client-side view switches (SPA soft navigations)
++ *
++ * APIs used:
++ *   - 'event' (PerformanceEventTiming): maps interactionId -> clicked element,
++ *     and provides the next-paint latency (fallback in browsers without ICP).
++ *   - 'interaction-contentful-paint': the full interaction -> contentful paint
++ *     latency, including async updates (fetch / await / setTimeout).
++ *   - 'soft-navigation': client-side view switches (URL change + paint).
++ *
++ * Results are pushed to `window.__dailyGrindPerf`, dispatched as a
++ * `dailygrind:perf` CustomEvent on `window`, logged to the console, and
++ * optionally beaconed to `PERF_ENDPOINT` when the page is hidden.
++ */
++
++// Set to a URL (e.g. '/analytics/perf') to send metrics with sendBeacon.
++const PERF_ENDPOINT = null;
++
++const supported = (type) =>
++  typeof PerformanceObserver !== 'undefined' &&
++  PerformanceObserver.supportedEntryTypes?.includes(type);
++
++const HAS_EVENT = supported('event');
++const HAS_ICP = supported('interaction-contentful-paint');
++const HAS_SOFT_NAV = supported('soft-navigation');
++
++const reports = (window.__dailyGrindPerf = window.__dailyGrindPerf || []);
++const outbox = [];
++
++function report(metric) {
++  reports.push(metric);
++  outbox.push(metric);
++  window.dispatchEvent(new CustomEvent('dailygrind:perf', { detail: metric }));
++  console.info(
++    `[perf] ${metric.kind} (${metric.region}) ${metric.label ?? ''} → ` +
++      `${Math.round(metric.duration)}ms [${metric.source}]`,
++  );
++}
++
++function flush() {
++  if (!PERF_ENDPOINT || outbox.length === 0) return;
++  const payload = JSON.stringify(outbox.splice(0));
++  navigator.sendBeacon?.(PERF_ENDPOINT, payload);
++}
++
++/** Describe the tracked region (if any) an element belongs to. */
++function describeTarget(node) {
++  const el = node instanceof Element ? node : node?.parentElement;
++  const regionEl = el?.closest('[data-perf-region]');
++  if (!regionEl) return null;
++  const labelEl =
++    regionEl.dataset.perfRegion === 'seasonal-favorites'
++      ? el.closest('.card')?.querySelector('h3') ?? el
++      : el.closest('a, button') ?? el;
++  return {
++    region: regionEl.dataset.perfRegion,
++    label: labelEl.textContent.trim().replace(/\s+/g, ' ').slice(0, 60),
++  };
++}
++
++// interactionId -> { region, label, nextPaint, icp, reported }
++const interactions = new Map();
++
++function getInteraction(id) {
++  let rec = interactions.get(id);
++  if (!rec) {
++    rec = { target: null, nextPaint: 0, startTime: 0, icp: null, reported: false };
++    interactions.set(id, rec);
++  }
++  return rec;
++}
++
++function finalizeInteraction(id, rec) {
++  if (rec.reported) return;
++  rec.reported = true;
++  if (!rec.target) return; // Interaction outside the tracked regions.
++
++  if (rec.icp) {
++    const lcp = rec.icp.largestContentfulPaint;
++    report({
++      kind: 'interaction-paint',
++      source: 'interaction-contentful-paint',
++      ...rec.target,
++      interactionId: id,
++      startTime: rec.icp.startTime,
++      // duration = presentationTime - interaction startTime
++      duration: rec.icp.duration,
++      nextPaint: rec.nextPaint || null,
++      largestElement: lcp?.element?.tagName?.toLowerCase() ?? null,
++      largestSize: lcp?.size ?? null,
++    });
++  } else {
++    // Fallback (no ICP support, or no contentful paint happened): report the
++    // interaction -> next paint latency from Event Timing.
++    report({
++      kind: 'interaction-paint',
++      source: 'event-timing',
++      ...rec.target,
++      interactionId: id,
++      startTime: rec.startTime,
++      duration: rec.nextPaint,
++      nextPaint: rec.nextPaint,
++    });
++  }
++}
++
++function finalizeAll(exceptId) {
++  for (const [id, rec] of interactions) {
++    if (id !== exceptId) {
++      finalizeInteraction(id, rec);
++      interactions.delete(id);
++    }
++  }
++}
++
++if (HAS_EVENT) {
++  new PerformanceObserver((list) => {
++    for (const entry of list.getEntries()) {
++      if (!entry.interactionId) continue;
++      const isNew = !interactions.has(entry.interactionId);
++      // A new interaction finalizes earlier ones: their paints are complete.
++      if (isNew) finalizeAll(entry.interactionId);
++      const rec = getInteraction(entry.interactionId);
++      rec.target ??= entry.target ? describeTarget(entry.target) : null;
++      rec.startTime ||= entry.startTime;
++      rec.nextPaint = Math.max(rec.nextPaint, entry.duration);
++    }
++    // durationThreshold: 16 is the minimum allowed; capture (nearly) all clicks.
++  }).observe({ type: 'event', buffered: true, durationThreshold: 16 });
++}
++
++if (HAS_ICP) {
++  new PerformanceObserver((list) => {
++    for (const entry of list.getEntries()) {
++      // Entries arrive progressively larger; keep the latest per interaction.
++      if (!interactions.has(entry.interactionId)) finalizeAll(entry.interactionId);
++      const rec = getInteraction(entry.interactionId);
++      if (!rec.reported) rec.icp = entry;
++    }
++  }).observe({ type: 'interaction-contentful-paint', buffered: true });
++}
++
++// --- Client-side view switches (soft navigations) ---------------------------
++let activeSoftNav = null;
++let activeSoftNavLcp = null;
++let activeSoftNavTarget = null;
++
++function finalizeSoftNav() {
++  if (!activeSoftNav) return;
++  report({
++    kind: 'view-switch',
++    source: 'soft-navigation',
++    region: activeSoftNavTarget?.region ?? 'other',
++    label: activeSoftNavTarget?.label ?? null,
++    url: activeSoftNav.name,
++    navigationId: activeSoftNav.navigationId,
++    interactionId: activeSoftNav.interactionId,
++    startTime: activeSoftNav.startTime,
++    // First contentful paint of the new view, relative to interaction start.
++    fcpDuration: activeSoftNav.duration,
++    // Largest contentful paint of the new view, relative to interaction start.
++    duration: activeSoftNavLcp?.duration ?? activeSoftNav.duration,
++    largestElement:
++      activeSoftNavLcp?.largestContentfulPaint?.element?.tagName?.toLowerCase() ?? null,
++  });
++  activeSoftNav = activeSoftNavLcp = activeSoftNavTarget = null;
++}
++
++if (HAS_SOFT_NAV && HAS_ICP) {
++  new PerformanceObserver((list) => {
++    for (const entry of list.getEntries()) {
++      finalizeSoftNav();
++      activeSoftNav = entry;
++      // Include paints that happened before the URL was updated.
++      activeSoftNavLcp = entry.getLargestInteractionContentfulPaint?.() ?? null;
++      activeSoftNavTarget = interactions.get(entry.interactionId)?.target ?? null;
++    }
++  }).observe({ type: 'soft-navigation', buffered: true });
++
++  new PerformanceObserver((list) => {
++    for (const entry of list.getEntries()) {
++      // Match by interactionId (not navigationId) per the spec guidance.
++      if (activeSoftNav && entry.interactionId === activeSoftNav.interactionId) {
++        activeSoftNavLcp = entry;
++        activeSoftNavTarget ??= interactions.get(entry.interactionId)?.target ?? null;
++      }
++    }
++  }).observe({ type: 'interaction-contentful-paint', buffered: true });
++}
++
++// Finalize everything when the page is backgrounded or unloaded (including
++// when a tracked link triggers a full page navigation).
++function onHidden() {
++  finalizeAll();
++  finalizeSoftNav();
++  flush();
++}
++document.addEventListener('visibilitychange', () => {
++  if (document.visibilityState === 'hidden') onHidden();
++});
++window.addEventListener('pagehide', onHidden);

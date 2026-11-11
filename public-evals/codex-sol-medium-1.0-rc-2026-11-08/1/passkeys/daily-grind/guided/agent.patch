@@ -1,0 +1,641 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..ed551cf
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,4 @@
++node_modules/
++public/account.js
++data/
++*.sqlite*
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..9c9d9c6
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,30 @@
++# The Daily Grind
++
++The homepage includes passwordless customer registration, discoverable passkey sign-in and autofill, a profile editor, saved-passkey listing/renaming/removal, and passkey reauthentication. The existing coffee-shop content and links remain intact.
++
++## Build and run
++
++Requires Node.js 22.13 or newer (including `node:sqlite`).
++
++```sh
++npm ci
++npm run build
++npm start
++```
++
++`npm start` builds the browser bundle before starting the application. The server serves both the homepage and the account API; a static-only host cannot authenticate users. Local defaults are `http://localhost:11222` and RP ID `localhost`.
++
++Set these environment variables for deployment:
++
++- `APP_ORIGIN`: the exact public HTTPS origin, for example `https://coffee.example.com` (no trailing slash). Required in production. Requests from other origins are rejected.
++- `RP_ID`: the registered passkey domain. Defaults to the hostname of `APP_ORIGIN`. Keep it stable; changing it invalidates access to existing passkeys.
++- `PORT`: server port, default `11222`.
++- `DATABASE_PATH`: SQLite file path, default `data/accounts.sqlite`. Its parent directory must exist. Store it on a persistent volume and back it up. This implementation is intended for a single Node server instance.
++
++Use an HTTPS reverse proxy in production and set `NODE_ENV=production`. Session cookies are HTTP-only, same-site, and secure on HTTPS. Sessions expire after eight hours; WebAuthn challenges expire after five minutes and are consumed before verification. SQLite stores public credential material, counters, profile information, and hashed session identifiers. Private keys stay with the customer's passkey provider.
++
++Profile updates, additional passkey registration, and removal prompt for verification with a credential belonging to the current account, with user verification required. The server enforces a five-minute reauthentication window. An account's last passkey cannot be removed; register a backup on another device or provider first. There is no password or email recovery route, and email addresses are account identifiers rather than verified email ownership claims. Customers who lose every passkey cannot recover access through this application.
++
++The frontend uses native WebAuthn APIs with locally bundled `webauthn-polyfills`. Signal API calls are optional and fail independently of account operations. The small local provider registry is a subset of the [passkey-authenticator-aaguids registry](https://github.com/passkeydeveloper/passkey-authenticator-aaguids); unknown/zero AAGUIDs use a neutral icon and provider name. Provider metadata is used only for display.
++
++No browser verification or development/preview server was used during implementation. Build and syntax validation do not substitute for testing with real authenticators before production deployment.
+diff --git a/account.css b/account.css
+new file mode 100644
+index 0000000..f3c4afa
+--- /dev/null
++++ b/account.css
+@@ -0,0 +1,55 @@
++[hidden] { display: none !important; }
++button, input { font: inherit; }
++button { cursor: pointer; }
++button:disabled { cursor: not-allowed; opacity: .55; }
++button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid #b66b00; outline-offset: 4px; }
++nav .logout-link { color: white; background: transparent; font-size: .9rem; }
++.account { margin-top: 64px; padding-top: 35px; border-top: 1px solid var(--secondary); scroll-margin-top: 100px; }
++.account-heading, .member-welcome, .passkey-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
++.account-heading h2 { font-size: 2rem; }
++.eyebrow { font-size: .7rem; font-weight: 700; letter-spacing: 1.8px; color: #795548; }
++.security-badge { font-size: .78rem; background: #eee9e3; padding: 7px 12px; border-radius: 30px; white-space: nowrap; }
++.account-status { margin: 16px 0; min-height: 26px; font-size: .9rem; }
++.account-status[data-error="true"], #dialog-status { color: #9e2e22; }
++.account-grid { display: grid; grid-template-columns: .9fr 1.1fr; background: white; border: 1px solid #e5ded8; border-radius: 12px; overflow: hidden; }
++.account-intro { background: #f0e9e2; padding: 36px; }
++.account h3 { font-size: 1.3rem; margin-bottom: 6px; }
++.key-mark { display: inline-grid; place-items: center; background: #e0d2c5; width: 52px; height: 52px; border-radius: 50%; font-size: 2rem; margin-bottom: 22px; }
++.passkey-benefits { list-style: none; margin: 22px 0; }
++.passkey-benefits li { margin: 10px 0; font-size: .9rem; }
++.passkey-benefits li::before { content: '✓'; margin-right: 12px; color: #4d6547; }
++.account-forms { padding: 30px 36px; }
++.account-switch { display: flex; border-bottom: 1px solid #e5ded8; margin-bottom: 26px; gap: 24px; }
++.account-switch button { border: 0; padding: 10px 0; background: none; color: #77665e; font-size: .9rem; border-bottom: 2px solid transparent; }
++.account-switch button[aria-pressed="true"] { color: var(--primary); font-weight: 600; border-color: var(--primary); }
++.account label, dialog label { display: block; margin-top: 18px; margin-bottom: 6px; font-weight: 600; font-size: .85rem; }
++.account input, dialog input { width: 100%; border: 1px solid #cdbfb6; border-radius: 5px; padding: 10px 12px; background: #fff; color: var(--text); min-width: 0; }
++.account .btn, dialog .btn { border: 1px solid var(--primary); font-size: .9rem; }
++.account-primary { width: 100%; margin-bottom: 14px; }
++.small, .field-help { color: #73645c; font-size: .8rem; }
++.field-help { margin-top: 8px; line-height: 1.55; }
++.optional { font-weight: 400; color: #73645c; }
++.text-button { padding: 0; border: 0; background: none; color: var(--primary); text-decoration: underline; }
++.outline-button { border: 1px solid #b9a89a; border-radius: 5px; background: transparent; color: var(--primary); padding: 9px 14px; font-size: .85rem; }
++.outline-button:hover { background: #f0e9e2; }
++.account-note { padding: 12px 16px; border-left: 3px solid #a67b50; background: #f4eee8; font-size: .85rem; margin-top: 16px; }
++.member-welcome { padding: 12px 0 24px; }
++.member-grid { display: grid; grid-template-columns: .9fr 1.1fr; gap: 24px; }
++.account-panel { padding: 26px; background: white; border: 1px solid #e5ded8; border-radius: 8px; }
++.count-badge { border-radius: 50%; padding: 2px 10px; background: #eee9e3; font-size: .8rem; }
++.passkey-list { list-style: none; margin: 22px 0; }
++.passkey-row { border-bottom: 1px solid #e5ded8; padding: 16px 0; }
++.passkey-detail { display: flex; gap: 10px; align-items: flex-start; }
++.provider-icon { width: 28px; height: 28px; object-fit: contain; }
++.passkey-row strong { display: block; overflow-wrap: anywhere; }
++.passkey-row p { font-size: .75rem; color: #73645c; }
++.passkey-actions { display: flex; gap: 18px; margin: 10px 0 0 38px; }
++.passkey-actions button { font-size: .8rem; }
++.passkey-actions .remove { color: #9e2e22; }
++dialog { margin: auto; width: min(440px, calc(100% - 32px)); max-height: 90dvh; overflow: auto; padding: 28px; border: 1px solid #d7ccc8; border-radius: 10px; background: #fafafa; color: var(--text); }
++dialog:modal { overscroll-behavior: contain; }
++dialog::backdrop { background: rgb(35 24 18 / .55); overflow: hidden; overscroll-behavior: contain; }
++.dialog-actions { display: flex; justify-content: flex-end; align-items: center; gap: 12px; margin-top: 22px; }
++.dialog-actions .btn { margin: 0; }
++#dialog-status { font-size: .85rem; margin-top: 12px; }
++@media (max-width: 700px) { nav { flex-wrap: wrap; gap: 12px; padding: 12px 20px; } nav ul { flex-wrap: wrap; gap: 12px; } nav ul li { margin-left: 0; } .account-grid, .member-grid { grid-template-columns: 1fr; } .account-heading, .member-welcome { align-items: flex-start; flex-direction: column; gap: 12px; } .account-intro, .account-forms, .account-panel { padding: 24px; } .account { scroll-margin-top: 140px; } }
+diff --git a/account.js b/account.js
+new file mode 100644
+index 0000000..219c202
+--- /dev/null
++++ b/account.js
+@@ -0,0 +1,193 @@
++import 'webauthn-polyfills';
++import providers from './providers.json';
++const $ = id => document.getElementById(id);
++const PK = window.PublicKeyCredential;
++let account = null, busy = false, controller, supported = false, registrationSupported = false, modalAction;
++const validID = v => typeof v === 'string' && v.length > 0 && v.length % 4 !== 1 && /^[A-Za-z0-9_-]+$/.test(v);
++function status(message, error=false) { $('account-status').textContent=message; $('account-status').dataset.error=String(error); }
++async function api(path, method='GET', body) {
++  let response;
++  try { response=await fetch(path,{ method, credentials:'same-origin', headers:method==='GET'?{}:{'Content-Type':'application/json'}, ...(method==='GET'?{}:{body:JSON.stringify(body || {})}) }); }
++  catch { throw new Error('Could not reach your account. Check your connection and try again.'); }
++  let result;
++  try { result=await response.json(); } catch { throw new Error('Account services are unavailable. Please try again later.'); }
++  if(!response.ok) {
++    if(response.status===401) { account=null; render(); }
++    throw Object.assign(new Error(result.error || 'Unable to complete this request.'),{status:response.status});
++  }
++  return result;
++}
++async function signal(method, params) {
++  if(!PK?.[method] || !params.rpId) return;
++  const ids=[params.userId,params.credentialId,...(params.allAcceptedCredentialIds || [])].filter(v=>v!==undefined);
++  if(!ids.every(validID)) { console.warn('Passkey synchronization skipped: invalid server ID.'); return; }
++  try { await PK[method](params); } catch(err) { console.warn('Passkey synchronization unavailable:',err.message); }
++}
++function syncAccepted() { return signal('signalAllAcceptedCredentials',{rpId:account.rpId,userId:account.userId,allAcceptedCredentialIds:account.credentials.map(c=>c.id)}); }
++function abort() { controller?.abort(); controller=undefined; }
++function message(err) {
++  return ({NotAllowedError:'The passkey request was cancelled or timed out. You can try again.',AbortError:'The passkey request was cancelled.',InvalidStateError:'A passkey already exists in this password manager. Try a different device or provider.',SecurityError:'Passkeys require a secure connection and a matching site domain.'})[err.name] || err.message || 'Something went wrong. Please try again.';
++}
++function setBusy(value) {
++  busy=value;
++  $('my-account').setAttribute('aria-busy',String(value));
++  document.querySelectorAll('#my-account button, #logout, #dialog-confirm').forEach(button=>{
++    button.disabled=value || (button.hasAttribute('data-passkey') && !supported);
++  });
++  document.querySelectorAll('#register-form [data-passkey], #add-passkey').forEach(button=>button.disabled=value || !registrationSupported);
++  // Removing the final credential would lock this passwordless account out.
++  document.querySelectorAll('[data-last-passkey]').forEach(button=>button.disabled=true);
++}
++async function run(action) {
++  if(busy) return;
++  abort(); setBusy(true);
++  try { await action(); }
++  catch(err) {
++    status(message(err),true);
++    if($('passkey-dialog').open) $('dialog-status').textContent=message(err);
++  } finally { setBusy(false); if(!account?.user && !$('signin-form').hidden) startAutofill(); }
++}
++function date(value) { return value ? new Intl.DateTimeFormat(undefined,{dateStyle:'medium'}).format(new Date(value)) : 'Not used yet'; }
++function element(tag,text,className) { const el=document.createElement(tag); if(text!==undefined) el.textContent=text; if(className) el.className=className; return el; }
++function render() {
++  const user=account?.user;
++  $('account-loading').hidden=true; $('account-guest').hidden=!!user; $('account-member').hidden=!user; $('logout').hidden=!user;
++  if(!user) return;
++  $('member-greeting').textContent=`Welcome back, ${user.displayName}.`;
++  $('profile-name').value=user.displayName; $('profile-email').value=user.name;
++  $('passkey-count').textContent=account.credentials.length;
++  const list=$('passkey-list'); list.replaceChildren();
++  if(!account.credentials.length) list.append(element('li','No passkeys found. Add one to secure your account.','account-note'));
++  for(const credential of account.credentials) {
++    const provider=credential.aaguid!=='00000000-0000-0000-0000-000000000000' ? providers[credential.aaguid] : null;
++    const row=element('li',undefined,'passkey-row');
++    const detail=element('div',undefined,'passkey-detail');
++    if(provider?.icon_light?.startsWith('data:image/')) { const icon=element('img',undefined,'provider-icon'); icon.src=provider.icon_light; icon.alt=''; detail.append(icon); }
++    else {const icon=element('span','⚿','provider-icon');icon.setAttribute('aria-hidden','true');detail.append(icon);}
++    const info=element('div'); info.append(element('strong',credential.name),element('p',provider?.name || 'Unknown passkey provider'),element('p',`Added ${date(credential.registeredAt)} · Last used: ${date(credential.lastUsedAt)}`),element('p',credential.credentialBackedUp?'Backed up by your passkey provider':'Keep a backup passkey on another device'));
++    detail.append(info);
++    const actions=element('div',undefined,'passkey-actions');
++    const rename=element('button','Rename','text-button'); rename.type='button'; rename.setAttribute('aria-label',`Rename ${credential.name}`); rename.addEventListener('click',()=>openDialog('rename',credential));
++    const remove=element('button','Remove','text-button remove'); remove.type='button'; remove.setAttribute('aria-label',`Remove ${credential.name}`); remove.addEventListener('click',()=>openDialog('remove',credential));
++    if(account.credentials.length===1) {remove.disabled=true;remove.dataset.lastPasskey='';remove.title='Add another passkey before removing your last one.';}
++    actions.append(rename,remove);row.append(detail,actions);list.append(row);
++  }
++  setBusy(busy);
++}
++async function authenticated(result) { abort(); account=result;render();await syncAccepted(); }
++async function authenticate({reauth=false,conditional=false}={}) {
++  const prefix=reauth?'/api/reauth':'/api/auth';
++  const options=await api(`${prefix}/options`,'POST');
++  if(conditional && (busy || account?.user || $('signin-form').hidden)) return;
++  const publicKey=PK.parseRequestOptionsFromJSON(options);
++  controller=new AbortController();
++  const credential=await navigator.credentials.get({publicKey,signal:controller.signal,...(conditional?{mediation:'conditional'}:{})});
++  if(!credential) throw new Error('No passkey selected. Please try again.');
++  const encoded=credential.toJSON();
++  let result;
++  try { result=await api(`${prefix}/verify`,'POST',encoded); }
++  catch(err) {
++    if(err.status===404 && !reauth && !account?.user) await signal('signalUnknownCredential',{rpId:publicKey.rpId,credentialId:encoded.id});
++    throw err;
++  }
++  if(!reauth) await authenticated(result);
++  return result;
++}
++async function startAutofill() {
++  if(!supported || busy || account?.user || $('signin-form').hidden) return;
++  try {
++    const caps=await PK.getClientCapabilities();
++    if(!caps.conditionalGet || busy || account?.user) return;
++    abort();
++    await authenticate({conditional:true});
++    status('You’re signed in. Welcome back!');
++  } catch(err) {
++    if(!['AbortError','NotAllowedError'].includes(err.name) && !busy) status(message(err),true);
++  }
++}
++async function register(body={}) {
++  if(account?.user) {status('Verify your identity to add a passkey.');await authenticate({reauth:true});}
++  const options=await api('/api/register/options','POST',body);
++  const publicKey=PK.parseCreationOptionsFromJSON(options);
++  controller=new AbortController();
++  const credential=await navigator.credentials.create({publicKey,signal:controller.signal});
++  if(!credential) throw new Error('No passkey created. Please try again.');
++  const encoded=credential.toJSON();
++  let result;
++  try {result=await api('/api/register/verify','POST',encoded);}
++  catch(err) {
++    // A lost network response may hide a successful commit; reconcile first.
++    try {
++      const current=await api('/api/account');
++      if(current.user && current.credentials.some(c=>c.id===encoded.id)) result=current;
++      else await signal('signalUnknownCredential',{rpId:publicKey.rp.id,credentialId:encoded.id});
++    } catch { /* Do not discard a potentially committed passkey while offline. */ }
++    if(!result) throw err;
++  }
++  await authenticated(result);status('Your passkey is saved. You’re ready for your next daily grind.');
++  $('register-form').reset();
++}
++function switchForm(registering) {
++  if(busy) return;
++  abort(); $('signin-form').hidden=registering; $('register-form').hidden=!registering;
++  $('show-signin').setAttribute('aria-pressed',String(!registering)); $('show-register').setAttribute('aria-pressed',String(registering));
++  status('');
++  if(!registering) startAutofill();
++}
++function openDialog(type,credential) {
++  modalAction={type,credential};
++  $('passkey-dialog-title').textContent=type==='rename'?'Rename passkey':'Remove passkey?';
++  $('passkey-dialog-description').textContent=type==='rename'?'Choose a name you’ll recognize. This only changes the label in your Daily Grind account.':`Remove “${credential.name}” from your account? You’ll verify your identity first. It may also need to be removed from your password manager.`;
++  $('passkey-name-field').hidden=type!=='rename'; $('passkey-name').required=type==='rename';$('passkey-name').value=credential.name;
++  $('dialog-confirm').textContent=type==='rename'?'Save name':'Verify & remove'; $('dialog-status').textContent='';
++  $('passkey-dialog').showModal();
++}
++$('show-signin').addEventListener('click',()=>switchForm(false));
++$('show-register').addEventListener('click',()=>switchForm(true));
++$('register-instead').addEventListener('click',()=>switchForm(true));
++$('signin-form').addEventListener('submit',event=>{event.preventDefault();run(async()=>{status('Choose your passkey to sign in…');await authenticate();status('You’re signed in. Welcome back!');});});
++$('register-form').addEventListener('submit',event=>{event.preventDefault();const body=Object.fromEntries(new FormData(event.currentTarget));run(()=>register(body));});
++$('add-passkey').addEventListener('click',()=>run(()=>register()));
++$('verify-identity').addEventListener('click',()=>run(async()=>{status('Verify with a passkey for this account…');await authenticate({reauth:true});status('Identity verified. You can make sensitive changes for the next five minutes.');}));
++$('profile-form').addEventListener('submit',event=>{
++  event.preventDefault();const body=Object.fromEntries(new FormData(event.currentTarget));
++  run(async()=>{
++    status('Verify your identity to save your profile…');await authenticate({reauth:true});
++    account=await api('/api/profile','PUT',body);render();
++    await signal('signalCurrentUserDetails',{rpId:account.rpId,userId:account.userId,name:account.user.name,displayName:account.user.displayName});
++    status('Your profile has been updated.');
++  });
++});
++$('logout').addEventListener('click',()=>run(async()=>{await api('/api/logout','POST');account=null;render();status('You’re signed out. See you for your next cup.');}));
++$('dialog-cancel').addEventListener('click',()=>$('passkey-dialog').close());
++$('passkey-dialog').addEventListener('close',()=>{abort();modalAction=null;});
++$('passkey-dialog-form').addEventListener('submit',event=>{
++  event.preventDefault();const action=modalAction; const name=$('passkey-name').value.trim();
++  if(action.type==='rename'&&!name) {$('dialog-status').textContent='Enter a passkey name.';return;}
++  run(async()=>{
++    if(action.type==='remove') { $('dialog-status').textContent='Verify with a passkey for this account…';await authenticate({reauth:true}); if(modalAction!==action) throw new DOMException('Cancelled','AbortError'); }
++    account=await api(`/api/credentials/${encodeURIComponent(action.credential.id)}`,action.type==='rename'?'PUT':'DELETE',action.type==='rename'?{name}:{});
++    render();if(action.type==='remove') await syncAccepted();
++    $('passkey-dialog').close();status(action.type==='rename'?'Passkey renamed.':'Passkey removed. Remove its saved copy from your password manager if it still appears there.');
++  });
++});
++async function initialize() {
++  setBusy(true);
++  try {
++    if(window.isSecureContext && PK && navigator.credentials) {
++      const caps=await PK.getClientCapabilities();
++      supported=true;
++      // The capabilities polyfill cannot infer hybrid transport support.
++      registrationSupported=!!(caps.passkeyPlatformAuthenticator ?? caps.userVerifyingPlatformAuthenticator) && !!caps.conditionalGet;
++    }
++  } catch { supported=false; }
++  $('passkey-unavailable').hidden=registrationSupported;
++  try {
++    account=await api('/api/account');render();
++    if(account.user) {await syncAccepted();status('Your account, all in one place.');}
++    else status(supported?'Sign in or create an account to get started.':'Passkeys aren’t supported in this browser or connection.');
++  } catch(err) { render();status(message(err),true); }
++  finally {setBusy(false);startAutofill();}
++  if(location.pathname==='/account') $('my-account').scrollIntoView();
++}
++initialize();
+diff --git a/index.html b/index.html
+index 66c9173..b6e64b7 100644
+--- a/index.html
++++ b/index.html
+@@ -5,6 +5,8 @@
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <title>The Daily Grind | Artisanal Coffee</title>
++  <link rel="stylesheet" href="/account.css">
++  <script type="module" src="/account.js"></script>
+   <style>
+     :root {
+       --primary: #4e342e;
+@@ -163,8 +165,8 @@
+       <li><a href="/menu">Menu</a></li>
+       <li><a href="/locations">Locations</a></li>
+       <li><a href="/rewards">Rewards</a></li>
+-      <li><a href="/account">My Account</a></li>
+-      <li><a href="/logout" class="logout-link">Logout</a></li>
++      <li><a href="#my-account" id="account-link">My Account</a></li>
++      <li><button type="button" id="logout" class="logout-link" hidden>Sign out</button></li>
+     </ul>
+   </nav>
+ 
+@@ -195,7 +197,76 @@
+         </div>
+       </div>
+     </section>
++    <section id="my-account" class="account" aria-labelledby="account-title">
++      <div class="account-heading">
++        <div><p class="eyebrow">YOUR DAILY RITUAL, SIMPLIFIED</p><h2 id="account-title">My Account</h2></div>
++        <span class="security-badge">◇ Password-free, worry-free</span>
++      </div>
++      <p id="account-status" class="account-status" role="status" aria-live="polite">Loading your account…</p>
++      <div id="account-loading" class="account-note">Connecting securely to your account.</div>
++      <div id="account-guest" hidden>
++        <div class="account-grid">
++          <div class="account-intro">
++            <span class="key-mark" aria-hidden="true">⚿</span>
++            <h3>A better way to sign in.</h3>
++            <p>Skip the password. Use your fingerprint, face, or device PIN to make yourself at home.</p>
++            <ul class="passkey-benefits"><li>No passwords to remember</li><li>Protected by your device</li><li>Your biometrics stay yours</li></ul>
++            <p class="small">Your passkey is saved in your password manager. Daily Grind never receives your fingerprint, face, or device PIN.</p>
++          </div>
++          <div class="account-forms">
++            <div class="account-switch" aria-label="Account options">
++              <button type="button" id="show-signin" aria-pressed="true">Sign in</button>
++              <button type="button" id="show-register" aria-pressed="false">Create an account</button>
++            </div>
++            <form id="signin-form">
++              <h3>Welcome back.</h3><p>Your next great cup is calling.</p>
++              <label for="signin-email">Email address <span class="optional">(optional)</span></label>
++              <input id="signin-email" name="username" type="email" autocomplete="username webauthn" placeholder="you@example.com">
++              <p class="field-help">Choose a saved passkey from autofill, or sign in below. Your passkey identifies your account.</p>
++              <button class="btn account-primary" id="signin-passkey" type="submit" data-passkey>Sign in with a passkey</button>
++              <p class="small">New here? <button type="button" class="text-button" id="register-instead">Create your account</button></p>
++            </form>
++            <form id="register-form" hidden>
++              <h3>Make it your daily grind.</h3><p>Create your account with a passkey.</p>
++              <label for="register-name">Your name</label><input id="register-name" name="displayName" autocomplete="name" maxlength="80" required>
++              <label for="register-email">Email address</label><input id="register-email" name="name" type="email" autocomplete="username" maxlength="254" required>
++              <p class="field-help">Choose where to save your passkey in the next step. No password needed.</p>
++              <button type="submit" class="btn account-primary" data-passkey>Create account with a passkey</button>
++            </form>
++            <p id="passkey-unavailable" class="account-note" hidden>Passkeys aren’t available here. Open this site over HTTPS in an up-to-date browser on a device with a screen lock, or use a device where you already have a passkey.</p>
++          </div>
++        </div>
++      </div>
++      <div id="account-member" hidden>
++        <div class="member-welcome"><div><h3 id="member-greeting">Welcome back.</h3><p>A little more you. A little less to remember.</p></div><button type="button" id="verify-identity" class="outline-button" data-passkey>Verify identity</button></div>
++        <div class="member-grid">
++          <form id="profile-form" class="account-panel">
++            <p class="eyebrow">THE BASICS</p><h3>Your profile</h3>
++            <label for="profile-name">Your name</label><input id="profile-name" name="displayName" autocomplete="name" maxlength="80" required>
++            <label for="profile-email">Email address</label><input id="profile-email" name="name" type="email" autocomplete="username" maxlength="254" required>
++            <p class="field-help">We’ll ask you to verify your identity before saving changes. This email is an account identifier; email ownership is not verified.</p>
++            <button class="btn" type="submit" data-passkey>Save profile</button>
++          </form>
++          <div class="account-panel">
++            <div class="passkey-heading"><div><p class="eyebrow">SAFE &amp; SOUND</p><h3>Your passkeys</h3></div><span id="passkey-count" class="count-badge">0</span></div>
++            <p class="small">Manage the ways you sign in. Add a backup passkey so you can always get back in.</p>
++            <ul id="passkey-list" class="passkey-list" aria-label="Saved passkeys"></ul>
++            <button type="button" id="add-passkey" class="outline-button" data-passkey>+ Add a passkey</button>
++            <p class="field-help">Use this device, another device, or a security key. Keep at least one passkey on your account.</p>
++          </div>
++        </div>
++      </div>
++      <noscript><p>Enable JavaScript to register or sign in with a passkey.</p></noscript>
++    </section>
+   </main>
++  <dialog id="passkey-dialog" aria-labelledby="passkey-dialog-title">
++    <form id="passkey-dialog-form">
++      <h2 id="passkey-dialog-title">Rename passkey</h2><p id="passkey-dialog-description"></p>
++      <div id="passkey-name-field"><label for="passkey-name">Passkey name</label><input id="passkey-name" maxlength="80" required></div>
++      <p id="dialog-status" role="status" aria-live="polite"></p>
++      <div class="dialog-actions"><button type="button" id="dialog-cancel" class="outline-button" autofocus>Cancel</button><button type="submit" id="dialog-confirm" class="btn">Save name</button></div>
++    </form>
++  </dialog>
+ 
+   <footer>
+     <div class="footer-links">
+diff --git a/package.json b/package.json
+index 2bd4d77..0076abf 100644
+--- a/package.json
++++ b/package.json
+@@ -2,9 +2,22 @@
+   "name": "daily-grind",
+   "version": "1.0.0",
+   "scripts": {
+-    "start": "pnpm dlx statikk --port ${PORT:-11222}"
++    "start": "node server/start.js",
++    "build": "esbuild account.js --bundle --format=esm --outfile=public/account.js",
++    "prestart": "npm run build"
+   },
+   "pnpm": {
+     "onlyBuiltDependencies": []
++  },
++  "dependencies": {
++    "@simplewebauthn/server": "^14.1.0",
++    "webauthn-polyfills": "^0.1.7"
++  },
++  "devDependencies": {
++    "esbuild": "^0.28.2"
++  },
++  "type": "module",
++  "engines": {
++    "node": ">=22.13.0"
+   }
+ }
+diff --git a/providers.json b/providers.json
+new file mode 100644
+index 0000000..f1671c7
+--- /dev/null
++++ b/providers.json
+@@ -0,0 +1 @@
++{"08987058-cadc-4b81-b6e1-30de50dcbe96":{"name":"Windows Hello","icon_light":"data:image/svg+xml;base64,PHN2ZyBpZD0iTGF5ZXJfMSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB2aWV3Qm94PSIwIDAgMjU2IDI1NiI+PGRlZnM+PHN0eWxlPi5jbHMtMXtmaWxsOiMwMDc4ZDQ7c3Ryb2tlLXdpZHRoOjBweDt9PC9zdHlsZT48L2RlZnM+PHJlY3QgY2xhc3M9ImNscy0xIiB4PSIyNC4yNSIgeT0iMjQuMjUiIHdpZHRoPSI5OC4zNSIgaGVpZ2h0PSI5OC4zNSIvPjxyZWN0IGNsYXNzPSJjbHMtMSIgeD0iMTMzLjQiIHk9IjI0LjI1IiB3aWR0aD0iOTguMzUiIGhlaWdodD0iOTguMzUiLz48cmVjdCBjbGFzcz0iY2xzLTEiIHg9IjI0LjI1IiB5PSIxMzMuNCIgd2lkdGg9Ijk4LjM1IiBoZWlnaHQ9Ijk4LjM1Ii8+PHJlY3QgY2xhc3M9ImNscy0xIiB4PSIxMzMuNCIgeT0iMTMzLjQiIHdpZHRoPSI5OC4zNSIgaGVpZ2h0PSI5OC4zNSIvPjwvc3ZnPg=="},"9ddd1817-af5a-4672-a2b9-3e3dd95000a9":{"name":"Windows Hello","icon_light":"data:image/svg+xml;base64,PHN2ZyBpZD0iTGF5ZXJfMSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB2aWV3Qm94PSIwIDAgMjU2IDI1NiI+PGRlZnM+PHN0eWxlPi5jbHMtMXtmaWxsOiMwMDc4ZDQ7c3Ryb2tlLXdpZHRoOjBweDt9PC9zdHlsZT48L2RlZnM+PHJlY3QgY2xhc3M9ImNscy0xIiB4PSIyNC4yNSIgeT0iMjQuMjUiIHdpZHRoPSI5OC4zNSIgaGVpZ2h0PSI5OC4zNSIvPjxyZWN0IGNsYXNzPSJjbHMtMSIgeD0iMTMzLjQiIHk9IjI0LjI1IiB3aWR0aD0iOTguMzUiIGhlaWdodD0iOTguMzUiLz48cmVjdCBjbGFzcz0iY2xzLTEiIHg9IjI0LjI1IiB5PSIxMzMuNCIgd2lkdGg9Ijk4LjM1IiBoZWlnaHQ9Ijk4LjM1Ii8+PHJlY3QgY2xhc3M9ImNscy0xIiB4PSIxMzMuNCIgeT0iMTMzLjQiIHdpZHRoPSI5OC4zNSIgaGVpZ2h0PSI5OC4zNSIvPjwvc3ZnPg=="},"6028b017-b1d4-4c02-b4b3-afcdafc96bb2":{"name":"Windows Hello","icon_light":"data:image/svg+xml;base64,PHN2ZyBpZD0iTGF5ZXJfMSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIiB2aWV3Qm94PSIwIDAgMjU2IDI1NiI+PGRlZnM+PHN0eWxlPi5jbHMtMXtmaWxsOiMwMDc4ZDQ7c3Ryb2tlLXdpZHRoOjBweDt9PC9zdHlsZT48L2RlZnM+PHJlY3QgY2xhc3M9ImNscy0xIiB4PSIyNC4yNSIgeT0iMjQuMjUiIHdpZHRoPSI5OC4zNSIgaGVpZ2h0PSI5OC4zNSIvPjxyZWN0IGNsYXNzPSJjbHMtMSIgeD0iMTMzLjQiIHk9IjI0LjI1IiB3aWR0aD0iOTguMzUiIGhlaWdodD0iOTguMzUiLz48cmVjdCBjbGFzcz0iY2xzLTEiIHg9IjI0LjI1IiB5PSIxMzMuNCIgd2lkdGg9Ijk4LjM1IiBoZWlnaHQ9Ijk4LjM1Ii8+PHJlY3QgY2xhc3M9ImNscy0xIiB4PSIxMzMuNCIgeT0iMTMzLjQiIHdpZHRoPSI5OC4zNSIgaGVpZ2h0PSI5OC4zNSIvPjwvc3ZnPg=="},"531126d6-e717-415c-9320-3d9aa6981239":{"name":"Dashlane","icon_light":"data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiIgdmlld0JveD0iMCAwIDUxMiA1MTIiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxwYXRoIGQ9Ik0yNTcuNDc0IDM1OS4yMDlDMjU3LjQ3NCAzNTYuMTg5IDI1NC40NTQgMzUzLjE2OSAyNTAuMjE1IDM1MS45NTlMMTk5LjQxMSAzMzMuMjMxQzE5MC44OTUgMzI5LjYwMSAxODEuMjY0IDMzMy44MzEgMTgxLjI2NCAzMzkuODlWNDc1Ljc3OUMxODEuMjY0IDQ3OC44MDkgMTg0LjI4MyA0ODIuNDM4IDE4Ny4zMDMgNDgzLjY0OEwyMzkuMzI2IDUwMi4zNzZDMjQ3LjE5NSA1MDUuMzk2IDI1Ny40NzQgNTAxLjE2NiAyNTcuNDc0IDQ5NC41MDhWMzU5LjIwOVoiIGZpbGw9IiMwOTM2M0YiLz4KPHBhdGggZD0iTTM1Mi43MzYgMzIxLjEwM0MzNTIuNzM2IDMxOC4wODQgMzQ5LjcxNyAzMTUuMDY0IDM0NS40NzcgMzEzLjg1NEwyOTQuNjc0IDI5NS4xMjZDMjg2LjE1NyAyOTEuNDk2IDI3Ni41MjYgMjk1LjcyNiAyNzYuNTI2IDMwMS43ODVWNDM3LjY3NEMyNzYuNTI2IDQ0MC43MDQgMjc5LjU0NiA0NDQuMzMzIDI4Mi41NjYgNDQ1LjU0M0wzMzQuNTg5IDQ2NC4yNzFDMzQyLjQ1OCA0NjcuMjkxIDM1Mi43MzYgNDYzLjA2MSAzNTIuNzM2IDQ1Ni40MDNWMzIxLjEwM1oiIGZpbGw9IiMwOTM2M0YiLz4KPHBhdGggZD0iTTI1Ny40NzQgMzUuMzIxMUMyNTcuNDc0IDMyLjMwMTMgMjU0LjQ1NCAyOS4yODE1IDI1MC4yMTUgMjguMDcxN0wxOTkuNDExIDkuMzQzNDNDMTkwLjg5NSA1LjcxMzk5IDE4MS4yNjQgOS45NDM1OCAxODEuMjY0IDE2LjAwMjJWMTUxLjg5MkMxODEuMjY0IDE1NC45MjEgMTg0LjI4MyAxNTguNTUxIDE4Ny4zMDMgMTU5Ljc2TDIzOS4zMjYgMTc4LjQ4OUMyNDcuMTk1IDE4MS41MDggMjU3LjQ3NCAxNzcuMjc5IDI1Ny40NzQgMTcwLjYyVjM1LjMyMTFaIiBmaWxsPSIjMDkzNjNGIi8+CjxwYXRoIGQ9Ik0zNTIuNzM2IDkyLjQ3NzdDMzUyLjczNiA4OS40NTc5IDM0OS43MTcgODYuNDM4MiAzNDUuNDc3IDg1LjIyODNMMjk0LjY3NCA2Ni41QzI4Ni4xNTcgNjIuODcwNiAyNzYuNTI2IDY3LjEwMDIgMjc2LjUyNiA3My4xNTg4VjIwOS4wNDhDMjc2LjUyNiAyMTIuMDc4IDI3OS41NDYgMjE1LjcwNyAyODIuNTY2IDIxNi45MTdMMzM0LjU4OSAyMzUuNjQ1QzM0Mi40NTggMjM4LjY2NSAzNTIuNzM2IDIzNC40MzYgMzUyLjczNiAyMjcuNzc3VjkyLjQ3NzdaIiBmaWxsPSIjMDkzNjNGIi8+CjxwYXRoIGQ9Ik00NDggMTY4LjY4N0M0NDggMTY1LjY2NyA0NDQuOTggMTYyLjY0NyA0NDAuNzQxIDE2MS40MzdMMzg5LjkzNyAxNDIuNzA5QzM4MS40MjEgMTM5LjA3OSAzNzEuNzkgMTQzLjMwOSAzNzEuNzkgMTQ5LjM2OFYzNjEuNDY2QzM3MS43OSAzNjQuNDk1IDM3NC44MSAzNjguMTI1IDM3Ny44MjkgMzY5LjMzNUw0MjkuODUyIDM4OC4wNjNDNDM3LjcyMSAzOTEuMDgzIDQ0OCAzODYuODUzIDQ0OCAzODAuMTk0VjE2OC42ODdaIiBmaWxsPSIjMDkzNjNGIi8+CjxwYXRoIGQ9Ik0xNjIuMjEgMzUuMzMwNkMxNjIuMjEgMzIuMzEwOCAxNTkuMTkgMjkuMjgxNSAxNTQuOTUxIDI4LjA3MTdMMTA0LjE0OCA5LjM0MzQzQzk1LjY3ODcgNS43MTM5OSA4NiA5Ljk0MzU4IDg2IDE2LjAwMjJWNDc1Ljc4OUM4NiA0NzguODA4IDg5LjAxOTggNDgyLjQzOCA5Mi4wNDkyIDQ4My42NDhMMTQ0LjA2MyA1MDIuMzc2QzE1MS45MzEgNTA1LjM5NiAxNjIuMjEgNTAxLjE2NiAxNjIuMjEgNDk0LjUwN1YzNS4zMzA2WiIgZmlsbD0iIzA5MzYzRiIvPgo8L3N2Zz4K"},"ea9b8d66-4d01-1d21-3ce4-b6b48cb575d4":{"name":"Google Password Manager","icon_light":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGVuYWJsZS1iYWNrZ3JvdW5kPSJuZXcgMCAwIDE5MiAxOTIiIGhlaWdodD0iMjRweCIgdmlld0JveD0iMCAwIDE5MiAxOTIiIHdpZHRoPSIyNHB4Ij48cmVjdCBmaWxsPSJub25lIiBoZWlnaHQ9IjE5MiIgd2lkdGg9IjE5MiIgeT0iMCIvPjxnPjxwYXRoIGQ9Ik02OS4yOSwxMDZjLTMuNDYsNS45Ny05LjkxLDEwLTE3LjI5LDEwYy0xMS4wMywwLTIwLTguOTctMjAtMjBzOC45Ny0yMCwyMC0yMCBjNy4zOCwwLDEzLjgzLDQuMDMsMTcuMjksMTBoMjUuNTVDOTAuMyw2Ni41NCw3Mi44Miw1Miw1Miw1MkMyNy43NCw1Miw4LDcxLjc0LDgsOTZzMTkuNzQsNDQsNDQsNDRjMjAuODIsMCwzOC4zLTE0LjU0LDQyLjg0LTM0IEg2OS4yOXoiIGZpbGw9IiM0Mjg1RjQiLz48cmVjdCBmaWxsPSIjRkJCQzA0IiBoZWlnaHQ9IjI0IiB3aWR0aD0iNDQiIHg9Ijk0IiB5PSI4NCIvPjxwYXRoIGQ9Ik05NC4zMiw4NEg2OHYwLjA1YzIuNSwzLjM0LDQsNy40Nyw0LDExLjk1cy0xLjUsOC42MS00LDExLjk1VjEwOGgyNi4zMiBjMS4wOC0zLjgyLDEuNjgtNy44NCwxLjY4LTEyUzk1LjQxLDg3LjgyLDk0LjMyLDg0eiIgZmlsbD0iI0VBNDMzNSIvPjxwYXRoIGQ9Ik0xODQsMTA2djI2aC0xNnYtOGMwLTQuNDItMy41OC04LTgtOHMtOCwzLjU4LTgsOHY4aC0xNnYtMjZIMTg0eiIgZmlsbD0iIzM0QTg1MyIvPjxyZWN0IGZpbGw9IiMxODgwMzgiIGhlaWdodD0iMjQiIHdpZHRoPSI0OCIgeD0iMTM2IiB5PSI4NCIvPjwvZz48L3N2Zz4="},"dd4ec289-e01d-41c9-bb89-70fa845d4bf2":{"name":"iCloud Keychain (Managed)","icon_light":"data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNTYgMjU2IiBmaWxsPSJub25lIj48cGF0aCBkPSJtMjE3LjM2LDkwLjY5Yy0xNS41OCw5LjU0LTI1LjE3LDI2LjQxLTI1LjM4LDQ0LjY4LjA2LDIwLjY3LDEyLjQzLDM5LjMyLDMxLjQ2LDQ3LjQxLTMuNjcsMTEuODQtOS4xLDIzLjA2LTE2LjExLDMzLjI4LTEwLjAzLDE0LjQ0LTIwLjUyLDI4Ljg3LTM2LjQ3LDI4Ljg3cy0yMC4wNi05LjI3LTM4LjQ1LTkuMjctMjQuMzIsOS41Ny0zOC45LDkuNTctMjQuNzctMTMuMzctMzYuNDctMjkuNzljLTE1LjQ2LTIyLjk5LTIzLjk1LTQ5Ljk2LTI0LjQ3LTc3LjY2LDAtNDUuNTksMjkuNjMtNjkuNzUsNTguODEtNjkuNzUsMTUuNSwwLDI4LjQyLDEwLjE4LDM4LjE1LDEwLjE4czIzLjcxLTEwLjc5LDQxLjM0LTEwLjc5YzE4LjQxLS40NywzNS44NCw4LjI0LDQ2LjUsMjMuMjVabS01NC44Ni00Mi41NWM3Ljc3LTkuMTQsMTIuMTctMjAuNjcsMTIuNDYtMzIuNjcuMDEtMS41OC0uMTQtMy4xNi0uNDYtNC43MS0xMy4zNSwxLjMtMjUuNjksNy42Ny0zNC41LDE3Ljc4LTcuODUsOC43OC0xMi40MSwyMC0xMi45MiwzMS43NiwwLDEuNDMuMTYsMi44Ni40Niw0LjI2LDEuMDUuMiwyLjEyLjMsMy4xOS4zLDEyLjQzLS45OSwyMy45MS03LjA0LDMxLjc2LTE2LjczWiIgZmlsbD0iIzAwMCIvPjwvc3ZnPg=="},"bada5566-a7aa-401f-bd96-45619a55120d":{"name":"1Password","icon_light":"data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQwIiBoZWlnaHQ9IjI0MCIgdmlld0JveD0iMCAwIDI0MCAyNDAiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxwYXRoIGZpbGwtcnVsZT0iZXZlbm9kZCIgY2xpcC1ydWxlPSJldmVub2RkIiBkPSJNMjM5LjExNiAxMjAuNDE3QzIzOS4xMTYgNTQuNDE5MyAxODUuNjEzIDAuOTE2NTA0IDExOS42MTYgMC45MTY1MDRDNTMuNjE5IDAuOTE2NTA0IDAuMTE2MjExIDU0LjQxOTMgMC4xMTYyMTEgMTIwLjQxN0MwLjExNjIxMSAxODYuNDE3IDUzLjYxOSAyMzkuOTE3IDExOS42MTYgMjM5LjkxN0MxODUuNjEzIDIzOS45MTcgMjM5LjExNiAxODYuNDE3IDIzOS4xMTYgMTIwLjQxN1pNOTcuODY1OCA1NC4wMjc2Qzk2LjkyNjMgNTUuODcxNCA5Ni45MjYzIDU4LjI4NTEgOTYuOTI2MyA2My4xMTI2VjkwLjQ3MjlDOTYuOTI2MyA5MS42Nzg4IDk2LjkyNjMgOTIuMjgxNyA5Ny4wNzg1IDkyLjgzOTJDOTcuMjEzNCA5My4zMzMxIDk3LjQzNTIgOTMuNzk5IDk3LjczMzUgOTQuMjE1Qzk4LjA3MDIgOTQuNjg0NyA5OC41MzgxIDk1LjA2NDggOTkuNDc0MSA5NS44MjUxTDEwNi4zOTUgMTAxLjQ0N0MxMDcuNTIzIDEwMi4zNjQgMTA4LjA4NyAxMDIuODIyIDEwOC4yOTIgMTAzLjM3NEMxMDguNDcxIDEwMy44NTcgMTA4LjQ3MSAxMDQuMzkgMTA4LjI5MiAxMDQuODczQzEwOC4wODcgMTA1LjQyNSAxMDcuNTIzIDEwNS44ODMgMTA2LjM5NSAxMDYuOEw5OS40NzQxIDExMi40MjJDOTguNTM4MiAxMTMuMTgyIDk4LjA3MDIgMTEzLjU2MiA5Ny43MzM1IDExNC4wMzJDOTcuNDM1MiAxMTQuNDQ4IDk3LjIxMzQgMTE0LjkxNCA5Ny4wNzg1IDExNS40MDhDOTYuOTI2MyAxMTUuOTY1IDk2LjkyNjMgMTE2LjU2OCA5Ni45MjYzIDExNy43NzRWMTc3LjcxOUM5Ni45MjYzIDE4Mi41NDcgOTYuOTI2MyAxODQuOTYxIDk3Ljg2NTggMTg2LjgwNUM5OC42OTIyIDE4OC40MjYgMTAwLjAxMSAxODkuNzQ1IDEwMS42MzMgMTkwLjU3MUMxMDMuNDc3IDE5MS41MTEgMTA1Ljg5IDE5MS41MTEgMTEwLjcxOCAxOTEuNTExSDEyOC41MTVDMTMzLjM0MiAxOTEuNTExIDEzNS43NTYgMTkxLjUxMSAxMzcuNiAxOTAuNTcxQzEzOS4yMjEgMTg5Ljc0NSAxNDAuNTQgMTg4LjQyNiAxNDEuMzY3IDE4Ni44MDVDMTQyLjMwNiAxODQuOTYxIDE0Mi4zMDYgMTgyLjU0NyAxNDIuMzA2IDE3Ny43MTlWMTUwLjM1OUMxNDIuMzA2IDE0OS4xNTMgMTQyLjMwNiAxNDguNTUgMTQyLjE1NCAxNDcuOTkzQzE0Mi4wMTkgMTQ3LjQ5OSAxNDEuNzk3IDE0Ny4wMzMgMTQxLjQ5OSAxNDYuNjE3QzE0MS4xNjIgMTQ2LjE0NyAxNDAuNjk0IDE0NS43NjcgMTM5Ljc1OCAxNDUuMDA3TDEzMi44MzcgMTM5LjM4NUMxMzEuNzA5IDEzOC40NjggMTMxLjE0NSAxMzguMDEgMTMwLjk0IDEzNy40NTlDMTMwLjc2MSAxMzYuOTc1IDEzMC43NjEgMTM2LjQ0MyAxMzAuOTQgMTM1Ljk1OUMxMzEuMTQ1IDEzNS40MDcgMTMxLjcwOSAxMzQuOTQ5IDEzMi44MzcgMTM0LjAzM0wxMzkuNzU4IDEyOC40MUMxNDAuNjk0IDEyNy42NSAxNDEuMTYyIDEyNy4yNyAxNDEuNDk5IDEyNi44QzE0MS43OTcgMTI2LjM4NCAxNDIuMDE5IDEyNS45MTggMTQyLjE1NCAxMjUuNDI0QzE0Mi4zMDYgMTI0Ljg2NyAxNDIuMzA2IDEyNC4yNjQgMTQyLjMwNiAxMjMuMDU4VjYzLjExMjZDMTQyLjMwNiA1OC4yODUxIDE0Mi4zMDYgNTUuODcxNCAxNDEuMzY3IDU0LjAyNzZDMTQwLjU0IDUyLjQwNTcgMTM5LjIyMSA1MS4wODcgMTM3LjYgNTAuMjYwNkMxMzUuNzU2IDQ5LjMyMTEgMTMzLjM0MiA0OS4zMjExIDEyOC41MTUgNDkuMzIxMUgxMTAuNzE4QzEwNS44OSA0OS4zMjExIDEwMy40NzcgNDkuMzIxMSAxMDEuNjMzIDUwLjI2MDZDMTAwLjAxMSA1MS4wODcgOTguNjkyMiA1Mi40MDU3IDk3Ljg2NTggNTQuMDI3NloiIGZpbGw9IiMxQTI4NUYiLz4KPC9zdmc+Cg=="},"d548826e-79b4-db40-a3d8-11116f7e8349":{"name":"Bitwarden","icon_light":"data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzAwIiBoZWlnaHQ9IjMwMCIgdmlld0JveD0iMCAwIDMwMCAzMDAiIGZpbGw9Im5vbmUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+CjxnIGNsaXAtcGF0aD0idXJsKCNjbGlwMF82OF82MSkiPgo8cGF0aCBkPSJNMzAwIDI1My4xMjVDMzAwIDI3OS4wMjMgMjc5LjAyMyAzMDAgMjUzLjEyNSAzMDBINDYuODc1QzIwLjk3NjYgMzAwIDAgMjc5LjAyMyAwIDI1My4xMjVWNDYuODc1QzAgMjAuOTc2NiAyMC45NzY2IDAgNDYuODc1IDBIMjUzLjEyNUMyNzkuMDIzIDAgMzAwIDIwLjk3NjYgMzAwIDQ2Ljg3NVYyNTMuMTI1WiIgZmlsbD0iIzE3NUREQyIvPgo8cGF0aCBkPSJNMjQzLjEwNSAzNy42NzU4QzI0MS4yMDEgMzUuNzcxNSAyMzguOTQ1IDM0LjgzNCAyMzYuMzY3IDM0LjgzNEg2My42MzI4QzYxLjAyNTQgMzQuODM0IDU4Ljc5ODggMzUuNzcxNSA1Ni44OTQ1IDM3LjY3NThDNTQuOTkwMiAzOS41ODAxIDU0LjA1MjcgNDEuODM1OSA1NC4wNTI3IDQ0LjQxNDFWMTU5LjU4QzU0LjA1MjcgMTY4LjE2NCA1NS43MjI3IDE3Ni42ODkgNTkuMDYyNSAxODUuMTU2QzYyLjQwMjMgMTkzLjU5NCA2Ni41NjI1IDIwMS4wOTQgNzEuNTEzNyAyMDcuNjU2Qzc2LjQ2NDggMjE0LjE4OSA4Mi4zNTM1IDIyMC41NzYgODkuMjA5IDIyNi43ODdDOTYuMDY0NSAyMzIuOTk4IDEwMi4zOTMgMjM4LjEyNSAxMDguMTY0IDI0Mi4yMjdDMTEzLjk2NSAyNDYuMzI4IDEyMCAyNTAuMTk1IDEyNi4yOTkgMjUzLjg1N0MxMzIuNTk4IDI1Ny41MiAxMzcuMDggMjU5Ljk4IDEzOS43MTcgMjYxLjI3QzE0Mi4zNTQgMjYyLjU1OSAxNDQuNDkyIDI2My41ODQgMTQ2LjA3NCAyNjQuMjU4QzE0Ny4yNzUgMjY0Ljg0NCAxNDguNTY0IDI2NS4xNjYgMTQ5Ljk3MSAyNjUuMTY2QzE1MS4zNzcgMjY1LjE2NiAxNTIuNjY2IDI2NC44NzMgMTUzLjg2NyAyNjQuMjU4QzE1NS40NzkgMjYzLjU1NSAxNTcuNTg4IDI2Mi41NTkgMTYwLjI1NCAyNjEuMjdDMTYyLjg5MSAyNTkuOTggMTY3LjM3MyAyNTcuNDkgMTczLjY3MiAyNTMuODU3QzE3OS45NzEgMjUwLjE5NSAxODYuMDA2IDI0Ni4zMjggMTkxLjgwNyAyNDIuMjI3QzE5Ny42MDcgMjM4LjEyNSAyMDMuOTM2IDIzMi45NjkgMjEwLjc5MSAyMjYuNzg3QzIxNy42NDYgMjIwLjU3NiAyMjMuNTM1IDIxNC4yMTkgMjI4LjQ4NiAyMDcuNjU2QzIzMy40MzggMjAxLjA5NCAyMzcuNTY4IDE5My42MjMgMjQwLjkzOCAxODUuMTU2QzI0NC4yNzcgMTc2LjcxOSAyNDUuOTQ3IDE2OC4xOTMgMjQ1Ljk0NyAxNTkuNThWNDQuNDQzNEMyNDUuOTc3IDQxLjgzNTkgMjQ1LjAxIDM5LjU4MDEgMjQzLjEwNSAzNy42NzU4Wk0yMjAuODQgMTYwLjY2NEMyMjAuODQgMjAyLjM1NCAxNTAgMjM4LjI3MSAxNTAgMjM4LjI3MVY1OS41MDJIMjIwLjg0QzIyMC44NCA1OS41MDIgMjIwLjg0IDExOC45NzUgMjIwLjg0IDE2MC42NjRaIiBmaWxsPSJ3aGl0ZSIvPgo8L2c+CjxkZWZzPgo8Y2xpcFBhdGggaWQ9ImNsaXAwXzY4XzYxIj4KPHJlY3Qgd2lkdGg9IjMwMCIgaGVpZ2h0PSIzMDAiIGZpbGw9IndoaXRlIi8+CjwvY2xpcFBhdGg+CjwvZGVmcz4KPC9zdmc+Cg=="}}
+diff --git a/server/app.js b/server/app.js
+new file mode 100644
+index 0000000..286bae6
+--- /dev/null
++++ b/server/app.js
+@@ -0,0 +1,160 @@
++import { DatabaseSync } from 'node:sqlite';
++import { randomBytes, createHash } from 'node:crypto';
++import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from '@simplewebauthn/server';
++
++const token = () => randomBytes(32).toString('base64url');
++const hash = value => createHash('sha256').update(value).digest('hex');
++const fail = (status, message) => { throw Object.assign(new Error(message), { status }); };
++export function createApp({ database = 'data/accounts.sqlite', origin = 'http://localhost:11222', rpID = new URL(origin).hostname } = {}) {
++  const url = new URL(origin);
++  if (url.origin !== origin) throw new Error('APP_ORIGIN must be an exact origin without a path or trailing slash.');
++  if (url.protocol !== 'https:' && !['localhost', '127.0.0.1'].includes(url.hostname)) throw new Error('APP_ORIGIN must use HTTPS.');
++  const db = new DatabaseSync(database);
++  db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
++    CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, displayName TEXT NOT NULL);
++    CREATE TABLE IF NOT EXISTS credentials (id TEXT PRIMARY KEY, userId TEXT NOT NULL REFERENCES users(id), record TEXT NOT NULL);
++    CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, record TEXT NOT NULL, expires INTEGER NOT NULL);`);
++  const getUser = id => db.prepare('SELECT * FROM users WHERE id=?').get(id);
++  const list = id => db.prepare('SELECT record FROM credentials WHERE userId=?').all(id).map(row => JSON.parse(row.record));
++  const putCredential = (userId, c) => db.prepare('INSERT OR REPLACE INTO credentials VALUES (?,?,?)').run(c.id, userId, JSON.stringify(c));
++  const profile = user => ({ user, rpId: rpID, userId: user.id, credentials: list(user.id).map(({ publicKey, counter, ...safe }) => safe) });
++  const clean = (value, max=80) => typeof value === 'string' && value.trim().length > 0 && value.trim().length <= max ? value.trim() : fail(400, 'Please complete all fields with a valid value.');
++  const details = body => {
++    const name = clean(body.name, 254).toLowerCase();
++    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(name)) fail(400, 'Enter a valid email address.');
++    return { name, displayName: clean(body.displayName) };
++  };
++  const limits = new Map();
++  return { close: () => db.close(), async handle(req, clientIP='local') {
++    let session, sessionID, cookie;
++    const headers = { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
++    const respond = (body, status=200) => {
++      if (session && sessionID) {
++        const expires = Date.now()+8*60*60*1000;
++        if (cookie) db.prepare('INSERT INTO sessions VALUES (?,?,?)').run(hash(sessionID), JSON.stringify(session), expires);
++        else db.prepare('UPDATE sessions SET record=?, expires=? WHERE id=?').run(JSON.stringify(session), expires, hash(sessionID));
++      }
++      if (cookie) headers['Set-Cookie'] = cookie;
++      return new Response(JSON.stringify(body), { status, headers });
++    };
++    const rotate = () => {
++      if (sessionID) db.prepare('DELETE FROM sessions WHERE id=?').run(hash(sessionID));
++      sessionID = token();
++      cookie = `dg_session=${sessionID}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800${url.protocol === 'https:' ? '; Secure' : ''}`;
++    };
++    try {
++      const path = new URL(req.url).pathname;
++      if (req.method !== 'GET') {
++        if (req.headers.get('origin') !== origin) fail(403, 'Request origin was rejected.');
++        if (!req.headers.get('content-type')?.startsWith('application/json')) fail(415, 'JSON is required.');
++        const now = Date.now();
++        for (const [key, value] of limits) if (value.until < now) limits.delete(key);
++        const rate = limits.get(clientIP) || { count: 0, until: now+60000 };
++        limits.set(clientIP, rate);
++        if (++rate.count > 60) fail(429, 'Too many attempts. Please wait a minute.');
++      }
++      db.prepare('DELETE FROM sessions WHERE expires < ?').run(Date.now());
++      sessionID = req.headers.get('cookie')?.match(/(?:^|;\s*)dg_session=([A-Za-z0-9_-]{43})(?:;|$)/)?.[1];
++      const stored = sessionID && db.prepare('SELECT record FROM sessions WHERE id=?').get(hash(sessionID));
++      session = stored ? JSON.parse(stored.record) : {};
++      if (!stored) rotate();
++      const user = session.userId && getUser(session.userId);
++      const signedIn = () => user || fail(401, 'Please sign in to your account.');
++      const requireRecent = () => { signedIn(); if (!session.verifiedAt || Date.now()-session.verifiedAt > 5*60000) fail(403, 'Verify your identity to continue.'); };
++      let body = {};
++      if (req.method !== 'GET') {
++        const raw = await req.text();
++        if (raw.length > 65536) fail(413, 'Request is too large.');
++        try { body = JSON.parse(raw); } catch { fail(400, 'Invalid JSON.'); }
++        if (!body || typeof body !== 'object' || Array.isArray(body)) fail(400, 'Invalid request.');
++      }
++      if (path === '/api/account' && req.method === 'GET') return respond(user ? profile(user) : { user: null });
++      if (path === '/api/logout' && req.method === 'POST') { session = {}; rotate(); return respond({ success: true }); }
++      if (path === '/api/register/options' && req.method === 'POST') {
++        let account;
++        if (user) { requireRecent(); account = user; }
++        else {
++          account = { id: token(), ...details(body) };
++          if (db.prepare('SELECT id FROM users WHERE name=?').get(account.name)) fail(409, 'An account with this email already exists. Sign in with your passkey.');
++        }
++        const options = await generateRegistrationOptions({ rpName: 'The Daily Grind', rpID, userID: Buffer.from(account.id, 'base64url'), userName: account.name, userDisplayName: account.displayName, attestationType: 'none', supportedAlgorithmIDs: [-7, -257], excludeCredentials: user ? list(user.id).map(c => ({ id:c.id, transports:c.transports })) : [], authenticatorSelection: { residentKey:'required', requireResidentKey:true, userVerification:'preferred' } });
++        session.ceremony = { type:'register', challenge:options.challenge, account, existing:!!user, expires:Date.now()+300000, uv:false };
++        return respond(options);
++      }
++      if (['/api/auth/options','/api/reauth/options'].includes(path) && req.method === 'POST') {
++        const reauth = path.includes('/reauth/');
++        if (reauth) { signedIn(); if (!list(user.id).length) fail(409, 'No passkeys are available for this account.'); }
++        const options = await generateAuthenticationOptions({ rpID, userVerification:reauth ? 'required' : 'preferred', allowCredentials:reauth ? list(user.id).map(c=>({id:c.id, transports:c.transports})) : [] });
++        session.ceremony = { type:reauth?'reauth':'auth', challenge:options.challenge, userId:reauth?user.id:null, expires:Date.now()+300000, uv:reauth };
++        return respond(options);
++      }
++      if (['/api/register/verify','/api/auth/verify','/api/reauth/verify'].includes(path) && req.method === 'POST') {
++        const kind = path.split('/')[2];
++        const pending = session.ceremony;
++        delete session.ceremony;
++        // Consume before asynchronous verification, including failed attempts.
++        const consumed = db.prepare('UPDATE sessions SET record=? WHERE id=? AND record=?').run(JSON.stringify(session), hash(sessionID), stored?.record || '');
++        if (!consumed.changes) fail(400, 'This request was already used or replaced. Please try again.');
++        if (!pending || pending.type !== kind || pending.expires < Date.now()) fail(400, 'This request expired. Please try again.');
++        if (kind === 'register') {
++          if (pending.existing && (!user || user.id !== pending.account.id)) fail(403, 'Account changed. Sign in again.');
++          const result = await verifyRegistrationResponse({ response:body, expectedChallenge:pending.challenge, expectedOrigin:origin, expectedRPID:rpID, requireUserVerification:pending.uv });
++          if (!result.verified || !result.registrationInfo) fail(400, 'Passkey registration could not be verified.');
++          const { credential, credentialDeviceType, credentialBackedUp, aaguid } = result.registrationInfo;
++          if (!db.prepare('SELECT id FROM sessions WHERE id=?').get(hash(sessionID))) fail(401, 'Your session ended. Please sign in again.');
++          if (db.prepare('SELECT id FROM credentials WHERE id=?').get(credential.id)) fail(409, 'This passkey is already registered.');
++          db.exec('BEGIN IMMEDIATE');
++          try {
++            if (!pending.existing) db.prepare('INSERT INTO users VALUES (?,?,?)').run(pending.account.id, pending.account.name, pending.account.displayName);
++            putCredential(pending.account.id, { id:credential.id, publicKey:Buffer.from(credential.publicKey).toString('base64url'), counter:credential.counter, transports:credential.transports || [], credentialType:'public-key', credentialDeviceType, credentialBackedUp, aaguid, name:'My passkey', registeredAt:Date.now(), lastUsedAt:null });
++            db.exec('COMMIT');
++          } catch (err) { db.exec('ROLLBACK'); if (err.code?.startsWith('ERR_SQLITE')) fail(409, 'Account registration conflicted. Please sign in or try again.'); throw err; }
++          session = { userId:pending.account.id }; rotate();
++          return respond(profile(getUser(session.userId)));
++        }
++        const row = db.prepare('SELECT * FROM credentials WHERE id=?').get(body.id || '');
++        if (!row) fail(404, 'This passkey is no longer registered. Try another passkey.');
++        if (kind === 'reauth' && (!user || row.userId !== user.id || pending.userId !== user.id)) fail(403, 'Use a passkey for the signed-in account.');
++        if (body.response?.userHandle && body.response.userHandle !== row.userId) fail(403, 'Passkey account did not match.');
++        const credential = JSON.parse(row.record);
++        const result = await verifyAuthenticationResponse({ response:body, expectedChallenge:pending.challenge, expectedOrigin:origin, expectedRPID:rpID, requireUserVerification:pending.uv, credential:{ id:credential.id, publicKey:Buffer.from(credential.publicKey,'base64url'), counter:credential.counter, transports:credential.transports } });
++        if (!result.verified) fail(400, 'Passkey authentication could not be verified.');
++        credential.counter = result.authenticationInfo.newCounter;
++        credential.lastUsedAt = Date.now();
++        credential.credentialBackedUp = result.authenticationInfo.credentialBackedUp;
++        credential.credentialDeviceType = result.authenticationInfo.credentialDeviceType;
++        if (!db.prepare('SELECT id FROM sessions WHERE id=?').get(hash(sessionID))) fail(401, 'Your session ended. Please sign in again.');
++        const saved = db.prepare('UPDATE credentials SET record=? WHERE id=? AND record=?').run(JSON.stringify(credential), row.id, row.record);
++        if (!saved.changes) fail(409, 'This passkey changed during sign-in. Please try again.');
++        session = { userId:row.userId, ...(kind==='reauth' ? { verifiedAt:Date.now() } : {}) }; rotate();
++        return respond(profile(getUser(row.userId)));
++      }
++      if (path === '/api/profile' && req.method === 'PUT') {
++        requireRecent();
++        const updated = details(body);
++        if (db.prepare('SELECT id FROM users WHERE name=? AND id<>?').get(updated.name,user.id)) fail(409, 'This email is already in use.');
++        db.prepare('UPDATE users SET name=?,displayName=? WHERE id=?').run(updated.name,updated.displayName,user.id);
++        delete session.verifiedAt;
++        return respond(profile(getUser(user.id)));
++      }
++      if (path.startsWith('/api/credentials/') && ['PUT','DELETE'].includes(req.method)) {
++        signedIn();
++        const id = path.slice('/api/credentials/'.length);
++        const credential = list(user.id).find(c=>c.id===id);
++        if (!credential) fail(404, 'Passkey not found.');
++        if (req.method === 'PUT') { credential.name = clean(body.name); putCredential(user.id,credential); }
++        else {
++          requireRecent();
++          if (list(user.id).length <= 1) fail(409, 'Add another passkey before removing your last one.');
++          db.prepare('DELETE FROM credentials WHERE id=? AND userId=?').run(id,user.id);
++          delete session.verifiedAt;
++        }
++        return respond(profile(user));
++      }
++      fail(404, 'Not found.');
++    } catch (err) {
++      if (!err.status) console.warn('Account request failed:', err.message);
++      return respond({ error:err.status ? err.message : 'Unable to verify this request. Please try again.' }, err.status || 400);
++    }
++  }};
++}
+diff --git a/server/start.js b/server/start.js
+new file mode 100644
+index 0000000..e45d700
+--- /dev/null
++++ b/server/start.js
+@@ -0,0 +1,27 @@
++import { createServer } from 'node:http';
++import { mkdir, readFile } from 'node:fs/promises';
++import { createApp } from './app.js';
++const port = Number(process.env.PORT || 11222);
++const origin = process.env.APP_ORIGIN || `http://localhost:${port}`;
++if (process.env.NODE_ENV === 'production' && !process.env.APP_ORIGIN) throw new Error('Set APP_ORIGIN to your HTTPS website URL.');
++await mkdir('data', { recursive:true });
++const app = createApp({ origin, rpID:process.env.RP_ID || new URL(origin).hostname, database:process.env.DATABASE_PATH || 'data/accounts.sqlite' });
++const files = new Map([['/', ['index.html','text/html']], ['/account',['index.html','text/html']], ['/account.js',['public/account.js','text/javascript']], ['/account.css',['account.css','text/css']]]);
++createServer(async (req,res) => {
++  try {
++    const path = new URL(req.url,origin).pathname;
++    res.setHeader('X-Content-Type-Options','nosniff');
++    res.setHeader('Referrer-Policy','same-origin');
++    if (path.startsWith('/api/')) {
++      const chunks=[]; let size=0;
++      for await (const chunk of req) { size+=chunk.length; if(size>65536) { res.writeHead(413);res.end();return; } chunks.push(chunk); }
++      const request = new Request(new URL(req.url,origin), { method:req.method, headers:req.headers, ...(!['GET','HEAD'].includes(req.method) ? { body:Buffer.concat(chunks) } : {}) });
++      const response = await app.handle(request, req.socket.remoteAddress);
++      res.writeHead(response.status,Object.fromEntries(response.headers));res.end(await response.text()); return;
++    }
++    const file=files.get(path);
++    if (!file || !['GET','HEAD'].includes(req.method)) {res.writeHead(404);res.end('Not found');return;}
++    const content=await readFile(file[0]);
++    res.writeHead(200,{'Content-Type':`${file[1]}; charset=utf-8`});res.end(req.method==='HEAD'?undefined:content);
++  } catch {res.writeHead(500);res.end('Unable to complete request. Run npm run build before starting the application.');}
++}).listen(port,()=>console.log(`Daily Grind listening on port ${port}`));

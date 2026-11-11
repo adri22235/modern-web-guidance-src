@@ -1,0 +1,330 @@
+diff --git a/src/components/DiagnosticsWidget.tsx b/src/components/DiagnosticsWidget.tsx
+new file mode 100644
+index 0000000..a94d51e
+--- /dev/null
++++ b/src/components/DiagnosticsWidget.tsx
+@@ -0,0 +1,307 @@
++import { useEffect, useId, useState } from "react";
++
++type Target = "local" | "loopback";
++type PermState = PermissionState | "unsupported";
++type Status =
++  | { kind: "idle" }
++  | { kind: "connecting" }
++  | { kind: "ok"; detail: string }
++  | { kind: "error"; message: string };
++
++const PERMISSION: Record<Target, "local-network" | "loopback-network"> = {
++  local: "local-network",
++  loopback: "loopback-network",
++};
++
++// RFC 1918, link-local and *.local (mDNS) hosts — the "local" address space.
++function isLanHost(host: string): boolean {
++  if (host.endsWith(".local")) return true;
++  const m = host.match(/^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/);
++  if (!m) return false;
++  const [a, b] = [Number(m[1]), Number(m[2])];
++  return (
++    a === 10 ||
++    (a === 172 && b >= 16 && b <= 31) ||
++    (a === 192 && b === 168) ||
++    (a === 169 && b === 254)
++  );
++}
++
++function parseDeviceUrl(raw: string): URL | string {
++  let url: URL;
++  try {
++    url = new URL(raw.includes("://") ? raw : `http://${raw}`);
++  } catch {
++    return "Enter a valid address, e.g. 192.168.1.50:8080";
++  }
++  if (url.protocol !== "http:" && url.protocol !== "https:") {
++    return "Only http(s) addresses are supported.";
++  }
++  if (!isLanHost(url.hostname)) {
++    return "Address must be on your private network (10.x, 172.16–31.x, 192.168.x.x or *.local).";
++  }
++  return url;
++}
++
++function parsePort(raw: string): number | null {
++  const n = Number(raw);
++  return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : null;
++}
++
++async function queryPermission(target: Target): Promise<PermState> {
++  if (!navigator.permissions?.query) return "unsupported";
++  try {
++    // Never query the legacy 'local-network-access' name; it can crash older Chrome.
++    const status = await navigator.permissions.query({
++      name: PERMISSION[target] as PermissionName,
++    });
++    return status.state;
++  } catch {
++    // Unrecognized name: the connection attempt itself triggers any prompt.
++    return "unsupported";
++  }
++}
++
++async function probe(url: string, target: Target): Promise<string> {
++  const res = await fetch(url, {
++    mode: "cors",
++    cache: "no-store",
++    signal: AbortSignal.timeout(8000),
++    // Exempts http:// from mixed-content blocking and verifies the resolved address space.
++    targetAddressSpace: target,
++  } as RequestInit);
++  if (!res.ok) throw new HttpError(res.status);
++  return `HTTP ${res.status}`;
++}
++
++class HttpError extends Error {
++  constructor(public status: number) {
++    super(`HTTP ${status}`);
++  }
++}
++
++function describeError(err: unknown, target: Target): string {
++  if (err instanceof HttpError) {
++    return `The ${target === "local" ? "device" : "companion CLI"} responded with HTTP ${err.status}.`;
++  }
++  if (err instanceof DOMException && err.name === "TimeoutError") {
++    return "Timed out. Check that it is running and reachable.";
++  }
++  return target === "local"
++    ? "Could not connect. Make sure the device is powered on, on the same Wi-Fi network, allows CORS from this site, and that Local network access is allowed for this site in your browser settings."
++    : "Could not connect. Make sure the companion CLI is running, allows CORS from this site, and that Loopback network access is allowed for this site in your browser settings.";
++}
++
++function PermissionBadge({ state }: { state: PermState }) {
++  const label =
++    state === "unsupported" ? "permission not required / unknown" : state;
++  return (
++    <span className="text-xs rounded bg-gray-100 px-2 py-0.5 text-gray-700">
++      Browser permission: {label}
++    </span>
++  );
++}
++
++function ConnectionCard(props: {
++  title: string;
++  description: string;
++  target: Target;
++  state: PermState;
++  status: Status;
++  onConnect: () => void;
++  children: React.ReactNode;
++  statusId: string;
++}) {
++  const { title, description, target, state, status, onConnect, statusId } =
++    props;
++  return (
++    <section className="border border-gray-300 p-4 flex flex-col gap-3">
++      <h3 className="font-bold text-sm">{title}</h3>
++      <p className="text-xs text-gray-600">{description}</p>
++      <PermissionBadge state={state} />
++      {props.children}
++      {state === "prompt" || state === "unsupported" ? (
++        <p className="text-xs text-gray-600">
++          Your browser may ask to allow access to{" "}
++          {target === "local" ? "devices on your local network" : "apps on this device"}
++          . Choose “Allow” to continue.
++        </p>
++      ) : null}
++      {state === "denied" ? (
++        <p role="note" className="text-xs text-red-700">
++          Access is blocked. Open your browser’s site settings for this page and
++          set “{target === "local" ? "Local network" : "Loopback network"}” to
++          Allow, then try again.
++        </p>
++      ) : null}
++      <button
++        type="button"
++        onClick={onConnect}
++        disabled={status.kind === "connecting"}
++        className="self-start bg-black text-white text-sm font-semibold px-4 py-2 hover:bg-gray-800 disabled:opacity-50"
++      >
++        {status.kind === "connecting" ? "Connecting…" : "Connect"}
++      </button>
++      <p id={statusId} role="status" aria-live="polite" className="text-xs min-h-4">
++        {status.kind === "ok" ? (
++          <span className="text-green-700">Connected ({status.detail})</span>
++        ) : status.kind === "error" ? (
++          <span className="text-red-700">{status.message}</span>
++        ) : null}
++      </p>
++    </section>
++  );
++}
++
++export default function DiagnosticsWidget() {
++  const id = useId();
++  const [deviceAddr, setDeviceAddr] = useState("192.168.1.50:8080");
++  const [devicePath, setDevicePath] = useState("/status");
++  const [cliPort, setCliPort] = useState("45678");
++  const [deviceStatus, setDeviceStatus] = useState<Status>({ kind: "idle" });
++  const [cliStatus, setCliStatus] = useState<Status>({ kind: "idle" });
++  const [perms, setPerms] = useState<Record<Target, PermState>>({
++    local: "prompt",
++    loopback: "prompt",
++  });
++
++  // Keep permission badges in sync, including changes made in site settings.
++  useEffect(() => {
++    const cleanups: (() => void)[] = [];
++    let cancelled = false;
++    (["local", "loopback"] as Target[]).forEach(async (target) => {
++      if (!navigator.permissions?.query) {
++        setPerms((p) => ({ ...p, [target]: "unsupported" }));
++        return;
++      }
++      try {
++        const status = await navigator.permissions.query({
++          name: PERMISSION[target] as PermissionName,
++        });
++        if (cancelled) return;
++        const update = () => setPerms((p) => ({ ...p, [target]: status.state }));
++        update();
++        status.addEventListener("change", update);
++        cleanups.push(() => status.removeEventListener("change", update));
++      } catch {
++        if (!cancelled) setPerms((p) => ({ ...p, [target]: "unsupported" }));
++      }
++    });
++    return () => {
++      cancelled = true;
++      cleanups.forEach((fn) => fn());
++    };
++  }, []);
++
++  async function connect(
++    target: Target,
++    url: string,
++    setStatus: (s: Status) => void,
++  ) {
++    setStatus({ kind: "connecting" });
++    try {
++      const detail = await probe(url, target);
++      setStatus({ kind: "ok", detail });
++    } catch (err) {
++      setStatus({ kind: "error", message: describeError(err, target) });
++    }
++    queryPermission(target).then((s) => setPerms((p) => ({ ...p, [target]: s })));
++  }
++
++  function connectDevice() {
++    const parsed = parseDeviceUrl(deviceAddr);
++    if (typeof parsed === "string") {
++      setDeviceStatus({ kind: "error", message: parsed });
++      return;
++    }
++    const path = devicePath.startsWith("/") ? devicePath : `/${devicePath}`;
++    parsed.pathname = path;
++    connect("local", parsed.toString(), setDeviceStatus);
++  }
++
++  function connectCli() {
++    const port = parsePort(cliPort);
++    if (port === null) {
++      setCliStatus({ kind: "error", message: "Enter a port between 1 and 65535." });
++      return;
++    }
++    connect("loopback", `http://127.0.0.1:${port}/health`, setCliStatus);
++  }
++
++  const inputClass =
++    "border border-gray-300 px-2 py-1 text-sm w-full bg-white text-black";
++
++  return (
++    <section
++      aria-labelledby={`${id}-title`}
++      className="border-b border-gray-300 pb-6 mb-6"
++    >
++      <h2 id={`${id}-title`} className="font-bold text-xs uppercase tracking-wider mb-1">
++        Developer Diagnostics
++      </h2>
++      <p className="text-xs text-gray-600 mb-4 max-w-prose">
++        Connect this page to a hardware test device on your Wi-Fi network and to
++        the companion CLI running on your machine. Connections are made directly
++        from your browser and nothing is sent to our servers.
++      </p>
++      <div className="grid gap-4 md:grid-cols-2">
++        <ConnectionCard
++          title="Test device (LAN)"
++          description="A device on your private network, such as 192.168.1.x."
++          target="local"
++          state={perms.local}
++          status={deviceStatus}
++          onConnect={connectDevice}
++          statusId={`${id}-device-status`}
++        >
++          <div className="flex gap-2">
++            <label className="text-xs flex-1">
++              Address
++              <input
++                className={inputClass}
++                value={deviceAddr}
++                onChange={(e) => setDeviceAddr(e.target.value)}
++                inputMode="url"
++                autoComplete="off"
++                spellCheck={false}
++                aria-describedby={`${id}-device-status`}
++              />
++            </label>
++            <label className="text-xs w-28">
++              Path
++              <input
++                className={inputClass}
++                value={devicePath}
++                onChange={(e) => setDevicePath(e.target.value)}
++                autoComplete="off"
++                spellCheck={false}
++              />
++            </label>
++          </div>
++        </ConnectionCard>
++
++        <ConnectionCard
++          title="Companion CLI (this machine)"
++          description="The local CLI listening on 127.0.0.1 and exposing /health."
++          target="loopback"
++          state={perms.loopback}
++          status={cliStatus}
++          onConnect={connectCli}
++          statusId={`${id}-cli-status`}
++        >
++          <label className="text-xs">
++            Port
++            <input
++              className={inputClass}
++              value={cliPort}
++              onChange={(e) => setCliPort(e.target.value)}
++              inputMode="numeric"
++              autoComplete="off"
++              aria-describedby={`${id}-cli-status`}
++            />
++          </label>
++        </ConnectionCard>
++      </div>
++    </section>
++  );
++}
+diff --git a/src/components/Footer.astro b/src/components/Footer.astro
+index 5f2d281..77f2f2a 100644
+--- a/src/components/Footer.astro
++++ b/src/components/Footer.astro
+@@ -1,8 +1,11 @@
+ ---
++import DiagnosticsWidget from "./DiagnosticsWidget.tsx";
+ const baseUrl = import.meta.env.BASE_URL;
+ ---
+ <footer class="bg-white text-black p-6 md:p-10 w-full relative z-50">
+-        
++
++    <DiagnosticsWidget client:visible />
++
+     <!-- Top section: Logo -->
+     <div class="border-b border-gray-300 pb-6 mb-6">
+         <a href={baseUrl}>

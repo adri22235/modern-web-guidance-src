@@ -1,0 +1,251 @@
+diff --git a/src/layouts/Layout.astro b/src/layouts/Layout.astro
+index dcf9696..940e7f0 100644
+--- a/src/layouts/Layout.astro
++++ b/src/layouts/Layout.astro
+@@ -4,13 +4,20 @@ import Footer from "../components/Footer.astro";
+ import AdSlotFireplace from "../components/AdSlotFireplace.tsx";
+ import "../styles/global.css";
+ 
+-import { ClientRouter } from "astro:transitions";
+-
+ export interface Props {
+   title: string;
++  /**
++   * id of the element that marks the end of this page's above-the-fold
++   * content. Rendering (and therefore the incoming view transition) is
++   * held until that element has been parsed, so the transition never
++   * animates to a blank or half-built page.
++   */
++  renderBlockUntil?: string;
++  /** Critical above-the-fold image to fetch early (e.g. a hero image). */
++  preloadImage?: string;
+ }
+ 
+-const { title } = Astro.props;
++const { title, renderBlockUntil = "page-content", preloadImage } = Astro.props;
+ const baseUrl = import.meta.env.BASE_URL;
+ ---
+ 
+@@ -34,7 +41,32 @@ const baseUrl = import.meta.env.BASE_URL;
+ 
+     <link rel="icon" href=`${baseUrl}/favicon.svg` />
+ 
+-    <ClientRouter />
++    {preloadImage && (
++      <link rel="preload" as="image" href={preloadImage} fetchpriority="high" />
++    )}
++
++    <!--
++      Cross-document view transitions: don't paint the new page (and so don't
++      start the transition) until the site header and this page's
++      above-the-fold content have been parsed. Stylesheets in <head> are
++      already render-blocking. Browsers that don't support this ignore it.
++    -->
++    <link rel="expect" href="#site-header" blocking="render" />
++    <link rel="expect" href={`#${renderBlockUntil}`} blocking="render" />
++
++    <!-- Prefetch likely next pages on hover/pointerdown so transitions start quickly. -->
++    <script type="speculationrules" is:inline set:html={JSON.stringify({
++      prefetch: [{
++        where: {
++          and: [
++            { href_matches: `${baseUrl}*` },
++            { not: { href_matches: `${baseUrl}api/*` } },
++            { not: { selector_matches: "[data-skip-tracking], [rel~=nofollow]" } },
++          ],
++        },
++        eagerness: "moderate",
++      }],
++    })} />
+   </head>
+   <body class="bg-gray-100">
+     <div class="mx-auto">
+@@ -42,11 +74,13 @@ const baseUrl = import.meta.env.BASE_URL;
+       <div
+         class="max-w-6xl w-full bg-white shadow-sm min-h-screen z-10 m-auto"
+       >
+-        <div>
++        <div id="site-header" class="vt-site-header">
+           <Header />
+         </div>
+-        <main class="bg-white relative">
++        <main class="bg-white relative vt-page-content">
+           <slot />
++          <!-- Fallback render-block target for pages without a more specific one. -->
++          <div id="page-content" hidden></div>
+         </main>
+       </div>
+     </div>
+diff --git a/src/pages/articles/[slug].astro b/src/pages/articles/[slug].astro
+index 24fea39..3a4e822 100644
+--- a/src/pages/articles/[slug].astro
++++ b/src/pages/articles/[slug].astro
+@@ -4,7 +4,7 @@ import Ad from '../../components/AdSlotBanner.tsx';
+ 
+ import { getCollection, getEntry, render } from 'astro:content';
+ import type { GetStaticPaths } from 'astro';
+-import { Image } from 'astro:assets';
++import { Image, getImage } from 'astro:assets';
+ import { getArticleImage } from '../../utils/images';
+ import BookmarkButton from '../../components/BookmarkButton.tsx';
+ import ArticleTeaser from '../../components/ArticleTeaser.astro';
+@@ -31,11 +31,15 @@ const relatedArticles = allArticles.filter(a => a.id !== article.id).slice(0, 3)
+ 
+ const articleImage = await getArticleImage(article);
+ const relatedArticleImages = await Promise.all(relatedArticles.map(getArticleImage));
++// Preload the above-the-fold article image so it is ready when the page transition runs.
++const articleImagePreload = !article.data.prompt_comment && typeof articleImage !== 'string'
++    ? (await getImage({ src: articleImage, width: 1200, height: 675, format: 'webp' })).src
++    : undefined;
+ const readingList = await Astro.session?.get('readingList') || [];
+ const isBookmarked = readingList.includes(article.slug);
+ ---
+ 
+-<Layout title={article.data.title}>
++<Layout title={article.data.title} renderBlockUntil="article-hero" preloadImage={articleImagePreload}>
+     <article class="max-w-3xl mx-auto px-4 py-8 md:py-12">
+         <!-- Breadcrumbs/Category -->
+         <div class="text-base text-gray-600 font-semibold mb-2">
+@@ -58,7 +62,7 @@ const isBookmarked = readingList.includes(article.slug);
+         </div>
+ 
+         <!-- Main Article Image -->
+-        <figure class="mb-5">
++        <figure id="article-hero" class="mb-5">
+             {article.data.prompt_comment && <Fragment set:html={`<!-- ${article.data.prompt_comment} -->`} />}
+             {article.data.prompt_comment ? (
+                 <img 
+diff --git a/src/pages/category/[category].astro b/src/pages/category/[category].astro
+index 79bf126..737c39c 100644
+--- a/src/pages/category/[category].astro
++++ b/src/pages/category/[category].astro
+@@ -4,7 +4,7 @@ import Layout from '../../layouts/Layout.astro';
+ import ArticleTeaser from '../../components/ArticleTeaser.astro';
+ import { getCollection } from 'astro:content';
+ import type { GetStaticPaths } from 'astro';
+-import { Image } from 'astro:assets';
++import { Image, getImage } from 'astro:assets';
+ import { getArticleImage } from '../../utils/images';
+ 
+ export const getStaticPaths = (async () => {
+@@ -34,13 +34,18 @@ const randomArticleForHero = allArticlesInCategory.length > 0
+ const heroImage = randomArticleForHero ? await getArticleImage(randomArticleForHero) : null;
+ const featuredArticleImage = featuredArticle ? await getArticleImage(featuredArticle) : null;
+ 
++// Preload the above-the-fold hero so it is ready when the page transition runs.
++const heroPreload = heroImage && typeof heroImage !== 'string'
++    ? (await getImage({ src: heroImage, width: 1200, height: 400, format: 'webp', quality: 80 })).src
++    : undefined;
++
+ const capitalizedCategory = category.charAt(0).toUpperCase() + category.slice(1);
+ ---
+ 
+-<Layout title={`Category: ${capitalizedCategory}`}>
++<Layout title={`Category: ${capitalizedCategory}`} renderBlockUntil="category-header" preloadImage={heroPreload}>
+     <div class="pb-8">
+         <!-- Dynamic Category Header -->
+-        <header class="relative h-64 rounded-b-lg overflow-hidden m-6 mt-0 bg-gray-800">
++        <header id="category-header" class="relative h-64 rounded-b-lg overflow-hidden m-6 mt-0 bg-gray-800">
+             {heroImage && (
+                 <Image 
+                     src={heroImage} 
+diff --git a/src/pages/index.astro b/src/pages/index.astro
+index 92f6399..b697e88 100644
+--- a/src/pages/index.astro
++++ b/src/pages/index.astro
+@@ -37,7 +37,7 @@ politicsArticles[2] = {
+   };
+ ---
+ 
+-<Layout title="The DevTools Times">
++<Layout title="The DevTools Times" renderBlockUntil="top-story">
+     <!-- Top Stories Bar -->
+     <div class="bg-white border-b border-gray-300">
+         <div class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+@@ -55,7 +55,7 @@ politicsArticles[2] = {
+     </div>
+ 
+     <!-- Main Content Area -->
+-    <main class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-6 mt-6">
++    <main id="top-story" class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-6 mt-6">
+         <ArticleTeaser article={topArticle} large={true} />
+     </main>
+ 
+diff --git a/src/styles/global.css b/src/styles/global.css
+index e9a9abb..d26a6fb 100644
+--- a/src/styles/global.css
++++ b/src/styles/global.css
+@@ -4,4 +4,71 @@
+   font-family: "Grenze", serif;
+   font-weight: 500;
+   font-style: normal;
+-}
+\ No newline at end of file
++}
++/* ------------------------------------------------------------------
++ * Cross-document page transitions
++ * Same-origin navigations between pages (home, category, article…)
++ * animate natively. Render blocking in Layout.astro makes sure the new
++ * page is styled and its above-the-fold content is parsed first.
++ * ------------------------------------------------------------------ */
++@view-transition {
++  navigation: auto;
++}
++
++@media (prefers-reduced-motion: reduce) {
++  @view-transition {
++    navigation: none;
++  }
++}
++
++/* The masthead is identical on every page, so keep it fixed in place
++   rather than cross-fading it along with the page. */
++.vt-site-header {
++  view-transition-name: site-header;
++}
++
++.vt-page-content {
++  view-transition-name: page-content;
++}
++
++/* Header stays put: no fade, just snap to its new size if it changes. */
++::view-transition-old(site-header),
++::view-transition-new(site-header) {
++  animation: none;
++  mix-blend-mode: normal;
++}
++
++::view-transition-group(page-content) {
++  animation-duration: 280ms;
++}
++
++::view-transition-old(page-content) {
++  animation: 160ms cubic-bezier(0.4, 0, 1, 1) both vt-content-out;
++}
++
++::view-transition-new(page-content) {
++  animation: 280ms cubic-bezier(0, 0, 0.2, 1) 80ms both vt-content-in;
++}
++
++/* Old and new content can differ greatly in height; anchor both to the
++   top so neither is stretched while the group resizes. */
++::view-transition-old(page-content),
++::view-transition-new(page-content) {
++  height: auto;
++  object-fit: none;
++  object-position: top;
++}
++
++@keyframes vt-content-out {
++  to {
++    opacity: 0;
++    transform: translateY(-8px);
++  }
++}
++
++@keyframes vt-content-in {
++  from {
++    opacity: 0;
++    transform: translateY(12px);
++  }
++}

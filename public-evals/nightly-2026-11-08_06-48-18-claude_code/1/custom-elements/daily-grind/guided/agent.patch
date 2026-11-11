@@ -1,0 +1,417 @@
+diff --git a/coffee-card.js b/coffee-card.js
+new file mode 100644
+index 0000000..7817021
+--- /dev/null
++++ b/coffee-card.js
+@@ -0,0 +1,309 @@
++/**
++ * <coffee-card> — an autonomous custom element for a menu item.
++ *
++ * Attributes (all reflected to same-named camelCase properties):
++ *   name      string   Drink name shown as the card heading.
++ *   href      string   Link target for "View Details".
++ *   image     string   Optional photo URL.
++ *   price     number   Price in USD; formatted for display. Omitted/invalid → hidden.
++ *   rating    number   0–5 stars, clamped. Omitted → hidden.
++ *   featured  boolean  Shows a "Seasonal" badge.
++ *   sold-out  boolean  Disables "Add to Order" and dims the card (property: soldOut).
++ *
++ * The description is regular light-DOM content, projected through a <slot>.
++ *
++ * Events:
++ *   add-to-order  CustomEvent<{ name, price }>, bubbles + composed.
++ */
++
++const template = document.createElement('template');
++template.innerHTML = `
++  <style>
++    :host {
++      display: block;
++      position: relative;
++      background: white;
++      border-radius: 8px;
++      box-shadow: 0 2px 5px rgb(0 0 0 / 0.1);
++      text-align: center;
++      overflow: hidden;
++      contain: content;
++    }
++    :host([hidden]) { display: none; }
++    :host([sold-out]) { opacity: 0.65; }
++    [hidden] { display: none !important; }
++
++    img {
++      display: block;
++      width: 100%;
++      aspect-ratio: 3 / 2;
++      object-fit: cover;
++      background: var(--secondary, #d7ccc8);
++    }
++    img:not([src]) { display: none; }
++
++    .body { padding: 20px; }
++
++    h3 {
++      margin: 0 0 10px;
++      color: var(--primary, #4e342e);
++    }
++
++    .badge {
++      position: absolute;
++      top: 12px;
++      left: 12px;
++      background: var(--accent, #ffab40);
++      color: var(--text, #3e2723);
++      font-size: 0.75rem;
++      font-weight: bold;
++      text-transform: uppercase;
++      letter-spacing: 0.05em;
++      padding: 2px 10px;
++      border-radius: 999px;
++    }
++    :host([sold-out]) .badge { background: var(--secondary, #d7ccc8); }
++
++    .meta {
++      display: flex;
++      justify-content: center;
++      gap: 12px;
++      margin-top: 10px;
++      font-weight: 600;
++    }
++    .rating { color: #b26a00; }
++
++    .actions {
++      display: flex;
++      flex-wrap: wrap;
++      justify-content: center;
++      gap: 10px;
++      margin-top: 15px;
++    }
++
++    .btn {
++      display: inline-block;
++      font: inherit;
++      font-size: 0.95rem;
++      background: var(--primary, #4e342e);
++      color: white;
++      padding: 10px 20px;
++      border: 0;
++      border-radius: 5px;
++      text-decoration: none;
++      cursor: pointer;
++      transition: background 0.3s;
++    }
++    .btn:hover { background: #3e2723; }
++    .btn:focus-visible { outline: 3px solid var(--accent, #ffab40); outline-offset: 2px; }
++    .btn.secondary {
++      background: transparent;
++      color: var(--primary, #4e342e);
++      box-shadow: inset 0 0 0 1px currentColor;
++    }
++    .btn.secondary:hover { background: var(--secondary, #d7ccc8); }
++    .btn:disabled { cursor: not-allowed; background: #8d8d8d; }
++  </style>
++  <article part="card">
++    <span class="badge" part="badge" hidden></span>
++    <img part="image" alt="" loading="lazy" decoding="async">
++    <div class="body">
++      <h3 part="name"></h3>
++      <slot></slot>
++      <div class="meta">
++        <span class="price" part="price" hidden></span>
++        <span class="rating" part="rating" hidden></span>
++      </div>
++      <div class="actions">
++        <a class="btn" part="details">View Details</a>
++        <button class="btn secondary" part="add" type="button">Add to Order</button>
++      </div>
++    </div>
++  </article>
++`;
++
++const priceFormat = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
++
++/** Parse a numeric attribute; returns null when absent or not a finite number. */
++const toNumber = (value) => {
++  if (value === null || value.trim() === '') return null;
++  const n = Number(value);
++  return Number.isFinite(n) ? n : null;
++};
++
++export class CoffeeCard extends HTMLElement {
++  static observedAttributes = ['name', 'href', 'image', 'price', 'rating', 'featured', 'sold-out'];
++
++  /** Properties that may have been set on an instance before the element upgraded. */
++  static #reflectedProps = ['name', 'href', 'image', 'price', 'rating', 'featured', 'soldOut'];
++
++  #els;
++  #listeners = null;
++
++  constructor() {
++    super();
++    const root = this.attachShadow({ mode: 'open' });
++    root.append(template.content.cloneNode(true));
++    this.#els = {
++      badge: root.querySelector('.badge'),
++      img: root.querySelector('img'),
++      name: root.querySelector('h3'),
++      price: root.querySelector('.price'),
++      rating: root.querySelector('.rating'),
++      details: root.querySelector('a'),
++      add: root.querySelector('button'),
++    };
++  }
++
++  // ---- String attributes ---------------------------------------------------
++
++  get name() { return this.getAttribute('name') ?? ''; }
++  set name(v) { this.#setString('name', v); }
++
++  get href() { return this.getAttribute('href') ?? ''; }
++  set href(v) { this.#setString('href', v); }
++
++  get image() { return this.getAttribute('image') ?? ''; }
++  set image(v) { this.#setString('image', v); }
++
++  // ---- Numeric attributes --------------------------------------------------
++
++  /** @returns {number|null} */
++  get price() {
++    const n = toNumber(this.getAttribute('price'));
++    return n === null ? null : Math.max(0, n);
++  }
++  set price(v) { this.#setNumber('price', v); }
++
++  /** @returns {number|null} clamped to 0–5 */
++  get rating() {
++    const n = toNumber(this.getAttribute('rating'));
++    return n === null ? null : Math.min(5, Math.max(0, n));
++  }
++  set rating(v) { this.#setNumber('rating', v); }
++
++  // ---- Boolean attributes (presence = true; never write "false") -----------
++
++  get featured() { return this.hasAttribute('featured'); }
++  set featured(on) { this.toggleAttribute('featured', Boolean(on)); }
++
++  get soldOut() { return this.hasAttribute('sold-out'); }
++  set soldOut(on) { this.toggleAttribute('sold-out', Boolean(on)); }
++
++  // ---- Lifecycle -----------------------------------------------------------
++
++  connectedCallback() {
++    // Properties assigned before upgrade live as own data properties that
++    // shadow our accessors; re-route them through the setters.
++    for (const prop of CoffeeCard.#reflectedProps) {
++      if (Object.hasOwn(this, prop)) {
++        const value = this[prop];
++        delete this[prop];
++        this[prop] = value;
++      }
++    }
++
++    // connectedCallback runs on every insertion — keep setup idempotent.
++    if (!this.#listeners) {
++      this.#listeners = new AbortController();
++      this.#els.add.addEventListener('click', () => this.#addToOrder(), {
++        signal: this.#listeners.signal,
++      });
++    }
++
++    this.#render();
++  }
++
++  disconnectedCallback() {
++    // Tear down, but the element may be reinserted later (connectedCallback re-adds).
++    this.#listeners?.abort();
++    this.#listeners = null;
++  }
++
++  /** Moving via Node.moveBefore() keeps listeners/state; nothing to redo. */
++  connectedMoveCallback() {}
++
++  attributeChangedCallback(name, oldValue, newValue) {
++    if (oldValue === newValue || !this.isConnected) return;
++    this.#render(name);
++  }
++
++  // ---- Internals -----------------------------------------------------------
++
++  #setString(attr, v) {
++    if (v === null || v === undefined || v === '') this.removeAttribute(attr);
++    else this.setAttribute(attr, String(v));
++  }
++
++  #setNumber(attr, v) {
++    const n = v === null || v === undefined || v === '' ? NaN : Number(v);
++    if (Number.isFinite(n)) this.setAttribute(attr, String(n));
++    else this.removeAttribute(attr);
++  }
++
++  /** Update only the parts affected by `changed` (or everything when omitted). */
++  #render(changed) {
++    const all = changed === undefined;
++    const els = this.#els;
++
++    if (all || changed === 'name') {
++      els.name.textContent = this.name;
++      els.details.setAttribute('aria-label', `View details for ${this.name}`);
++    }
++
++    if (all || changed === 'href') {
++      if (this.href) els.details.href = this.href;
++      else els.details.removeAttribute('href');
++      els.details.hidden = !this.href;
++    }
++
++    if (all || changed === 'image') {
++      if (this.image) els.img.src = this.image;
++      else els.img.removeAttribute('src');
++    }
++
++    if (all || changed === 'price') {
++      const price = this.price;
++      els.price.hidden = price === null;
++      els.price.textContent = price === null ? '' : priceFormat.format(price);
++    }
++
++    if (all || changed === 'rating') {
++      const rating = this.rating;
++      els.rating.hidden = rating === null;
++      if (rating !== null) {
++        const stars = Math.round(rating);
++        els.rating.textContent = '★'.repeat(stars) + '☆'.repeat(5 - stars);
++        els.rating.setAttribute('role', 'img');
++        els.rating.setAttribute('aria-label', `Rated ${rating} out of 5`);
++      }
++    }
++
++    if (all || changed === 'name' || changed === 'sold-out') {
++      els.add.setAttribute('aria-label', this.soldOut
++        ? `${this.name} is sold out`
++        : `Add ${this.name} to order`);
++    }
++
++    if (all || changed === 'featured' || changed === 'sold-out') {
++      const label = this.soldOut ? 'Sold out' : this.featured ? 'Seasonal' : '';
++      els.badge.textContent = label;
++      els.badge.hidden = !label;
++      els.add.disabled = this.soldOut;
++      els.add.textContent = this.soldOut ? 'Sold Out' : 'Add to Order';
++    }
++  }
++
++  #addToOrder() {
++    if (this.soldOut) return;
++    this.dispatchEvent(new CustomEvent('add-to-order', {
++      bubbles: true,
++      composed: true,
++      detail: { name: this.name, price: this.price },
++    }));
++  }
++}
++
++if (!customElements.get('coffee-card')) {
++  customElements.define('coffee-card', CoffeeCard);
++}
+diff --git a/index.html b/index.html
+index 66c9173..89f9dde 100644
+--- a/index.html
++++ b/index.html
+@@ -107,17 +107,22 @@
+       margin-top: 20px;
+     }
+ 
+-    .card {
+-      background: white;
+-      padding: 20px;
+-      border-radius: 8px;
+-      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+-      text-align: center;
++    /* Avoid a flash of unstyled cards before upgrade, but fail open if the script never loads. */
++    coffee-card:not(:defined) {
++      display: block;
++      opacity: 0;
++      animation: defined-fallback 0.2s 2s forwards;
++    }
++
++    @keyframes defined-fallback {
++      to { opacity: 1; }
+     }
+ 
+-    .card h3 {
+-      margin-bottom: 10px;
+-      color: var(--primary);
++    .order-status {
++      text-align: center;
++      margin-top: 20px;
++      min-height: 1.6em;
++      font-weight: 600;
+     }
+ 
+     .btn {
+@@ -178,22 +183,34 @@
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+       <div class="grid">
+-        <div class="card">
+-          <h3>Maple Oat Latte</h3>
++        <coffee-card
++          name="Maple Oat Latte"
++          href="/menu/seasonal"
++          image="https://images.unsplash.com/photo-1572442388796-11668a67e53d?auto=format&fit=crop&w=600&q=70"
++          price="5.75"
++          rating="4.8"
++          featured>
+           <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+-          <a href="/menu/seasonal" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Dark Roast Espresso</h3>
++        </coffee-card>
++        <coffee-card
++          name="Dark Roast Espresso"
++          href="/menu/espresso"
++          image="https://images.unsplash.com/photo-1510591509098-f4fdc6d0ff04?auto=format&fit=crop&w=600&q=70"
++          price="3.25"
++          rating="4.6">
+           <p>Bold, smokey, and perfect for a morning boost.</p>
+-          <a href="/menu/espresso" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Cold Brew</h3>
++        </coffee-card>
++        <coffee-card
++          name="Cold Brew"
++          href="/menu/cold-brew"
++          image="https://images.unsplash.com/photo-1461023058943-07fcbe16d735?auto=format&fit=crop&w=600&q=70"
++          price="4.50"
++          rating="4.9"
++          sold-out>
+           <p>Steeped for 18 hours for maximum smoothness.</p>
+-          <a href="/menu/cold-brew" class="btn">View Details</a>
+-        </div>
++        </coffee-card>
+       </div>
++      <p class="order-status" role="status" aria-live="polite"></p>
+     </section>
+   </main>
+ 
+@@ -207,6 +224,18 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script type="module">
++    import './coffee-card.js';
++
++    const status = document.querySelector('.order-status');
++    const price = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
++
++    document.addEventListener('add-to-order', ({ detail }) => {
++      const cost = detail.price === null ? '' : ` (${price.format(detail.price)})`;
++      status.textContent = `Added ${detail.name}${cost} to your order.`;
++    });
++  </script>
++
+ </body>
+ 
+ </html>

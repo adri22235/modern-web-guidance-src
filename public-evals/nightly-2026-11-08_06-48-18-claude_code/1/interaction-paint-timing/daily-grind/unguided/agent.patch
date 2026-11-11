@@ -1,0 +1,504 @@
+diff --git a/index.html b/index.html
+index 66c9173..a2d879d 100644
+--- a/index.html
++++ b/index.html
+@@ -5,6 +5,8 @@
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <title>The Daily Grind | Artisanal Coffee</title>
++  <!-- Interaction-to-paint monitoring. Set data-endpoint="/your/collector" to beacon results. -->
++  <script src="/perf-monitor.js"></script>
+   <style>
+     :root {
+       --primary: #4e342e;
+@@ -157,7 +159,7 @@
+ 
+ <body>
+ 
+-  <nav>
++  <nav data-perf="nav">
+     <div class="logo">THE DAILY GRIND</div>
+     <ul>
+       <li><a href="/menu">Menu</a></li>
+@@ -171,24 +173,24 @@
+   <header class="hero">
+     <h1>Wake Up Your Senses</h1>
+     <p>Ethically sourced, locally roasted, delivered to your cup.</p>
+-    <a href="/order-online" class="btn">Order Now</a>
++    <a href="/order-online" class="btn" data-perf="order-now">Order Now</a>
+   </header>
+ 
+   <main class="container">
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+-      <div class="grid">
+-        <div class="card">
++      <div class="grid" data-perf="seasonal-favorites">
++        <div class="card" data-perf-label="Maple Oat Latte">
+           <h3>Maple Oat Latte</h3>
+           <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+           <a href="/menu/seasonal" class="btn">View Details</a>
+         </div>
+-        <div class="card">
++        <div class="card" data-perf-label="Dark Roast Espresso">
+           <h3>Dark Roast Espresso</h3>
+           <p>Bold, smokey, and perfect for a morning boost.</p>
+           <a href="/menu/espresso" class="btn">View Details</a>
+         </div>
+-        <div class="card">
++        <div class="card" data-perf-label="Cold Brew">
+           <h3>Cold Brew</h3>
+           <p>Steeped for 18 hours for maximum smoothness.</p>
+           <a href="/menu/cold-brew" class="btn">View Details</a>
+diff --git a/perf-monitor.js b/perf-monitor.js
+new file mode 100644
+index 0000000..f4b164a
+--- /dev/null
++++ b/perf-monitor.js
+@@ -0,0 +1,446 @@
++/*
++ * The Daily Grind: client-side interaction performance monitor.
++ *
++ * Measures how long it takes from a user interaction (or a client-side view
++ * switch) until the page has finished painting the visual updates it caused.
++ *
++ * Tracked interactions are clicks inside elements marked with `data-perf`
++ * (navigation bar, "Order Now" button, "Seasonal Favorites" cards). View
++ * switches are same-document navigations (history.pushState / replaceState
++ * with a URL change, back/forward traversals, hash changes, Navigation API).
++ *
++ * How "finished painting" is determined:
++ *   1. The measurement starts at the event's timestamp (click) or at the
++ *      moment the URL changes (view switch).
++ *   2. The first paint after the event is always awaited
++ *      (requestAnimationFrame + a posted task ≈ just after the frame paints).
++ *   3. Any further visual activity (DOM mutations, image loads, CSS
++ *      transitions/animations started after the interaction) schedules
++ *      another "after next paint" check, extending the measurement.
++ *   4. Once there has been no activity for QUIET_MS and no transitions or
++ *      finite animations are running, the measurement ends at the last
++ *      observed paint. Measurements are capped at MAX_MS.
++ *   Where the Event Timing API is available, the browser's own
++ *   input-delay / processing / presentation breakdown for the click is
++ *   attached to the report as well.
++ *
++ * Output (each completed measurement):
++ *   - performance.measure("dg:<name>")   → visible in DevTools Performance panel
++ *   - window "dg:perf" CustomEvent       → { detail: report }
++ *   - window.__dgPerf.entries            → in-memory buffer (last 100)
++ *   - optional beacon to an endpoint     → set data-endpoint on the <script>
++ *                                          tag or window.DG_PERF_CONFIG.endpoint
++ *   - console output when debugging      → add ?perfdebug to the URL or set
++ *                                          localStorage.dgPerfDebug = "1"
++ */
++(function () {
++  'use strict';
++
++  if (window.__dgPerf || typeof performance === 'undefined' || !performance.now) return;
++
++  var script = document.currentScript;
++  var cfg = window.DG_PERF_CONFIG || {};
++  var ENDPOINT = cfg.endpoint || (script && script.getAttribute('data-endpoint')) || null;
++  var QUIET_MS = cfg.quietMs || 150;
++  var MAX_MS = cfg.maxMs || 5000;
++  var BUFFER_SIZE = 100;
++  var BATCH_SIZE = 10;
++  var DEBUG = !!cfg.debug;
++  try {
++    DEBUG = DEBUG || /[?&]perfdebug\b/.test(location.search) || localStorage.getItem('dgPerfDebug') === '1';
++  } catch (e) { /* storage may be blocked */ }
++
++  var now = function () { return performance.now(); };
++  var supportsEventTiming =
++    typeof PerformanceObserver !== 'undefined' &&
++    (PerformanceObserver.supportedEntryTypes || []).indexOf('event') !== -1;
++
++  var api = { entries: [], active: [] };
++  window.__dgPerf = api;
++
++  /* ------------------------------------------------------------------ */
++  /* Paint scheduling                                                    */
++  /* ------------------------------------------------------------------ */
++
++  // Calls every queued callback with a timestamp taken just after the next
++  // frame has been painted. Multiple requests in the same frame are coalesced.
++  var paintQueue = [];
++  var paintScheduled = false;
++  function afterNextPaint(cb) {
++    paintQueue.push(cb);
++    if (paintScheduled) return;
++    paintScheduled = true;
++    requestAnimationFrame(function () {
++      var ch = new MessageChannel();
++      ch.port1.onmessage = function () {
++        paintScheduled = false;
++        var t = now();
++        var q = paintQueue;
++        paintQueue = [];
++        for (var i = 0; i < q.length; i++) q[i](t);
++      };
++      ch.port2.postMessage(null);
++    });
++  }
++
++  /* ------------------------------------------------------------------ */
++  /* Measurement lifecycle                                               */
++  /* ------------------------------------------------------------------ */
++
++  var runningAnims = new Map(); // key -> start time of a transition/animation
++
++  function Measurement(kind, name, start, info) {
++    this.kind = kind; // 'interaction' | 'view-switch'
++    this.name = name;
++    this.start = start;
++    this.info = info || {};
++    this.firstPaint = null;
++    this.lastPaint = null;
++    this.lastActivity = now();
++    this.pendingPaints = 0;
++    this.done = false;
++    this.capped = false;
++    this.quietTimer = null;
++    var self = this;
++    this.maxTimer = setTimeout(function () { self.capped = true; self.finish(); }, MAX_MS);
++    this.requestPaint();
++  }
++
++  Measurement.prototype.requestPaint = function () {
++    var self = this;
++    this.pendingPaints++;
++    afterNextPaint(function (t) {
++      self.pendingPaints--;
++      if (self.done) return;
++      if (self.firstPaint === null) self.firstPaint = t;
++      self.lastPaint = t;
++      self.scheduleQuietCheck();
++    });
++  };
++
++  Measurement.prototype.activity = function () {
++    if (this.done) return;
++    this.lastActivity = now();
++    this.requestPaint();
++  };
++
++  Measurement.prototype.hasRunningAnims = function () {
++    var start = this.start;
++    var running = false;
++    runningAnims.forEach(function (t) { if (t >= start) running = true; });
++    return running;
++  };
++
++  Measurement.prototype.scheduleQuietCheck = function () {
++    var self = this;
++    clearTimeout(this.quietTimer);
++    var wait = Math.max(0, QUIET_MS - (now() - this.lastActivity));
++    this.quietTimer = setTimeout(function () {
++      if (self.done) return;
++      if (self.pendingPaints > 0 || self.hasRunningAnims() || now() - self.lastActivity < QUIET_MS) {
++        // Still busy: a pending paint or animation end will reschedule us;
++        // otherwise poll again after another quiet window.
++        if (self.pendingPaints === 0) self.scheduleQuietCheck();
++        return;
++      }
++      self.finish();
++    }, wait);
++  };
++
++  Measurement.prototype.finish = function (incomplete) {
++    if (this.done) return;
++    this.done = true;
++    clearTimeout(this.quietTimer);
++    clearTimeout(this.maxTimer);
++    var idx = api.active.indexOf(this);
++    if (idx !== -1) api.active.splice(idx, 1);
++    if (!api.active.length) stopObserving();
++
++    var end = this.lastPaint;
++    var report = {
++      kind: this.kind,
++      name: this.name,
++      start: round(this.start),
++      end: end === null ? null : round(end),
++      duration: end === null ? null : round(end - this.start),
++      firstPaintDelay: this.firstPaint === null ? null : round(this.firstPaint - this.start),
++      capped: this.capped,
++      incomplete: !!incomplete || end === null,
++      url: location.href,
++      timestamp: Date.now()
++    };
++    for (var k in this.info) report[k] = this.info[k];
++
++    if (this.kind === 'interaction' && supportsEventTiming && !incomplete) {
++      // Event Timing entries are delivered shortly after the paint; give the
++      // observer a moment to attach the browser's breakdown before emitting.
++      var self = this;
++      setTimeout(function () { attachEventTiming(self, report); emit(report); }, 100);
++    } else {
++      if (this.kind === 'interaction') attachEventTiming(this, report);
++      emit(report);
++    }
++  };
++
++  function begin(kind, name, start, info) {
++    var m = new Measurement(kind, name, start, info);
++    api.active.push(m);
++    startObserving();
++    return m;
++  }
++
++  function notifyActivity(sinceTime) {
++    for (var i = 0; i < api.active.length; i++) {
++      var m = api.active[i];
++      if (sinceTime === undefined || sinceTime >= m.start) m.activity();
++    }
++  }
++
++  function round(n) { return Math.round(n * 10) / 10; }
++
++  /* ------------------------------------------------------------------ */
++  /* Visual activity observers (only attached while measuring)           */
++  /* ------------------------------------------------------------------ */
++
++  var mutationObserver = typeof MutationObserver !== 'undefined'
++    ? new MutationObserver(function () { notifyActivity(); })
++    : null;
++  var observing = false;
++
++  function startObserving() {
++    if (observing || !mutationObserver) return;
++    observing = true;
++    mutationObserver.observe(document.documentElement, {
++      childList: true, subtree: true, attributes: true, characterData: true
++    });
++  }
++
++  function stopObserving() {
++    if (!observing) return;
++    observing = false;
++    mutationObserver.disconnect();
++  }
++
++  // Images/media finishing loading change what's painted.
++  document.addEventListener('load', function (e) {
++    if (api.active.length && e.target && e.target.tagName) notifyActivity();
++  }, true);
++
++  function animKey(e) {
++    return e.type.indexOf('transition') === 0
++      ? 't:' + e.propertyName
++      : 'a:' + e.animationName;
++  }
++  var animIds = new WeakMap();
++  var nextAnimId = 0;
++  function fullKey(e) {
++    var id = animIds.get(e.target);
++    if (id === undefined) { id = ++nextAnimId; animIds.set(e.target, id); }
++    return id + ':' + animKey(e);
++  }
++
++  function onAnimStart(e) {
++    if (e.type === 'animationstart') {
++      try {
++        if (getComputedStyle(e.target).animationIterationCount.indexOf('infinite') !== -1) return;
++      } catch (err) { /* ignore */ }
++    }
++    var t = now();
++    runningAnims.set(fullKey(e), t);
++    notifyActivity(t);
++  }
++
++  function onAnimEnd(e) {
++    var key = fullKey(e);
++    var started = runningAnims.get(key);
++    runningAnims.delete(key);
++    if (started !== undefined) notifyActivity(started);
++  }
++
++  document.addEventListener('transitionrun', onAnimStart, true);
++  document.addEventListener('animationstart', onAnimStart, true);
++  ['transitionend', 'transitioncancel', 'animationend', 'animationcancel'].forEach(function (type) {
++    document.addEventListener(type, onAnimEnd, true);
++  });
++
++  /* ------------------------------------------------------------------ */
++  /* Event Timing API (browser-reported click latency breakdown)         */
++  /* ------------------------------------------------------------------ */
++
++  var eventTimings = []; // recent click PerformanceEventTiming entries
++
++  if (supportsEventTiming) {
++    try {
++      new PerformanceObserver(function (list) {
++        list.getEntries().forEach(function (entry) {
++          if (entry.name !== 'click') return;
++          eventTimings.push(entry);
++          if (eventTimings.length > 20) eventTimings.shift();
++        });
++      }).observe({ type: 'event', durationThreshold: 16, buffered: true });
++    } catch (e) { supportsEventTiming = false; }
++  }
++
++  function attachEventTiming(m, report) {
++    for (var i = eventTimings.length - 1; i >= 0; i--) {
++      var e = eventTimings[i];
++      if (Math.abs(e.startTime - m.start) < 1) {
++        report.eventTiming = {
++          duration: e.duration,
++          inputDelay: round(e.processingStart - e.startTime),
++          processingTime: round(e.processingEnd - e.processingStart),
++          presentationDelay: round(Math.max(0, e.startTime + e.duration - e.processingEnd)),
++          interactionId: e.interactionId || null
++        };
++        // The browser's presentation time can be later than our estimate.
++        var browserEnd = e.startTime + e.duration;
++        if (report.end === null || browserEnd > report.end) {
++          report.end = round(browserEnd);
++          report.duration = round(browserEnd - m.start);
++          report.incomplete = false;
++        }
++        return;
++      }
++    }
++  }
++
++  /* ------------------------------------------------------------------ */
++  /* Click tracking                                                      */
++  /* ------------------------------------------------------------------ */
++
++  function describeTarget(el) {
++    var region = el.closest('[data-perf]');
++    if (!region) return null;
++    var area = region.getAttribute('data-perf');
++    var labelEl = el.closest('[data-perf-label]');
++    var link = el.closest('a, button');
++    var label = (labelEl && region.contains(labelEl) && labelEl.getAttribute('data-perf-label')) ||
++      (link && link.textContent.trim()) ||
++      region.getAttribute('data-perf-label') ||
++      area;
++    return {
++      area: area,
++      label: label,
++      href: link && link.getAttribute('href') || null,
++      element: link ? link.tagName.toLowerCase() : el.tagName.toLowerCase()
++    };
++  }
++
++  // Capture phase so we see the click before app handlers can stop it.
++  document.addEventListener('click', function (e) {
++    var target = e.target && e.target.nodeType === 1 ? e.target : e.target && e.target.parentElement;
++    if (!target) return;
++    var info = describeTarget(target);
++    if (!info) return;
++    var start = e.timeStamp > 0 && e.timeStamp <= now() ? e.timeStamp : now();
++    info.input = e.detail === 0 ? 'keyboard' : (e.pointerType || 'pointer');
++    begin('interaction', 'click:' + info.area + ':' + info.label, start, info);
++  }, true);
++
++  /* ------------------------------------------------------------------ */
++  /* Client-side view switch tracking                                    */
++  /* ------------------------------------------------------------------ */
++
++  var lastUrl = location.href;
++  var lastSwitch = { url: null, time: -Infinity };
++
++  function viewSwitch(trigger, start) {
++    var from = lastUrl;
++    var to = location.href;
++    lastUrl = to;
++    var t = now();
++    // popstate + hashchange (or pushState + currententrychange) can fire for
++    // the same change; count it once.
++    if (lastSwitch.url === to && t - lastSwitch.time < 50) return;
++    if (from === to && trigger !== 'push') return;
++    lastSwitch = { url: to, time: t };
++
++    var triggeredBy = null;
++    for (var i = api.active.length - 1; i >= 0; i--) {
++      if (api.active[i].kind === 'interaction') { triggeredBy = api.active[i].name; break; }
++    }
++    begin('view-switch', 'view:' + pathOf(to), start === undefined ? t : start, {
++      trigger: trigger,
++      from: from,
++      to: to,
++      triggeredBy: triggeredBy
++    });
++  }
++
++  function pathOf(url) {
++    try { var u = new URL(url); return u.pathname + u.search + u.hash; } catch (e) { return url; }
++  }
++
++  if (window.navigation && typeof window.navigation.addEventListener === 'function') {
++    // Navigation API covers pushState/replaceState, traversals and
++    // intercepted navigations in one event.
++    window.navigation.addEventListener('currententrychange', function (e) {
++      viewSwitch(e.navigationType || 'unknown');
++    });
++  } else {
++    ['pushState', 'replaceState'].forEach(function (method) {
++      var original = history[method];
++      if (typeof original !== 'function') return;
++      history[method] = function () {
++        var result = original.apply(this, arguments);
++        viewSwitch(method === 'pushState' ? 'push' : 'replace');
++        return result;
++      };
++    });
++    window.addEventListener('popstate', function (e) { viewSwitch('traverse', e.timeStamp || undefined); });
++    window.addEventListener('hashchange', function (e) { viewSwitch('hash', e.timeStamp || undefined); });
++  }
++
++  /* ------------------------------------------------------------------ */
++  /* Reporting                                                           */
++  /* ------------------------------------------------------------------ */
++
++  var outbox = [];
++
++  function emit(report) {
++    api.entries.push(report);
++    if (api.entries.length > BUFFER_SIZE) api.entries.shift();
++
++    if (report.end !== null && performance.measure) {
++      try {
++        performance.measure('dg:' + report.name, { start: report.start, end: report.end, detail: report });
++      } catch (e) { /* older browsers lack the options-object signature */ }
++    }
++
++    try {
++      window.dispatchEvent(new CustomEvent('dg:perf', { detail: report }));
++    } catch (e) { /* ignore */ }
++
++    if (DEBUG && window.console) {
++      console.log('[perf] %s %s ms', report.name, report.duration, report);
++    }
++
++    if (ENDPOINT) {
++      outbox.push(report);
++      if (outbox.length >= BATCH_SIZE) flushOutbox();
++    }
++  }
++
++  function flushOutbox() {
++    if (!ENDPOINT || !outbox.length) return;
++    var body = JSON.stringify({ page: location.pathname, metrics: outbox });
++    outbox = [];
++    try {
++      if (navigator.sendBeacon && navigator.sendBeacon(ENDPOINT, new Blob([body], { type: 'application/json' }))) return;
++    } catch (e) { /* fall through */ }
++    try {
++      fetch(ENDPOINT, { method: 'POST', body: body, keepalive: true, headers: { 'Content-Type': 'application/json' } });
++    } catch (e) { /* ignore */ }
++  }
++
++  // Clicks on links that navigate away (e.g. nav items) unload the page; emit
++  // whatever was measured so far, then send the batch.
++  function flushAll() {
++    api.active.slice().forEach(function (m) { m.finish(true); });
++    flushOutbox();
++  }
++  window.addEventListener('pagehide', flushAll);
++  document.addEventListener('visibilitychange', function () {
++    if (document.visibilityState === 'hidden') flushAll();
++  });
++})();

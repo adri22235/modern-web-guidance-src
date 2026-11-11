@@ -1,0 +1,505 @@
+diff --git a/index.html b/index.html
+index 66c9173..ed1e2b6 100644
+--- a/index.html
++++ b/index.html
+@@ -113,6 +113,8 @@
+       border-radius: 8px;
+       box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+       text-align: center;
++      position: relative;
++      scroll-margin: 1rem;
+     }
+ 
+     .card h3 {
+@@ -152,6 +154,130 @@
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    /* Reorderable cards */
++    .grid[data-reorder] {
++      --drop-marker-color: var(--accent);
++      --drop-line-size: 4px;
++      --drop-ring-size: 12px;
++      --lifted-scale: 1.02;
++      --lifted-opacity: 0.95;
++      --lifted-shadow: 0 12px 28px rgba(62, 39, 35, 0.25);
++      position: relative;
++    }
++
++    .grid[data-reorder] .card:has(> .drag-handle) {
++      padding-top: 44px;
++    }
++
++    .drag-handle {
++      position: absolute;
++      top: 8px;
++      inset-inline-end: 8px;
++      display: grid;
++      place-items: center;
++      width: 32px;
++      height: 32px;
++      border: 0;
++      border-radius: 6px;
++      background: transparent;
++      color: var(--primary);
++      opacity: 0.55;
++      cursor: grab;
++      touch-action: none;
++      -webkit-user-select: none;
++      user-select: none;
++      transition: opacity 0.2s, background-color 0.2s;
++    }
++
++    .drag-handle:is(:hover, :focus-visible) {
++      opacity: 1;
++      background: var(--secondary);
++      outline: none;
++    }
++
++    .drag-handle[aria-pressed="true"] {
++      opacity: 1;
++      background: var(--primary);
++      color: white;
++    }
++
++    .card:has(.drag-handle:focus-visible) {
++      outline: 3px solid var(--accent);
++      outline-offset: 2px;
++    }
++
++    .reorder-hint {
++      display: none;
++      position: absolute;
++      top: 14px;
++      inset-inline-start: 12px;
++      font-size: 0.75rem;
++      color: #6d4c41;
++    }
++
++    .card:has(.drag-handle:focus-visible) .reorder-hint {
++      display: block;
++    }
++
++    .card.is-lifted {
++      z-index: 2;
++      scale: var(--lifted-scale);
++      opacity: var(--lifted-opacity);
++      box-shadow: var(--lifted-shadow);
++    }
++
++    .card.is-dragging {
++      pointer-events: none;
++    }
++
++    :root.is-reordering,
++    :root.is-reordering * {
++      cursor: grabbing !important;
++    }
++
++    .grid[data-drop]::before,
++    .grid[data-drop]::after {
++      content: "";
++      position: fixed;
++      pointer-events: none;
++      z-index: 3;
++    }
++
++    .grid[data-drop]::after {
++      left: calc(var(--drop-x) - var(--drop-w) / 2);
++      top: var(--drop-y);
++      width: var(--drop-w);
++      height: var(--drop-h);
++      border-radius: var(--drop-w);
++      background: var(--drop-marker-color);
++    }
++
++    .grid[data-drop]::before {
++      left: calc(var(--drop-x) - var(--drop-ring-size) / 2);
++      top: calc(var(--drop-y) - var(--drop-ring-size) / 2);
++      width: var(--drop-ring-size);
++      height: var(--drop-ring-size);
++      box-sizing: border-box;
++      border: 3px solid var(--drop-marker-color);
++      border-radius: 50%;
++      background: var(--light);
++    }
++
++    @media (forced-colors: active) {
++      .grid[data-reorder] {
++        --drop-marker-color: Highlight;
++      }
++    }
++
++    .visually-hidden {
++      position: absolute;
++      width: 1px;
++      height: 1px;
++      overflow: hidden;
++      clip-path: inset(50%);
++      white-space: nowrap;
++    }
+   </style>
+ </head>
+ 
+@@ -177,23 +303,25 @@
+   <main class="container">
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+-      <div class="grid">
+-        <div class="card">
++      <p id="reorder-instructions" class="visually-hidden">Press Space to pick up a card, Left and Right arrows to move it within its row, Space to drop, or Escape to cancel.</p>
++      <div class="grid" data-reorder>
++        <div class="card" data-id="maple-oat-latte">
+           <h3>Maple Oat Latte</h3>
+           <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+           <a href="/menu/seasonal" class="btn">View Details</a>
+         </div>
+-        <div class="card">
++        <div class="card" data-id="dark-roast-espresso">
+           <h3>Dark Roast Espresso</h3>
+           <p>Bold, smokey, and perfect for a morning boost.</p>
+           <a href="/menu/espresso" class="btn">View Details</a>
+         </div>
+-        <div class="card">
++        <div class="card" data-id="cold-brew">
+           <h3>Cold Brew</h3>
+           <p>Steeped for 18 hours for maximum smoothness.</p>
+           <a href="/menu/cold-brew" class="btn">View Details</a>
+         </div>
+       </div>
++      <p id="reorder-status" class="visually-hidden" role="status" aria-live="polite"></p>
+     </section>
+   </main>
+ 
+@@ -207,6 +335,330 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script>
++    (() => {
++      const grid = document.querySelector('.grid[data-reorder]');
++      const status = document.getElementById('reorder-status');
++      if (!grid) return;
++
++      const STORAGE_KEY = 'daily-grind:seasonal-order';
++      const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
++      const supportsMoveBefore = 'moveBefore' in Element.prototype;
++      const HINT_IDLE = 'Space to reorder';
++      const HINT_GRABBED = 'Arrows to move · Space to drop · Esc to cancel';
++
++      const items = () => [...grid.querySelectorAll(':scope > .card')];
++      const nameOf = (item) => item.querySelector('h3').textContent.trim();
++      const isRTL = () => getComputedStyle(grid).direction === 'rtl';
++      // Cards in the same visual grid row share the same offsetTop.
++      const rowOf = (item) => items().filter((el) => el.offsetTop === item.offsetTop);
++
++      // ---- Persistence ----------------------------------------------------
++      try {
++        const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
++        const byId = new Map(items().map((el) => [el.dataset.id, el]));
++        saved.forEach((id) => byId.has(id) && grid.append(byId.get(id)));
++      } catch { /* ignore malformed or unavailable storage */ }
++
++      const saveOrder = () => {
++        try {
++          localStorage.setItem(STORAGE_KEY, JSON.stringify(items().map((el) => el.dataset.id)));
++        } catch { /* storage unavailable */ }
++      };
++
++      // ---- Handles --------------------------------------------------------
++      items().forEach((item) => {
++        const handle = document.createElement('button');
++        handle.type = 'button';
++        handle.className = 'drag-handle';
++        handle.setAttribute('aria-pressed', 'false');
++        handle.setAttribute('aria-label', `Reorder ${nameOf(item)}`);
++        handle.setAttribute('aria-describedby', 'reorder-instructions');
++        handle.innerHTML = '<svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true" fill="currentColor">' +
++          '<circle cx="6" cy="4" r="1.6"/><circle cx="12" cy="4" r="1.6"/>' +
++          '<circle cx="6" cy="9" r="1.6"/><circle cx="12" cy="9" r="1.6"/>' +
++          '<circle cx="6" cy="14" r="1.6"/><circle cx="12" cy="14" r="1.6"/></svg>';
++        const hint = document.createElement('span');
++        hint.className = 'reorder-hint';
++        hint.setAttribute('aria-hidden', 'true');
++        hint.textContent = HINT_IDLE;
++        item.prepend(handle, hint);
++      });
++
++      // ---- Announcements --------------------------------------------------
++      let announceTimer;
++      const announce = (message) => {
++        clearTimeout(announceTimer);
++        status.textContent = '';
++        announceTimer = setTimeout(() => { status.textContent = message; }, 500);
++      };
++      const positionText = (item) => {
++        const row = rowOf(item);
++        return `position ${row.indexOf(item) + 1} of ${row.length} in its row`;
++      };
++
++      // ---- Moving + animation ---------------------------------------------
++      const snapshot = () => new Map(items().map((el) => [el, el.getBoundingClientRect()]));
++
++      const flip = (el, from, onDone) => {
++        const to = el.getBoundingClientRect();
++        const dx = from.left - to.left;
++        const dy = from.top - to.top;
++        if (reducedMotion.matches || (!dx && !dy)) { onDone?.(); return; }
++        el.animate(
++          { translate: [`${dx}px ${dy}px`, '0 0'] },
++          { duration: 220, easing: 'cubic-bezier(0.2, 0, 0, 1)' }
++        ).finished.then(() => onDone?.(), () => onDone?.());
++      };
++
++      // Moves `item` before `ref` (null = end), keeping the same node so state is preserved.
++      const moveItem = (item, ref, focusTarget, { skipItemFlip = false } = {}) => {
++        items().forEach((el) => el.getAnimations().forEach((a) => a.finish()));
++        const before = snapshot();
++        if (supportsMoveBefore) {
++          grid.moveBefore(item, ref);
++        } else if (ref) {
++          ref.before(item);
++        } else {
++          grid.append(item);
++        }
++        item.scrollIntoView({ block: 'nearest', inline: 'nearest' });
++        if (focusTarget && document.activeElement !== focusTarget) {
++          focusTarget.focus({ preventScroll: true });
++        }
++        before.forEach((rect, el) => {
++          if (el === item && skipItemFlip) return;
++          flip(el, rect);
++        });
++        saveOrder();
++      };
++
++      // ---- Pointer dragging -----------------------------------------------
++      let drag = null;
++
++      const clearDropMarker = () => {
++        grid.removeAttribute('data-drop');
++        ['--drop-x', '--drop-y', '--drop-w', '--drop-h'].forEach((p) => grid.style.removeProperty(p));
++      };
++
++      const updateDropSpot = () => {
++        if (!drag) return;
++        const { item, row } = drag;
++        const others = row.filter((el) => el !== item);
++        if (!others.length) { drag.ref = item.nextElementSibling; clearDropMarker(); return; }
++
++        const rtl = isRTL();
++        const gridRect = grid.getBoundingClientRect();
++        const first = row[0];
++        const last = row[row.length - 1];
++        const rowStart = Math.min(first.offsetLeft, last.offsetLeft);
++        const rowEnd = Math.max(first.offsetLeft + first.offsetWidth, last.offsetLeft + last.offsetWidth);
++        const x = Math.min(rowEnd, Math.max(rowStart,
++          drag.lastX - gridRect.left - grid.clientLeft + grid.scrollLeft));
++
++        const hit = others.find((el) => {
++          const mid = el.offsetLeft + el.offsetWidth / 2;
++          return rtl ? mid < x : mid > x;
++        });
++        let ref = hit ?? last.nextElementSibling;
++        if (ref === item) ref = item.nextElementSibling;
++        drag.ref = ref;
++
++        if (ref === item.nextElementSibling) { clearDropMarker(); return; }
++
++        // Neighbours of the gap (in the row, ignoring the lifted item).
++        const next = hit ?? null;
++        const prev = next ? others[others.indexOf(next) - 1] ?? null : others[others.length - 1];
++        const gap = parseFloat(getComputedStyle(grid).columnGap) || 0;
++        const pr = prev?.getBoundingClientRect();
++        const nr = next?.getBoundingClientRect();
++        const ref0 = nr ?? pr;
++        // Inline-start / inline-end edges in viewport coordinates.
++        const startEdge = (r) => (rtl ? r.right : r.left);
++        const endEdge = (r) => (rtl ? r.left : r.right);
++        const dir = rtl ? -1 : 1;
++        let lineX;
++        if (pr && nr) lineX = (endEdge(pr) + startEdge(nr)) / 2;
++        else if (pr) lineX = endEdge(pr) + (dir * gap) / 2;
++        else lineX = startEdge(nr) - (dir * gap) / 2;
++
++        const lineSize = getComputedStyle(grid).getPropertyValue('--drop-line-size').trim() || '4px';
++        grid.style.setProperty('--drop-x', `${lineX}px`);
++        grid.style.setProperty('--drop-y', `${ref0.top}px`);
++        grid.style.setProperty('--drop-w', lineSize);
++        grid.style.setProperty('--drop-h', `${ref0.height}px`);
++        grid.setAttribute('data-drop', '');
++      };
++
++      const onScroll = () => updateDropSpot();
++
++      const endDrag = (commit) => {
++        if (!drag) return;
++        const { item, handle, ref, pointerId, token } = drag;
++        drag = null;
++        window.removeEventListener('scroll', onScroll);
++        clearDropMarker();
++        document.documentElement.classList.remove('is-reordering');
++        item.classList.remove('is-dragging');
++        if (handle.hasPointerCapture(pointerId)) handle.releasePointerCapture(pointerId);
++
++        const released = item.getBoundingClientRect();
++        item.style.translate = '';
++        const settle = () => {
++          if (item.dataset.dragToken === token) item.classList.remove('is-lifted');
++        };
++
++        if (commit && ref !== item.nextElementSibling && ref !== item) {
++          moveItem(item, ref, handle, { skipItemFlip: true });
++          flip(item, released, settle);
++          announce(`${nameOf(item)} moved to ${positionText(item)}.`);
++        } else {
++          item.scrollIntoView({ block: 'nearest', inline: 'nearest' });
++          flip(item, released, settle);
++          if (!commit) announce(`Reordering cancelled. ${nameOf(item)} returned to ${positionText(item)}.`);
++        }
++      };
++
++      grid.addEventListener('pointerdown', (event) => {
++        const handle = event.target.closest('.drag-handle');
++        if (!handle || drag || event.button !== 0 || !event.isPrimary) return;
++        if (keyboard) dropKeyboard();
++        const item = handle.closest('.card');
++        event.preventDefault();
++        item.getAnimations().forEach((a) => a.finish());
++        handle.setPointerCapture(event.pointerId);
++
++        const token = String(Math.random());
++        item.dataset.dragToken = token;
++        drag = {
++          item, handle, token,
++          pointerId: event.pointerId,
++          startX: event.clientX,
++          lastX: event.clientX,
++          row: rowOf(item),
++          ref: item.nextElementSibling,
++        };
++        item.classList.add('is-lifted', 'is-dragging');
++        document.documentElement.classList.add('is-reordering');
++        window.addEventListener('scroll', onScroll, { passive: true });
++      });
++
++      document.addEventListener('pointermove', (event) => {
++        if (!drag || event.pointerId !== drag.pointerId) return;
++        drag.lastX = event.clientX;
++        drag.item.style.translate = `${event.clientX - drag.startX}px 0`;
++        updateDropSpot();
++      });
++
++      document.addEventListener('pointerup', (event) => {
++        if (drag && event.pointerId === drag.pointerId) endDrag(true);
++      });
++
++      document.addEventListener('pointercancel', (event) => {
++        if (drag && event.pointerId === drag.pointerId) endDrag(false);
++      });
++
++      grid.addEventListener('lostpointercapture', (event) => {
++        if (drag && event.pointerId === drag.pointerId) endDrag(false);
++      });
++
++      document.addEventListener('keydown', (event) => {
++        if (drag && event.key === 'Escape') {
++          event.preventDefault();
++          endDrag(false);
++        }
++      });
++
++      // ---- Keyboard: grab – move – drop ------------------------------------
++      let keyboard = null;
++
++      const setGrabbed = (handle, grabbed) => {
++        const item = handle.closest('.card');
++        handle.setAttribute('aria-pressed', String(grabbed));
++        item.classList.toggle('is-lifted', grabbed);
++        item.querySelector('.reorder-hint').textContent = grabbed ? HINT_GRABBED : HINT_IDLE;
++      };
++
++      const dropKeyboard = () => {
++        if (!keyboard) return;
++        const { item, handle, originalNext } = keyboard;
++        keyboard = null;
++        setGrabbed(handle, false);
++        if (item.nextElementSibling !== originalNext) {
++          announce(`${nameOf(item)} dropped at ${positionText(item)}.`);
++        } else {
++          announce(`${nameOf(item)} dropped.`);
++        }
++      };
++
++      grid.addEventListener('keydown', (event) => {
++        const handle = event.target.closest('.drag-handle');
++        if (!handle || drag) return;
++        const item = handle.closest('.card');
++        const grabbed = keyboard?.handle === handle;
++
++        if (event.key === ' ' || event.key === 'Enter') {
++          event.preventDefault();
++          if (grabbed) {
++            dropKeyboard();
++          } else {
++            if (keyboard) dropKeyboard();
++            keyboard = { item, handle, originalNext: item.nextElementSibling, moving: false };
++            setGrabbed(handle, true);
++            announce(`${nameOf(item)} grabbed, ${positionText(item)}. ` +
++              'Use Left and Right arrows to move, Space to drop, Escape to cancel.');
++          }
++          return;
++        }
++
++        if (!grabbed) return;
++
++        if (event.key === 'Escape') {
++          event.preventDefault();
++          const { originalNext } = keyboard;
++          keyboard.moving = true;
++          if (item.nextElementSibling !== originalNext) moveItem(item, originalNext, handle);
++          keyboard = null;
++          setGrabbed(handle, false);
++          announce(`Reordering cancelled. ${nameOf(item)} returned to ${positionText(item)}.`);
++          return;
++        }
++
++        if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
++        event.preventDefault();
++        // Arrow keys follow visual direction; in RTL, Left means later in DOM order.
++        const later = (event.key === 'ArrowRight') !== isRTL();
++        const target = later ? item.nextElementSibling : item.previousElementSibling;
++        // Stay within the current visual row.
++        if (!target || !target.matches('.card') || target.offsetTop !== item.offsetTop) return;
++
++        keyboard.moving = true;
++        moveItem(item, later ? target.nextElementSibling : target, handle);
++        if (keyboard) keyboard.moving = false;
++        const direction = event.key === 'ArrowRight' ? 'right' : 'left';
++        announce(`${nameOf(item)} moved ${direction}, ${positionText(item)}.`);
++      });
++
++      // Space on a <button> activates on keyup in some browsers; swallow it.
++      grid.addEventListener('keyup', (event) => {
++        if (event.key === ' ' && event.target.closest('.drag-handle')) event.preventDefault();
++      });
++
++      grid.addEventListener('focusout', (event) => {
++        if (keyboard && event.target === keyboard.handle && !keyboard.moving) dropKeyboard();
++      });
++
++      // Reveal the whole card when keyboard focus lands on its handle.
++      grid.addEventListener('focusin', (event) => {
++        const handle = event.target.closest('.drag-handle');
++        if (!handle || !handle.matches(':focus-visible')) return;
++        const item = handle.closest('.card');
++        if (item.getAnimations().length) return;
++        item.scrollIntoView({ block: 'nearest', inline: 'nearest' });
++      });
++    })();
++  </script>
++
+ </body>
+ 
+ </html>

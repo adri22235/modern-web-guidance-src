@@ -1,0 +1,2051 @@
+diff --git a/ACCOUNT-INTEGRATION.md b/ACCOUNT-INTEGRATION.md
+new file mode 100644
+index 0000000..5c91f8a
+--- /dev/null
++++ b/ACCOUNT-INTEGRATION.md
+@@ -0,0 +1,39 @@
++# Passkey account UI
++
++This repository is a static site and contains no session service, credential database, or WebAuthn registration backend. The account screen therefore defaults to an explicitly labeled local preview. Preview changes persist in browser storage, and preview IDs are never sent to a browser authenticator. No actual passkey authentication or registration is simulated.
++
++The original homepage links to the new screen at `/account/` (`account/index.html`). To connect the screen, change `data-account-mode="preview"` to `data-account-mode="connected"` in that file and implement the same-origin API below. Connected mode never falls back to demo data on an authentication or service failure.
++
++## API contract
++
++- `GET /api/account/passkeys`: return the signed-in customer's complete credential snapshot.
++- `PUT /api/account/passkeys/:id`: accept JSON `{ "name": "My laptop" }`, persist the trimmed nickname (1–60 characters), then return the complete updated snapshot.
++- `DELETE /api/account/passkeys/:id`: delete the credential, then return the complete remaining snapshot, including an empty array when appropriate.
++
++Every successful response must have `Content-Type: application/json` and this shape:
++
++```json
++{
++  "rpId": "your-registration-rp.example",
++  "userId": "dXNlci0x",
++  "credentials": [
++    {
++      "id": "Y3JlZGVudGlhbC0x",
++      "name": "My laptop",
++      "aaguid": "08987058-cadc-4b81-b6e1-30de50dcbe96",
++      "registeredAt": 1789171200000,
++      "lastUsedAt": null
++    }
++  ]
++}
++```
++
++Use the RP ID originally used in registration, not the page's hostname. `userId` is the WebAuthn user handle, encoded as unpadded Base64URL; credential IDs use the same encoding. Dates are persisted epoch milliseconds, not preformatted strings. Never expose public keys, challenges, or other users' records here.
++
++The backend must authenticate every request using the existing customer session, derive ownership from that session, enforce ownership on each mutation, validate request names, apply same-origin/CSRF protections, and disable response caching. Use 401/403 for expired or unauthorized sessions, 404 for credentials the customer cannot access, and a non-2xx response for failed changes. Enforce any policy preventing deletion of the last available authentication method on the backend; the UI also warns before deleting the last passkey. Serialize mutations per customer or use transactional snapshots so the returned list is complete and current.
++
++After initial load and each successful deletion, connected mode feature-detects `PublicKeyCredential.signalAllAcceptedCredentials` and shares the complete accepted list with the browser. Unsupported browsers and passive synchronization failures do not undo successful server changes, and the UI explains manual cleanup. A passkey nickname is an account-local label; it must not invoke `signalCurrentUserDetails`, which is for account profile names, not credential labels.
++
++The AAGUID registry subset only supplies display hints and uses a generic fallback for unknown or zero AAGUIDs. It is never used for security decisions. Source: https://github.com/passkeydeveloper/passkey-authenticator-aaguids
++
++Run the focused, server-free checks with `node --test tests/*.test.mjs` and `node --check account.mjs`. No build step is needed for this static site.
+diff --git a/account.mjs b/account.mjs
+new file mode 100644
+index 0000000..490bf24
+--- /dev/null
++++ b/account.mjs
+@@ -0,0 +1,223 @@
++import {
++  createPasskeyApi,
++  providerFor,
++  syncAcceptedCredentials,
++  validateName,
++} from "./passkey-api.mjs";
++
++const $ = (id) => document.getElementById(id);
++const preview = document.body.dataset.accountMode === "preview";
++let storage;
++try {
++  storage = window.localStorage;
++} catch {
++  /* Memory-only preview if browser storage is disabled. */
++}
++const api = createPasskeyApi({ preview, storage });
++let snapshot;
++let selectedId;
++let busy = false;
++const dateFormatter = new Intl.DateTimeFormat(undefined, {
++  month: "short",
++  day: "numeric",
++  year: "numeric",
++});
++
++function element(tag, className, text) {
++  const node = document.createElement(tag);
++  if (className) node.className = className;
++  if (text !== undefined) node.textContent = text;
++  return node;
++}
++function icon(name) {
++  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
++  svg.setAttribute("aria-hidden", "true");
++  const use = document.createElementNS("http://www.w3.org/2000/svg", "use");
++  use.setAttribute("href", `#icon-${name}`);
++  svg.append(use);
++  return svg;
++}
++function dateNode(label, epoch) {
++  const span = element("span", "", label);
++  const time = element("time", "", dateFormatter.format(epoch));
++  time.dateTime = new Date(epoch).toISOString();
++  span.append(time);
++  return span;
++}
++function render() {
++  const rows = snapshot.credentials.map((key) => {
++    const provider = providerFor(key.aaguid);
++    const row = element("li", "passkey-row");
++    const providerIcon = element("span", `provider-icon ${provider.style}`);
++    providerIcon.append(icon(provider.icon));
++    const details = element("div", "key-details");
++    const title = element("div", "key-title");
++    title.append(element("h4", "", key.name || provider.name));
++    const dates = element("p", "key-dates");
++    dates.append(
++      dateNode("Added ", key.registeredAt),
++      element("span", "dot", "·"),
++    );
++    if (key.lastUsedAt != null)
++      dates.append(dateNode("Last used ", key.lastUsedAt));
++    else dates.append(element("span", "", "Not used yet"));
++    details.append(title, element("p", "provider-label", provider.name), dates);
++    const actions = element("div", "key-actions");
++    for (const action of ["rename", "delete"]) {
++      const label = action === "rename" ? "Rename" : "Delete";
++      const button = element("button", `${action}-button`);
++      button.type = "button";
++      button.dataset.action = action;
++      button.dataset.id = key.id;
++      button.setAttribute(
++        "aria-label",
++        `${label} ${key.name || provider.name}`,
++      );
++      button.append(
++        icon(action === "rename" ? "edit" : "trash"),
++        element("span", "", label),
++      );
++      actions.append(button);
++    }
++    row.append(providerIcon, details, actions);
++    return row;
++  });
++  $("passkey-list").replaceChildren(...rows);
++  $("passkey-list").setAttribute("aria-busy", "false");
++  $("load-state").hidden = true;
++  $("key-count").hidden = false;
++  $("key-count").textContent = snapshot.credentials.length;
++  $("empty-state").hidden = snapshot.credentials.length !== 0;
++}
++async function synchronize() {
++  const result = await syncAcceptedCredentials(
++    snapshot,
++    window.PublicKeyCredential,
++    preview,
++  );
++  $("sync-status").textContent = {
++    preview:
++      "Preview mode — your actual device and password manager are unchanged.",
++    synced:
++      "Your current passkey list has been shared with your browser’s password manager.",
++    unsupported:
++      "Your browser can’t sync passkey changes. Remove deleted keys from your password manager manually.",
++    failed:
++      "Your account is up to date. Password manager sync is unavailable; remove deleted keys there manually.",
++  }[result];
++}
++function notify(message) {
++  $("notice").textContent = message;
++  $("notice").hidden = false;
++}
++async function load() {
++  $("load-state").hidden = false;
++  $("load-state").textContent = "Loading your passkeys…";
++  $("passkey-list").setAttribute("aria-busy", "true");
++  try {
++    snapshot = await api.list();
++    render();
++    await synchronize();
++  } catch (error) {
++    $("load-state").textContent =
++      error.message || "We couldn’t load your passkeys. Please try again.";
++    const retry = element("button", "button secondary", "Try again");
++    retry.type = "button";
++    retry.addEventListener("click", load);
++    $("load-state").append(retry);
++    $("passkey-list").setAttribute("aria-busy", "false");
++  }
++}
++$("passkey-list").addEventListener("click", (event) => {
++  const button = event.target.closest("button[data-action]");
++  if (!button || busy) return;
++  const key = snapshot.credentials.find((key) => key.id === button.dataset.id);
++  if (!key) return;
++  selectedId = key.id;
++  $("notice").hidden = true;
++  if (button.dataset.action === "rename") {
++    $("passkey-name").value = key.name;
++    $("rename-error").textContent = "";
++    $("rename-dialog").showModal();
++    $("passkey-name").select();
++  } else {
++    $("delete-name").textContent = key.name || providerFor(key.aaguid).name;
++    $("last-key-warning").hidden = snapshot.credentials.length !== 1;
++    $("delete-error").textContent = "";
++    $("delete-dialog").showModal();
++  }
++});
++for (const dialog of document.querySelectorAll("dialog")) {
++  dialog
++    .querySelector("[data-close]")
++    .addEventListener("click", () => dialog.close());
++}
++function setBusy(form, value) {
++  busy = value;
++  for (const control of form.elements) control.disabled = value;
++  form.setAttribute("aria-busy", String(value));
++}
++$("rename-form").addEventListener("submit", async (event) => {
++  event.preventDefault();
++  if (busy) return;
++  const form = event.currentTarget;
++  const id = selectedId;
++  try {
++    const name = validateName($("passkey-name").value);
++    setBusy(form, true);
++    snapshot = await api.rename(id, name);
++    // Close before replacing the invoking button, so native focus restoration works.
++    $("rename-dialog").close();
++    render();
++    document
++      .querySelector(`button[data-action="rename"][data-id="${id}"]`)
++      ?.focus();
++    notify("Passkey name updated. A little easier to recognize.");
++  } catch (error) {
++    const message =
++      error.message || "We couldn’t rename this passkey. Please try again.";
++    $("rename-error").textContent = message;
++    if (!$("rename-dialog").open) notify(message);
++  } finally {
++    setBusy(form, false);
++  }
++});
++$("delete-form").addEventListener("submit", async (event) => {
++  event.preventDefault();
++  if (busy) return;
++  const form = event.currentTarget;
++  try {
++    setBusy(form, true);
++    // The response is an authoritative, complete remaining credential list.
++    snapshot = await api.remove(selectedId);
++    $("delete-dialog").close();
++    render();
++    const next = $("passkey-list").querySelector("button");
++    if (next) next.focus();
++    else {
++      $("passkeys-title").tabIndex = -1;
++      $("passkeys-title").focus();
++    }
++    notify(
++      preview
++        ? "Passkey removed from this preview account."
++        : "Passkey deleted. It can no longer be used to sign in.",
++    );
++    await synchronize();
++  } catch (error) {
++    const message =
++      error.message || "We couldn’t delete this passkey. Please try again.";
++    $("delete-error").textContent = message;
++    if (!$("delete-dialog").open) notify(message);
++  } finally {
++    setBusy(form, false);
++  }
++});
++if (preview) {
++  $("preview-note").hidden = false;
++  $("account-kind").textContent = "Preview account";
++  if (!storage)
++    $("preview-note").textContent =
++      "Preview account · Browser storage is unavailable; changes last until you reload. No real passkeys are affected.";
++}
++await load();
+diff --git a/account/index.html b/account/index.html
+new file mode 100644
+index 0000000..e0e324d
+--- /dev/null
++++ b/account/index.html
+@@ -0,0 +1,324 @@
++<!doctype html>
++<html lang="en">
++  <head>
++    <meta charset="UTF-8" />
++    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
++    <meta name="theme-color" content="#f8f6f1" />
++    <title>My Account · The Daily Grind</title>
++    <link rel="stylesheet" href="/styles.css" />
++    <script type="module" src="/account.mjs"></script>
++  </head>
++  <!-- Switch to connected mode when the authenticated API is available. -->
++  <body data-account-mode="preview">
++    <a class="skip-link" href="#main">Skip to content</a>
++    <header class="site-header">
++      <a class="brand" href="/" aria-label="The Daily Grind home"
++        ><span class="brand-mark" aria-hidden="true">dg<span>✳</span></span
++        ><span>THE DAILY GRIND<small>GOOD COFFEE. GOOD DAYS.</small></span></a
++      >
++      <nav aria-label="Main navigation">
++        <a href="/menu">Menu</a><a href="/locations">Locations</a
++        ><a href="/rewards">Rewards</a
++        ><a class="active" href="/account" aria-current="page">My Account</a>
++      </nav>
++      <a class="order-button" href="/order-online"
++        >Order online <span aria-hidden="true">↗</span></a
++      >
++    </header>
++    <main id="main" class="page">
++      <p class="breadcrumb">
++        <a href="/">Home</a><span aria-hidden="true">/</span> My Account
++      </p>
++      <div class="page-heading">
++        <div>
++          <p class="eyebrow">YOUR DAILY GRIND</p>
++          <h1>My Account<span>.</span></h1>
++          <p>A little housekeeping. Then, back to good coffee.</p>
++        </div>
++        <div class="member-label">
++          <span class="small-spark" aria-hidden="true">✳</span> Make yourself
++          at home.
++        </div>
++      </div>
++      <div class="account-layout">
++        <aside class="sidebar" aria-label="Account navigation">
++          <div class="account-label">
++            <span class="avatar" aria-hidden="true"
++              ><svg><use href="#icon-user" /></svg
++            ></span>
++            <div>
++              <strong>Your account</strong
++              ><small id="account-kind">Customer settings</small>
++            </div>
++          </div>
++          <nav class="account-nav" aria-label="Account sections">
++            <a href="/account/profile"
++              ><svg><use href="#icon-user" /></svg>Personal details</a
++            >
++            <a href="/account/orders"
++              ><svg><use href="#icon-bag" /></svg>Order history</a
++            >
++            <a href="/account/rewards"
++              ><svg><use href="#icon-gift" /></svg>My rewards</a
++            >
++            <a href="#passkeys" class="selected" aria-current="page"
++              ><svg><use href="#icon-key" /></svg>Passkeys<span
++                aria-hidden="true"
++                >↗</span
++              ></a
++            >
++          </nav>
++          <a class="logout" href="/logout"
++            ><svg><use href="#icon-logout" /></svg>Log out</a
++          >
++          <div class="sidebar-note">
++            <span aria-hidden="true">☕</span>
++            <p>Your next good day<br />starts with a great cup.</p>
++            <a href="/menu"
++              >Find your favorite <span aria-hidden="true">↗</span></a
++            >
++          </div>
++        </aside>
++        <section
++          id="passkeys"
++          class="account-content"
++          aria-labelledby="passkeys-title"
++        >
++          <div class="section-heading">
++            <span class="section-icon"
++              ><svg><use href="#icon-key" /></svg
++            ></span>
++            <div>
++              <p class="eyebrow">SIGN-IN & SECURITY</p>
++              <h2 id="passkeys-title">Your passkeys</h2>
++            </div>
++            <span class="secure-badge"
++              ><svg><use href="#icon-shield" /></svg> A safer way to sign
++              in</span
++            >
++          </div>
++          <p class="section-intro">
++            Less typing, more sipping. Manage the passkeys you use to sign in<br
++              class="desktop-break"
++            />
++            with your fingerprint, face, or device screen lock.
++          </p>
++          <div class="passkey-panel">
++            <noscript
++              ><p class="state-message">
++                Enable JavaScript to view and manage your passkeys.
++              </p></noscript
++            >
++            <div class="panel-heading">
++              <h3>
++                Registered passkeys
++                <span id="key-count" class="count" hidden>0</span>
++              </h3>
++              <span class="private-label"
++                ><svg><use href="#icon-lock" /></svg> Yours, and only
++                yours</span
++              >
++            </div>
++            <div id="load-state" class="state-message" role="status">
++              Loading your passkeys…
++            </div>
++            <ul
++              id="passkey-list"
++              class="passkey-list"
++              aria-label="Registered passkeys"
++              aria-busy="true"
++            ></ul>
++            <div id="empty-state" class="empty-state" hidden>
++              <span class="section-icon"
++                ><svg><use href="#icon-key" /></svg
++              ></span>
++              <h3>No passkeys yet</h3>
++              <p>
++                You don’t have any passkeys registered to this account.<br />You
++                can still use your other sign-in methods.
++              </p>
++            </div>
++            <div class="panel-footnote">
++              <svg><use href="#icon-info" /></svg>
++              <p>
++                Recognize every passkey? Keep the ones you use and remove the
++                rest.
++              </p>
++            </div>
++          </div>
++          <p id="sync-status" class="sync-status" role="status"></p>
++          <div
++            id="notice"
++            class="notice"
++            role="status"
++            aria-live="polite"
++            hidden
++          ></div>
++          <div class="explainer">
++            <div class="explainer-icon">
++              <svg><use href="#icon-shield" /></svg
++              ><span aria-hidden="true">✦</span>
++            </div>
++            <div>
++              <h3>A small key. A big upgrade.</h3>
++              <p>
++                Passkeys are a secure alternative to passwords. Your fingerprint
++                or face stays on your device, and your passkey can’t be used on
++                a fake website.
++              </p>
++              <details>
++                <summary>
++                  A little more about passkeys <span aria-hidden="true">+</span>
++                </summary>
++                <p>
++                  A passkey is saved in your device or password manager.
++                  Renaming it here changes its label in your Daily Grind
++                  account. Deleting it removes access to this account; supported
++                  browsers also notify your password manager. If your browser
++                  can’t sync the change, you can remove the saved passkey in
++                  your password manager.
++                </p>
++              </details>
++            </div>
++          </div>
++          <p class="help-line">
++            A little help with your account?
++            <a href="/contact"
++              >We’re here for you <span aria-hidden="true">↗</span></a
++            >
++          </p>
++          <p id="preview-note" class="preview-note" hidden>
++            Preview account · Changes are saved in this browser only. No real
++            passkeys are affected.
++          </p>
++        </section>
++      </div>
++    </main>
++    <footer>
++      <a class="footer-brand" href="/"
++        >THE DAILY GRIND<span>One cup. A brighter day.</span></a
++      >
++      <p>© 2026 The Daily Grind Coffee Co.</p>
++      <div>
++        <a href="/about">Our story</a><a href="/contact">Contact</a
++        ><a href="/privacy-policy">Privacy</a>
++      </div>
++    </footer>
++    <dialog
++      id="rename-dialog"
++      aria-labelledby="rename-title"
++      aria-describedby="rename-description"
++    >
++      <form id="rename-form">
++        <span class="section-icon"
++          ><svg><use href="#icon-key" /></svg
++        ></span>
++        <h2 id="rename-title">Rename passkey</h2>
++        <p id="rename-description">
++          Give this passkey a name that’s easy to recognize. This only changes
++          its label in your account.
++        </p>
++        <label for="passkey-name">Passkey name</label
++        ><input
++          id="passkey-name"
++          name="name"
++          maxlength="60"
++          required
++          autocomplete="off"
++          autofocus
++        />
++        <p class="field-hint">
++          Up to 60 characters. For example, “My work laptop”.
++        </p>
++        <p class="form-error" id="rename-error" role="alert"></p>
++        <div class="dialog-actions">
++          <button type="button" class="button secondary" data-close>
++            Cancel</button
++          ><button type="submit" class="button primary">Save name</button>
++        </div>
++      </form>
++    </dialog>
++    <dialog
++      id="delete-dialog"
++      aria-labelledby="delete-title"
++      aria-describedby="delete-description"
++    >
++      <form id="delete-form">
++        <span class="section-icon danger-icon"
++          ><svg><use href="#icon-trash" /></svg
++        ></span>
++        <h2 id="delete-title">Delete this passkey?</h2>
++        <p id="delete-description">
++          You’ll no longer be able to use <strong id="delete-name"></strong> to
++          sign in to your Daily Grind account.
++        </p>
++        <p id="last-key-warning" class="last-key-warning" hidden>
++          This is your last passkey. Make sure you have another way to sign in
++          before deleting it.
++        </p>
++        <p class="delete-note">
++          You can’t undo this. Your password manager will be updated if your
++          browser supports it.
++        </p>
++        <p class="form-error" id="delete-error" role="alert"></p>
++        <div class="dialog-actions">
++          <button type="button" class="button secondary" data-close autofocus>
++            Keep passkey</button
++          ><button type="submit" class="button danger">Delete passkey</button>
++        </div>
++      </form>
++    </dialog>
++    <svg
++      class="svg-library"
++      xmlns="http://www.w3.org/2000/svg"
++      aria-hidden="true"
++    >
++      <defs>
++        <symbol id="icon-key" viewBox="0 0 24 24">
++          <circle cx="8" cy="8" r="4.5" />
++          <path d="m11.3 11.3 9.2 9.2M16 16l3-3m-1 5 3-3" />
++        </symbol>
++        <symbol id="icon-shield" viewBox="0 0 24 24">
++          <path d="M12 3 4.5 6v6c0 4 7.5 9 7.5 9s7.5-5 7.5-9V6Z" />
++          <path d="m8.5 11.5 2.5 2.5 4.5-5" />
++        </symbol>
++        <symbol id="icon-user" viewBox="0 0 24 24">
++          <circle cx="12" cy="7.5" r="3.5" />
++          <path d="M5 21v-2a7 7 0 0 1 14 0v2" />
++        </symbol>
++        <symbol id="icon-bag" viewBox="0 0 24 24">
++          <path d="M5 7h14l1 14H4ZM8 9V6a4 4 0 0 1 8 0v3" />
++        </symbol>
++        <symbol id="icon-gift" viewBox="0 0 24 24">
++          <path d="M3 8h18v4H3Zm2 4v9h14v-9M12 8v13" />
++          <path d="M12 8s-8 0-6-4 6 4 6 4 8 0 6-4-6 4-6 4Z" />
++        </symbol>
++        <symbol id="icon-logout" viewBox="0 0 24 24">
++          <path d="M10 4H4v16h6m4-13 5 5-5 5m-6-5h11" />
++        </symbol>
++        <symbol id="icon-lock" viewBox="0 0 24 24">
++          <rect x="6" y="10" width="12" height="11" rx="2" />
++          <path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2" />
++        </symbol>
++        <symbol id="icon-info" viewBox="0 0 24 24">
++          <circle cx="12" cy="12" r="9" />
++          <path d="M12 11v6m0-10v1" />
++        </symbol>
++        <symbol id="icon-edit" viewBox="0 0 24 24">
++          <path d="m15 4 5 5M4 20l5-1L21 7l-5-5L4 14Z" />
++        </symbol>
++        <symbol id="icon-trash" viewBox="0 0 24 24">
++          <path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7" />
++        </symbol>
++        <symbol id="icon-laptop" viewBox="0 0 24 24">
++          <rect x="4" y="4" width="16" height="12" rx="1.5" />
++          <path d="m4 16-2 4h20l-2-4M9 20h6" />
++        </symbol>
++        <symbol id="icon-phone" viewBox="0 0 24 24">
++          <rect x="6" y="2" width="12" height="20" rx="3" />
++          <path d="M10 5h4m-3 14h2" />
++        </symbol>
++      </defs>
++    </svg>
++  </body>
++</html>
+diff --git a/index.html b/index.html
+index 66c9173..85cac06 100644
+--- a/index.html
++++ b/index.html
+@@ -163,7 +163,7 @@
+       <li><a href="/menu">Menu</a></li>
+       <li><a href="/locations">Locations</a></li>
+       <li><a href="/rewards">Rewards</a></li>
+-      <li><a href="/account">My Account</a></li>
++      <li><a href="/account/">My Account</a></li>
+       <li><a href="/logout" class="logout-link">Logout</a></li>
+     </ul>
+   </nav>
+diff --git a/passkey-api.mjs b/passkey-api.mjs
+new file mode 100644
+index 0000000..06ac00a
+--- /dev/null
++++ b/passkey-api.mjs
+@@ -0,0 +1,201 @@
++// AAGUID names sourced from passkeydeveloper/passkey-authenticator-aaguids.
++// Provider metadata is a display hint only; it never grants access.
++const providers = {
++  "ea9b8d66-4d01-1d21-3ce4-b6b48cb575d4": {
++    name: "Google Password Manager",
++    icon: "phone",
++    style: "google",
++  },
++  "bada5566-a7aa-401f-bd96-45619a55120d": {
++    name: "1Password",
++    icon: "key",
++    style: "password",
++  },
++  "08987058-cadc-4b81-b6e1-30de50dcbe96": {
++    name: "Windows Hello",
++    icon: "laptop",
++    style: "",
++  },
++  "9ddd1817-af5a-4672-a2b9-3e3dd95000a9": {
++    name: "Windows Hello",
++    icon: "laptop",
++    style: "",
++  },
++  "6028b017-b1d4-4c02-b4b3-afcdafc96bb2": {
++    name: "Windows Hello",
++    icon: "laptop",
++    style: "",
++  },
++};
++export function providerFor(aaguid) {
++  const id = typeof aaguid === "string" ? aaguid.toLowerCase() : "";
++  return (
++    (Object.hasOwn(providers, id) ? providers[id] : null) ?? {
++      name: "Unknown passkey provider",
++      icon: "key",
++      style: "",
++    }
++  );
++}
++export function isBase64Url(value) {
++  return (
++    typeof value === "string" &&
++    value.length > 0 &&
++    value.length % 4 !== 1 &&
++    /^[A-Za-z0-9_-]+$/.test(value)
++  );
++}
++export function validateName(value) {
++  const name = value.trim();
++  if (!name || name.length > 60)
++    throw new Error("Enter a passkey name between 1 and 60 characters.");
++  return name;
++}
++export function validateSnapshot(data) {
++  if (
++    !data ||
++    !Array.isArray(data.credentials) ||
++    typeof data.rpId !== "string" ||
++    !data.rpId ||
++    !isBase64Url(data.userId)
++  ) {
++    throw new Error("Your passkeys could not be loaded. Please try again.");
++  }
++  const ids = new Set();
++  for (const key of data.credentials) {
++    if (
++      !key ||
++      !isBase64Url(key.id) ||
++      ids.has(key.id) ||
++      typeof key.name !== "string" ||
++      !Number.isFinite(key.registeredAt) ||
++      !Number.isFinite(new Date(key.registeredAt).getTime()) ||
++      (key.lastUsedAt != null &&
++        (!Number.isFinite(key.lastUsedAt) ||
++          !Number.isFinite(new Date(key.lastUsedAt).getTime())))
++    ) {
++      throw new Error("Your passkey list was incomplete. Please try again.");
++    }
++    ids.add(key.id);
++  }
++  return data;
++}
++export async function syncAcceptedCredentials(
++  snapshot,
++  publicKeyCredential = globalThis.PublicKeyCredential,
++  preview = false,
++) {
++  if (preview) return "preview";
++  if (typeof publicKeyCredential?.signalAllAcceptedCredentials !== "function")
++    return "unsupported";
++  try {
++    validateSnapshot(snapshot);
++    await publicKeyCredential.signalAllAcceptedCredentials({
++      rpId: snapshot.rpId,
++      userId: snapshot.userId,
++      allAcceptedCredentialIds: snapshot.credentials.map((key) => key.id),
++    });
++    return "synced";
++  } catch (error) {
++    console.warn("Passkey provider synchronization was unavailable:", error);
++    return "failed";
++  }
++}
++const previewSeed = {
++  // Preview data is NEVER passed to the WebAuthn Signal API.
++  rpId: "dailygrind.example",
++  userId: "ZGFpbHktZ3JpbmQtcHJldmlldy11c2Vy",
++  credentials: [
++    {
++      id: "cHJldmlldy1sYXB0b3A",
++      name: "My personal laptop",
++      aaguid: "08987058-cadc-4b81-b6e1-30de50dcbe96",
++      registeredAt: Date.UTC(2026, 8, 12),
++      lastUsedAt: Date.UTC(2026, 10, 8),
++    },
++    {
++      id: "cHJldmlldy1waG9uZQ",
++      name: "My phone",
++      aaguid: "ea9b8d66-4d01-1d21-3ce4-b6b48cb575d4",
++      registeredAt: Date.UTC(2026, 8, 12),
++      lastUsedAt: Date.UTC(2026, 10, 6),
++    },
++    {
++      id: "cHJldmlldy1iYWNrdXA",
++      name: "My backup passkey",
++      aaguid: "bada5566-a7aa-401f-bd96-45619a55120d",
++      registeredAt: Date.UTC(2026, 9, 3),
++      lastUsedAt: null,
++    },
++  ],
++};
++export function createPasskeyApi({
++  preview = false,
++  storage,
++  fetcher = globalThis.fetch,
++} = {}) {
++  const storageKey = "daily-grind:preview-passkeys:v1";
++  let memory = structuredClone(previewSeed);
++  if (preview) {
++    try {
++      const saved = storage?.getItem(storageKey);
++      if (saved) memory = validateSnapshot(JSON.parse(saved));
++    } catch {
++      /* Stale or unavailable local storage must not break the preview. */
++    }
++  }
++  async function request(path = "", options = {}) {
++    const response = await fetcher(`/api/account/passkeys${path}`, {
++      ...options,
++      credentials: "same-origin",
++      cache: "no-store",
++      headers: {
++        Accept: "application/json",
++        ...(options.body ? { "Content-Type": "application/json" } : {}),
++      },
++    });
++    if (response.status === 401 || response.status === 403)
++      throw new Error(
++        "Your session has expired. Sign in again to manage your passkeys.",
++      );
++    if (response.status === 404)
++      throw new Error(
++        "This passkey is no longer available. Refresh the page to see your current passkeys.",
++      );
++    if (!response.ok)
++      throw new Error("We couldn’t save that change. Please try again.");
++    if (!response.headers.get("content-type")?.includes("application/json"))
++      throw new Error(
++        "The account service is unavailable. Please try again later.",
++      );
++    return validateSnapshot(await response.json());
++  }
++  async function mutate(id, name) {
++    if (!isBase64Url(id))
++      throw new Error("Invalid passkey. Refresh the page and try again.");
++    if (!preview)
++      return request(
++        `/${encodeURIComponent(id)}`,
++        name === undefined
++          ? { method: "DELETE" }
++          : { method: "PUT", body: JSON.stringify({ name }) },
++      );
++    const updated = structuredClone(memory);
++    const key = updated.credentials.find((key) => key.id === id);
++    if (!key)
++      throw new Error("This passkey is no longer available. Refresh the page.");
++    if (name === undefined)
++      updated.credentials = updated.credentials.filter((key) => key.id !== id);
++    else key.name = name;
++    // Save before changing the UI: storage failures must not look like success.
++    if (storage) storage.setItem(storageKey, JSON.stringify(updated));
++    memory = updated;
++    return structuredClone(memory);
++  }
++  return {
++    list: () =>
++      preview ? Promise.resolve(structuredClone(memory)) : request(),
++    rename: (id, name) => mutate(id, validateName(name)),
++    remove: (id) => mutate(id),
++  };
++}
+diff --git a/styles.css b/styles.css
+new file mode 100644
+index 0000000..317f5cf
+--- /dev/null
++++ b/styles.css
+@@ -0,0 +1,1046 @@
++@import url("https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;450;500;550;600;650;700&family=Manrope:wght@400;500;600;650;700;750;800&display=swap");
++
++:root {
++  color-scheme: light;
++  --paper: #f8f6f1;
++  --ink: #292d26;
++  --muted: #72756c;
++  --line: #e3e4da;
++  --orange: #b74928;
++  --green: #4f6244;
++  font-family: "DM Sans", sans-serif;
++  color: var(--ink);
++  background: var(--paper);
++  font-synthesis: none;
++}
++* {
++  box-sizing: border-box;
++}
++body {
++  margin: 0;
++}
++a {
++  color: inherit;
++  text-decoration: none;
++}
++button,
++input {
++  font: inherit;
++}
++button {
++  cursor: pointer;
++}
++button:disabled {
++  cursor: wait;
++  opacity: 0.6;
++}
++svg {
++  width: 22px;
++  height: 22px;
++  fill: none;
++  stroke: currentColor;
++  stroke-width: 1.6;
++  stroke-linecap: round;
++  stroke-linejoin: round;
++  flex-shrink: 0;
++}
++[hidden] {
++  display: none !important;
++}
++:focus-visible {
++  outline: 3px solid var(--orange);
++  outline-offset: 4px;
++}
++a:hover {
++  text-decoration: underline;
++  text-underline-offset: 4px;
++}
++.skip-link {
++  position: fixed;
++  top: 8px;
++  left: 8px;
++  transform: translateY(-160%);
++  background: white;
++  padding: 12px;
++  z-index: 5;
++}
++.skip-link:focus {
++  transform: none;
++}
++.site-header {
++  min-height: 104px;
++  border-bottom: 1px solid var(--line);
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: 28px;
++  padding: 20px max(5.3%, calc((100vw - 1340px) / 2));
++}
++.brand {
++  display: flex;
++  gap: 13px;
++  align-items: center;
++  font-family: Manrope, sans-serif;
++  font-size: 15px;
++  letter-spacing: 1.8px;
++  font-weight: 800;
++  white-space: nowrap;
++}
++.brand:hover {
++  text-decoration: none;
++}
++.brand small {
++  display: block;
++  font-family: "DM Sans", sans-serif;
++  font-size: 8px;
++  letter-spacing: 2.1px;
++  font-weight: 500;
++  margin-top: 6px;
++}
++.brand-mark {
++  font-family: Georgia, serif;
++  font-size: 43px;
++  letter-spacing: -6px;
++  line-height: 1;
++  position: relative;
++  padding-right: 10px;
++}
++.brand-mark > span {
++  position: absolute;
++  font-family: serif;
++  font-size: 24px;
++  letter-spacing: 0;
++  right: -1px;
++  top: -10px;
++  color: var(--orange);
++}
++.site-header nav {
++  display: flex;
++  gap: 32px;
++  font-size: 13px;
++  font-weight: 500;
++  align-self: stretch;
++  align-items: center;
++}
++.site-header nav a {
++  position: relative;
++}
++.site-header nav .active {
++  color: var(--orange);
++}
++.site-header nav .active:after {
++  content: "";
++  position: absolute;
++  bottom: -14px;
++  left: 0;
++  right: 0;
++  height: 2px;
++  background: var(--orange);
++}
++.order-button {
++  background: var(--ink);
++  color: white;
++  border-radius: 6px;
++  padding: 13px 18px;
++  font-size: 12px;
++  font-weight: 500;
++  display: flex;
++  gap: 24px;
++  align-items: center;
++}
++.order-button:hover {
++  background: #41483b;
++  text-decoration: none;
++}
++.order-button span {
++  font-size: 18px;
++}
++.page {
++  max-width: 1240px;
++  padding: 0 32px;
++  margin: 0 auto;
++}
++.breadcrumb {
++  font-size: 11px;
++  color: var(--muted);
++  display: flex;
++  gap: 13px;
++  margin: 28px 0 34px;
++}
++.breadcrumb a {
++  color: #555a50;
++}
++.breadcrumb span {
++  color: #b2b5ab;
++}
++.page-heading {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  padding-bottom: 34px;
++  border-bottom: 1px solid var(--line);
++}
++.eyebrow {
++  font-size: 10px;
++  font-weight: 650;
++  letter-spacing: 1.9px;
++  color: var(--orange);
++  margin: 0 0 10px;
++}
++h1,
++h2,
++h3,
++p {
++  margin-top: 0;
++}
++h1,
++h2,
++h3 {
++  font-family: Manrope, sans-serif;
++}
++h1 {
++  font-size: 44px;
++  line-height: 1.2;
++  font-weight: 650;
++  letter-spacing: -1.8px;
++  margin: 0 0 13px;
++}
++h1 span {
++  color: var(--orange);
++}
++.page-heading p:last-child {
++  font-size: 13px;
++  color: var(--muted);
++  margin-bottom: 0;
++}
++.member-label {
++  display: flex;
++  gap: 12px;
++  align-items: center;
++  font-size: 12px;
++  color: var(--green);
++  padding-top: 20px;
++}
++.small-spark {
++  font-size: 33px;
++  color: var(--green);
++}
++.account-layout {
++  display: grid;
++  grid-template-columns: 225px minmax(0, 1fr);
++  gap: 54px;
++  margin: 37px 0 66px;
++}
++.sidebar {
++  border-right: 1px solid var(--line);
++  padding-right: 27px;
++}
++.account-label {
++  display: flex;
++  align-items: center;
++  gap: 11px;
++  margin-bottom: 27px;
++  padding: 0 8px;
++}
++.avatar {
++  width: 38px;
++  height: 38px;
++  border-radius: 50%;
++  background: #e8e9df;
++  display: grid;
++  place-items: center;
++  color: #5c6752;
++}
++.avatar svg {
++  width: 18px;
++  height: 18px;
++}
++.account-label strong {
++  display: block;
++  font-size: 12px;
++  font-weight: 600;
++}
++.account-label small {
++  display: block;
++  font-size: 10px;
++  color: var(--muted);
++  margin-top: 4px;
++}
++.account-nav {
++  display: grid;
++  gap: 8px;
++}
++.account-nav a,
++.logout {
++  display: flex;
++  align-items: center;
++  gap: 12px;
++  font-size: 12px;
++  color: #676b61;
++  padding: 13px 12px;
++  border-radius: 5px;
++}
++.account-nav svg,
++.logout svg {
++  width: 17px;
++  height: 17px;
++}
++.account-nav a:hover {
++  background: #efeee7;
++  text-decoration: none;
++}
++.account-nav a.selected {
++  background: #ebece2;
++  color: #34452e;
++  font-weight: 600;
++}
++.account-nav a.selected span {
++  margin-left: auto;
++  font-size: 17px;
++}
++.logout {
++  border-top: 1px solid var(--line);
++  border-radius: 0;
++  margin-top: 24px;
++  padding-top: 23px;
++}
++.sidebar-note {
++  margin-top: 62px;
++  padding: 21px 12px;
++  background: #f0eee6;
++  border-radius: 6px;
++}
++.sidebar-note > span {
++  font-size: 25px;
++  filter: grayscale(1);
++}
++.sidebar-note p {
++  font-family: Manrope, sans-serif;
++  font-size: 12px;
++  line-height: 1.8;
++  margin: 9px 0 13px;
++}
++.sidebar-note a {
++  font-size: 10px;
++  color: var(--orange);
++  font-weight: 600;
++}
++.sidebar-note a span {
++  margin-left: 7px;
++}
++.account-content {
++  padding-top: 3px;
++  min-width: 0;
++}
++.section-heading {
++  display: flex;
++  align-items: center;
++  gap: 14px;
++}
++.section-icon {
++  display: grid;
++  place-items: center;
++  background: #edeedf;
++  color: var(--green);
++  width: 45px;
++  height: 45px;
++  border-radius: 11px;
++  flex-shrink: 0;
++}
++.section-icon svg {
++  width: 24px;
++  height: 24px;
++}
++.section-heading .eyebrow {
++  font-size: 9px;
++  letter-spacing: 1.5px;
++  margin: 0 0 7px;
++}
++.section-heading h2 {
++  font-size: 27px;
++  letter-spacing: -1px;
++  font-weight: 650;
++  line-height: 1.1;
++  margin: 0;
++}
++.secure-badge {
++  margin-left: auto;
++  font-size: 9px;
++  display: flex;
++  align-items: center;
++  gap: 5px;
++  color: var(--green);
++  padding: 7px 9px;
++  border: 1px solid #dce2d3;
++  background: #f0f3e9;
++  border-radius: 20px;
++  white-space: nowrap;
++}
++.secure-badge svg {
++  width: 13px;
++  height: 13px;
++}
++.section-intro {
++  font-size: 12px;
++  line-height: 1.9;
++  color: var(--muted);
++  margin: 21px 0 25px;
++}
++.passkey-panel {
++  background: #fffefa;
++  border: 1px solid var(--line);
++  border-radius: 10px;
++  overflow: hidden;
++}
++.panel-heading {
++  padding: 20px 23px;
++  display: flex;
++  justify-content: space-between;
++  align-items: center;
++  border-bottom: 1px solid var(--line);
++  gap: 10px;
++}
++.panel-heading h3 {
++  font-family: "DM Sans", sans-serif;
++  font-size: 12px;
++  font-weight: 600;
++  margin: 0;
++  display: flex;
++  align-items: center;
++  gap: 8px;
++}
++.count {
++  display: inline-grid;
++  place-items: center;
++  min-width: 20px;
++  height: 20px;
++  border: 1px solid #dedfd7;
++  border-radius: 5px;
++  font-size: 10px;
++  color: #676d60;
++  background: #f5f5ed;
++}
++.private-label {
++  font-size: 9px;
++  color: #808476;
++  display: flex;
++  align-items: center;
++  gap: 5px;
++}
++.private-label svg {
++  width: 12px;
++  height: 12px;
++}
++.passkey-list {
++  padding: 0;
++  margin: 0;
++  list-style: none;
++}
++.passkey-row {
++  padding: 24px 23px;
++  display: flex;
++  align-items: center;
++  gap: 15px;
++  border-bottom: 1px solid #eaeae2;
++}
++.passkey-row:last-child {
++  border-bottom: 0;
++}
++.provider-icon {
++  width: 44px;
++  height: 44px;
++  background: #f1f1ec;
++  border: 1px solid #e7e8df;
++  border-radius: 10px;
++  display: grid;
++  place-items: center;
++  flex-shrink: 0;
++  color: #606957;
++}
++.provider-icon svg {
++  width: 23px;
++  height: 23px;
++}
++.provider-icon.google {
++  color: #447b60;
++  background: #edf1e9;
++}
++.provider-icon.password {
++  background: #eaf0f5;
++  color: #4c6c91;
++}
++.key-details {
++  flex: 1;
++  min-width: 0;
++}
++.key-title {
++  display: flex;
++  align-items: center;
++  gap: 9px;
++  flex-wrap: wrap;
++}
++.key-title h4 {
++  font-size: 12px;
++  font-weight: 600;
++  margin: 0;
++  overflow-wrap: anywhere;
++}
++.provider-label {
++  font-size: 10px;
++  color: #767b6e;
++  margin: 5px 0 0;
++}
++.key-dates {
++  display: flex;
++  gap: 7px;
++  flex-wrap: wrap;
++  font-size: 10px;
++  color: #757a6e;
++  margin: 8px 0 0;
++  line-height: 1.6;
++}
++.key-dates .dot {
++  color: #b7baae;
++}
++.key-actions {
++  display: flex;
++  align-items: center;
++  gap: 5px;
++}
++.key-actions button {
++  border: 0;
++  background: transparent;
++  color: #626b57;
++  display: flex;
++  gap: 5px;
++  align-items: center;
++  padding: 10px 7px;
++  border-radius: 5px;
++  font-size: 10px;
++  min-height: 36px;
++}
++.key-actions button:hover {
++  background: #f0f0e9;
++  color: #34452e;
++}
++.key-actions button.delete-button {
++  color: #aa5e4c;
++}
++.key-actions button.delete-button:hover {
++  background: #fbede7;
++}
++.key-actions svg {
++  width: 13px;
++  height: 13px;
++}
++.panel-footnote {
++  background: #f4f5ee;
++  padding: 13px 23px;
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  border-top: 1px solid var(--line);
++}
++.panel-footnote svg {
++  width: 13px;
++  height: 13px;
++  color: #7d866f;
++}
++.panel-footnote p {
++  font-size: 10px;
++  color: #727a66;
++  margin: 0;
++  line-height: 1.7;
++}
++.sync-status {
++  min-height: 15px;
++  font-size: 10px;
++  color: #747c69;
++  margin: 12px 1px 26px;
++  line-height: 1.6;
++}
++.sync-status:before {
++  content: "◌";
++  padding-right: 6px;
++}
++.sync-status:empty:before {
++  content: none;
++}
++.explainer {
++  background: #eeeee3;
++  border: 1px solid #e4e6d7;
++  border-radius: 9px;
++  display: flex;
++  gap: 23px;
++  padding: 25px 27px;
++}
++.explainer-icon {
++  position: relative;
++  width: 48px;
++  flex-shrink: 0;
++  align-self: center;
++  color: #65704c;
++}
++.explainer-icon > svg {
++  width: 42px;
++  height: 42px;
++  stroke-width: 1.2;
++}
++.explainer-icon > span {
++  position: absolute;
++  right: -2px;
++  top: -8px;
++  font-size: 19px;
++  color: #9a8a4a;
++}
++.explainer h3 {
++  font-size: 14px;
++  font-weight: 650;
++  margin: 0 0 9px;
++}
++.explainer p {
++  font-size: 11px;
++  color: #727765;
++  line-height: 1.9;
++  margin: 0;
++  max-width: 520px;
++}
++.explainer details {
++  margin-top: 14px;
++}
++.explainer summary {
++  font-size: 10px;
++  font-weight: 600;
++  cursor: pointer;
++  color: #4e5b3e;
++  list-style: none;
++  display: flex;
++  align-items: center;
++  gap: 12px;
++  width: fit-content;
++}
++.explainer summary::-webkit-details-marker {
++  display: none;
++}
++.explainer summary span {
++  font-size: 15px;
++}
++.explainer details[open] summary span {
++  transform: rotate(45deg);
++}
++.explainer details p {
++  margin-top: 12px;
++}
++.help-line {
++  text-align: center;
++  font-size: 10px;
++  color: #797e70;
++  margin: 24px 0 0;
++}
++.help-line a {
++  color: #576049;
++  text-decoration: underline;
++  text-underline-offset: 3px;
++  margin-left: 4px;
++}
++.help-line a span {
++  margin-left: 3px;
++}
++.preview-note {
++  text-align: center;
++  font-size: 10px;
++  line-height: 1.7;
++  color: #7c8173;
++  margin: 19px 0 0;
++}
++.notice {
++  padding: 12px 15px;
++  background: #edf3e6;
++  border: 1px solid #dce6d2;
++  color: #465739;
++  border-radius: 6px;
++  font-size: 12px;
++  margin: -10px 0 20px;
++}
++.state-message,
++.empty-state {
++  padding: 40px 24px;
++  text-align: center;
++  font-size: 12px;
++  color: var(--muted);
++}
++.state-message button {
++  margin-left: 12px;
++}
++.empty-state .section-icon {
++  margin: 0 auto 15px;
++}
++.empty-state h3 {
++  font-size: 16px;
++}
++.empty-state p {
++  font-size: 12px;
++  line-height: 1.8;
++  margin: 0;
++}
++footer {
++  border-top: 1px solid var(--line);
++  padding: 30px max(5.3%, calc((100vw - 1340px) / 2));
++  display: flex;
++  justify-content: space-between;
++  align-items: center;
++  gap: 24px;
++}
++.footer-brand {
++  font-size: 11px;
++  font-weight: 700;
++  letter-spacing: 1.4px;
++}
++.footer-brand span {
++  display: block;
++  font-size: 9px;
++  font-weight: 400;
++  letter-spacing: 0;
++  color: #7d8274;
++  margin-top: 6px;
++}
++footer p {
++  font-size: 9px;
++  color: #7d8274;
++  margin: 0;
++}
++footer > div {
++  display: flex;
++  gap: 22px;
++  font-size: 10px;
++  color: #777c6e;
++}
++.svg-library {
++  position: absolute;
++  width: 0;
++  height: 0;
++  overflow: hidden;
++}
++dialog {
++  border: 1px solid var(--line);
++  background: var(--paper);
++  color: var(--ink);
++  padding: 30px;
++  border-radius: 12px;
++  width: min(460px, calc(100% - 32px));
++  max-height: calc(100dvh - 40px);
++  box-shadow: 0 24px 90px #252b2630;
++}
++dialog:modal {
++  overscroll-behavior: contain;
++}
++dialog::backdrop {
++  background: #20251bc0;
++  overflow: hidden;
++  overscroll-behavior: contain;
++}
++dialog h2 {
++  font-size: 23px;
++  margin: 20px 0 12px;
++  letter-spacing: -0.6px;
++}
++dialog p {
++  font-size: 13px;
++  line-height: 1.8;
++  color: #707567;
++}
++dialog label {
++  font-size: 12px;
++  font-weight: 600;
++  display: block;
++  margin: 22px 0 8px;
++}
++dialog input {
++  width: 100%;
++  padding: 12px;
++  border: 1px solid #c8cebc;
++  border-radius: 5px;
++  background: #fffefa;
++  color: var(--ink);
++}
++dialog .field-hint {
++  font-size: 10px;
++  margin: 7px 0 0;
++}
++.dialog-actions {
++  display: flex;
++  justify-content: flex-end;
++  gap: 10px;
++  margin-top: 20px;
++}
++.button {
++  padding: 11px 16px;
++  border: 1px solid transparent;
++  border-radius: 5px;
++  font-size: 12px;
++  font-weight: 600;
++}
++.secondary {
++  background: transparent;
++  border-color: #cdd2c2;
++  color: #535e46;
++}
++.primary {
++  background: var(--green);
++  color: white;
++}
++.danger {
++  background: #ac452d;
++  color: white;
++}
++.danger-icon {
++  background: #f3e5de;
++  color: #ac452d;
++}
++.form-error {
++  color: #a33d25;
++  min-height: 20px;
++  font-size: 12px;
++  margin: 12px 0 0;
++}
++.last-key-warning {
++  padding: 12px;
++  background: #f3e6ce;
++  border-radius: 5px;
++  color: #7b5622;
++}
++.delete-note {
++  font-size: 11px;
++}
++#delete-name {
++  overflow-wrap: anywhere;
++}
++@media (min-width: 1450px) {
++  .page {
++    max-width: 1270px;
++  }
++  .account-layout {
++    gap: 64px;
++    grid-template-columns: 235px minmax(0, 1fr);
++  }
++}
++@media (max-width: 1000px) {
++  .site-header {
++    padding: 20px 28px;
++    gap: 20px;
++  }
++  .site-header nav {
++    gap: 20px;
++  }
++  .brand {
++    font-size: 12px;
++  }
++  .brand small {
++    font-size: 7px;
++  }
++  .account-layout {
++    grid-template-columns: 190px minmax(0, 1fr);
++    gap: 28px;
++  }
++  .sidebar {
++    padding-right: 20px;
++  }
++  .secure-badge {
++    display: none;
++  }
++  .key-actions button span {
++    display: none;
++  }
++  .key-actions button {
++    min-width: 36px;
++    justify-content: center;
++  }
++  .key-actions svg {
++    width: 16px;
++    height: 16px;
++  }
++  .private-label {
++    display: none;
++  }
++  .key-dates {
++    gap: 4px;
++  }
++  .explainer {
++    padding: 22px;
++    gap: 16px;
++  }
++}
++@media (max-width: 700px) {
++  .site-header {
++    padding: 20px;
++    flex-wrap: wrap;
++    gap: 22px;
++  }
++  .brand {
++    font-size: 12px;
++  }
++  .brand small {
++    font-size: 7px;
++  }
++  .brand-mark {
++    font-size: 36px;
++  }
++  .order-button {
++    margin-left: auto;
++    padding: 9px 12px;
++    font-size: 10px;
++    gap: 12px;
++  }
++  .site-header nav {
++    order: 3;
++    width: 100%;
++    justify-content: space-between;
++    font-size: 12px;
++    gap: 16px;
++  }
++  .site-header nav .active:after {
++    bottom: -10px;
++  }
++  .page {
++    padding: 0 20px;
++  }
++  .breadcrumb {
++    margin: 23px 0 28px;
++  }
++  .page-heading {
++    padding-bottom: 25px;
++  }
++  h1 {
++    font-size: 37px;
++  }
++  .page-heading p:last-child {
++    font-size: 12px;
++    line-height: 1.8;
++  }
++  .member-label {
++    display: none;
++  }
++  .account-layout {
++    display: block;
++    margin: 22px 0 40px;
++  }
++  .sidebar {
++    padding: 0;
++    border: 0;
++  }
++  .account-label,
++  .sidebar-note,
++  .logout {
++    display: none;
++  }
++  .account-nav {
++    display: flex;
++    gap: 8px;
++    overflow: auto;
++    padding-bottom: 18px;
++    border-bottom: 1px solid var(--line);
++    margin-bottom: 28px;
++  }
++  .account-nav a {
++    white-space: nowrap;
++    font-size: 11px;
++    padding: 10px;
++  }
++  .account-nav svg,
++  .account-nav .selected span {
++    display: none;
++  }
++  .account-content {
++    padding: 0;
++  }
++  .section-heading h2 {
++    font-size: 25px;
++  }
++  .section-intro {
++    font-size: 12px;
++  }
++  .desktop-break {
++    display: none;
++  }
++  .panel-heading {
++    padding: 18px;
++  }
++  .passkey-row {
++    padding: 21px 15px;
++    gap: 11px;
++    flex-wrap: wrap;
++  }
++  .provider-icon {
++    width: 37px;
++    height: 40px;
++  }
++  .key-actions {
++    margin-left: auto;
++  }
++  .key-details {
++    flex-basis: calc(100% - 60px);
++  }
++  .key-actions {
++    margin-top: -8px;
++  }
++  .key-actions button span {
++    display: inline;
++  }
++  .key-actions button {
++    font-size: 10px;
++    padding: 5px 10px;
++    min-height: 32px;
++  }
++  .key-actions svg {
++    width: 12px;
++    height: 12px;
++  }
++  .key-dates {
++    font-size: 10px;
++  }
++  .panel-footnote {
++    padding: 12px 16px;
++    align-items: flex-start;
++  }
++  .panel-footnote svg {
++    margin-top: 2px;
++  }
++  .explainer {
++    padding: 20px;
++    gap: 13px;
++  }
++  .explainer-icon {
++    width: 32px;
++  }
++  .explainer-icon > svg {
++    width: 30px;
++    height: 30px;
++  }
++  .explainer-icon > span {
++    font-size: 15px;
++  }
++  .explainer h3 {
++    font-size: 13px;
++  }
++  .explainer p {
++    font-size: 11px;
++  }
++  .help-line {
++    line-height: 2;
++  }
++  footer {
++    padding: 25px 20px;
++    flex-wrap: wrap;
++    gap: 20px;
++  }
++  footer > div {
++    gap: 18px;
++  }
++  footer p {
++    order: 3;
++    width: 100%;
++  }
++  .dialog-actions .button {
++    flex: 1;
++  }
++}
+diff --git a/tests/passkey-api.test.mjs b/tests/passkey-api.test.mjs
+new file mode 100644
+index 0000000..902b3ae
+--- /dev/null
++++ b/tests/passkey-api.test.mjs
+@@ -0,0 +1,169 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  createPasskeyApi,
++  isBase64Url,
++  syncAcceptedCredentials,
++  validateSnapshot,
++} from "../passkey-api.mjs";
++
++function memoryStorage() {
++  const values = new Map();
++  return {
++    getItem: (key) => values.get(key),
++    setItem: (key, value) => values.set(key, value),
++  };
++}
++
++test("preview names and deletion persist without reaching authentication APIs", async () => {
++  const storage = memoryStorage();
++  const api = createPasskeyApi({
++    preview: true,
++    storage,
++    fetcher: () => assert.fail("preview made a network request"),
++  });
++  const original = await api.list();
++  const id = original.credentials[0].id;
++  assert.equal(isBase64Url(original.userId), true);
++  assert.ok(original.credentials.every((key) => isBase64Url(key.id)));
++  await api.rename(id, "  Work laptop  ");
++  const reloaded = createPasskeyApi({ preview: true, storage });
++  assert.equal((await reloaded.list()).credentials[0].name, "Work laptop");
++  const remaining = await reloaded.remove(id);
++  assert.equal(remaining.credentials.length, original.credentials.length - 1);
++  assert.equal(
++    remaining.credentials.some((key) => key.id === id),
++    false,
++  );
++  assert.throws(() => api.rename(id, "   "));
++  assert.throws(() => api.rename(id, "x".repeat(61)));
++  const nextLoad = createPasskeyApi({ preview: true, storage });
++  assert.equal(
++    (await nextLoad.list()).credentials.length,
++    remaining.credentials.length,
++  );
++});
++
++test("failed storage writes leave the account unchanged", async () => {
++  const api = createPasskeyApi({
++    preview: true,
++    storage: {
++      getItem: () => null,
++      setItem: () => {
++        throw new Error("Storage is full");
++      },
++    },
++  });
++  const original = await api.list();
++  await assert.rejects(
++    api.remove(original.credentials[0].id),
++    /Storage is full/,
++  );
++  assert.deepEqual(await api.list(), original);
++});
++
++test("sync uses authoritative server RP and IDs, including an empty remaining list", async () => {
++  const calls = [];
++  const credential = {
++    signalAllAcceptedCredentials: async (value) => calls.push(value),
++  };
++  const snapshot = {
++    rpId: "parent.example",
++    userId: "dXNlcg",
++    credentials: [],
++  };
++  assert.equal(await syncAcceptedCredentials(snapshot, credential), "synced");
++  assert.deepEqual(calls, [
++    { rpId: "parent.example", userId: "dXNlcg", allAcceptedCredentialIds: [] },
++  ]);
++  assert.equal(
++    await syncAcceptedCredentials(snapshot, credential, true),
++    "preview",
++  );
++  assert.equal(calls.length, 1);
++  assert.equal(await syncAcceptedCredentials(snapshot, {}), "unsupported");
++});
++
++test("malformed identifiers never reach a browser authenticator and sync errors are non-fatal", async (t) => {
++  t.mock.method(console, "warn", () => {});
++  const snapshot = {
++    rpId: "parent.example",
++    userId: "not=padded",
++    credentials: [],
++  };
++  assert.equal(
++    await syncAcceptedCredentials(snapshot, {
++      signalAllAcceptedCredentials: () => assert.fail("malformed ID was sent"),
++    }),
++    "failed",
++  );
++  assert.equal(
++    await syncAcceptedCredentials(
++      { ...snapshot, userId: "dXNlcg" },
++      {
++        signalAllAcceptedCredentials: async () => {
++          throw new Error("Browser rejected sync");
++        },
++      },
++    ),
++    "failed",
++  );
++  for (const id of ["", "a", "a=b", "key:1", "abcde"])
++    assert.equal(isBase64Url(id), false);
++});
++
++test("connected mode sends authenticated mutations and returns server snapshots", async () => {
++  const snapshot = await createPasskeyApi({ preview: true }).list();
++  const requests = [];
++  const api = createPasskeyApi({
++    fetcher: async (path, options) => {
++      requests.push({ path, options });
++      return new Response(JSON.stringify(snapshot), {
++        headers: { "Content-Type": "application/json" },
++      });
++    },
++  });
++  await api.list();
++  await api.rename(snapshot.credentials[0].id, "New name");
++  await api.remove(snapshot.credentials[0].id);
++  assert.equal(requests[0].path, "/api/account/passkeys");
++  assert.equal(requests[1].options.method, "PUT");
++  assert.deepEqual(JSON.parse(requests[1].options.body), { name: "New name" });
++  assert.equal(requests[2].options.method, "DELETE");
++  assert.ok(
++    requests.every(
++      ({ options }) =>
++        options.credentials === "same-origin" && options.cache === "no-store",
++    ),
++  );
++});
++
++test("unauthenticated and HTML fallback responses never become preview accounts", async () => {
++  const unauthorized = createPasskeyApi({
++    fetcher: async () => new Response("", { status: 401 }),
++  });
++  await assert.rejects(unauthorized.list(), /session has expired/);
++  const htmlFallback = createPasskeyApi({
++    fetcher: async () =>
++      new Response("<html></html>", {
++        headers: { "Content-Type": "text/html" },
++      }),
++  });
++  await assert.rejects(htmlFallback.list(), /account service is unavailable/);
++});
++
++test("incomplete or duplicate lists are rejected before destructive synchronization", async () => {
++  const snapshot = await createPasskeyApi({ preview: true }).list();
++  assert.throws(() =>
++    validateSnapshot({
++      ...snapshot,
++      credentials: [...snapshot.credentials, snapshot.credentials[0]],
++    }),
++  );
++  assert.throws(() =>
++    validateSnapshot({
++      ...snapshot,
++      credentials: [{ ...snapshot.credentials[0], registeredAt: "yesterday" }],
++    }),
++  );
++});

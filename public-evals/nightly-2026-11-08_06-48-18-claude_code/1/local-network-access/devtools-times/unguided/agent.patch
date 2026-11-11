@@ -1,0 +1,450 @@
+diff --git a/src/components/DiagnosticsConnect.tsx b/src/components/DiagnosticsConnect.tsx
+new file mode 100644
+index 0000000..fe73a5b
+--- /dev/null
++++ b/src/components/DiagnosticsConnect.tsx
+@@ -0,0 +1,377 @@
++import React, { useRef, useState } from 'react';
++
++/**
++ * Developer diagnostics connection widget.
++ *
++ * Lets a reader connect from this public page to:
++ *   1. A hardware test device on their private LAN (e.g. 192.168.1.x)
++ *   2. A companion CLI running on their own machine (127.0.0.1)
++ *
++ * Security model (a public website talking to private/loopback hosts is a
++ * classic CSRF / DNS-rebinding / network-scanning vector, so we keep the
++ * surface deliberately small):
++ *   - Connections happen only on an explicit user click. No auto-connect, no
++ *     background polling, no subnet/port scanning.
++ *   - Hosts are strictly validated: the device must be a literal RFC 1918
++ *     private IPv4 address; the CLI must be a loopback address. Hostnames
++ *     (other than "localhost") are rejected, which removes DNS rebinding as a
++ *     way to redirect requests elsewhere.
++ *   - Only a fixed, read-only diagnostics path is requested. Users choose the
++ *     host and port, never the path, method, or body.
++ *   - Requests use `targetAddressSpace` so Chrome's Local Network Access
++ *     permission prompt is shown, `credentials: 'omit'` so no ambient cookies
++ *     are sent, `redirect: 'error'` so the target can't bounce us elsewhere,
++ *     and a short timeout.
++ *   - A pairing token (shown by the device / CLI) is sent as a bearer header.
++ *     This forces a CORS preflight, so the target must explicitly opt in to
++ *     this origin, and proves the reader controls the target. The token is kept
++ *     in memory only — never persisted or sent anywhere else.
++ *   - Responses are size-limited, parsed as JSON, and rendered as text (React
++ *     escapes it); nothing from the target is ever executed or injected as HTML.
++ */
++
++const DIAGNOSTICS_PATH = '/diagnostics/v1/status';
++const REQUEST_TIMEOUT_MS = 5000;
++const MAX_RESPONSE_BYTES = 64 * 1024;
++const TOKEN_PATTERN = /^[A-Za-z0-9._~-]{8,128}$/;
++
++type TargetKind = 'device' | 'cli';
++
++type Status =
++  | { state: 'idle' }
++  | { state: 'connecting' }
++  | { state: 'connected'; latencyMs: number; data: unknown }
++  | { state: 'error'; message: string };
++
++interface TargetConfig {
++  kind: TargetKind;
++  title: string;
++  description: string;
++  defaultHost: string;
++  defaultPort: string;
++  hostPlaceholder: string;
++  hostHelp: string;
++  /** Value for the Local Network Access `targetAddressSpace` fetch option. */
++  addressSpace: 'local' | 'loopback';
++  validateHost: (host: string) => string | null;
++}
++
++function parseIPv4(host: string): number[] | null {
++  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
++  if (!m) return null;
++  const octets = m.slice(1).map(Number);
++  // Reject leading zeros (octal ambiguity) and out-of-range octets.
++  if (m.slice(1).some((o) => o.length > 1 && o.startsWith('0'))) return null;
++  if (octets.some((o) => o > 255)) return null;
++  return octets;
++}
++
++function isPrivateIPv4(octets: number[]): boolean {
++  const [a, b] = octets;
++  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
++}
++
++function validateDeviceHost(host: string): string | null {
++  const octets = parseIPv4(host);
++  if (!octets) return 'Enter a numeric IPv4 address, e.g. 192.168.1.50.';
++  if (!isPrivateIPv4(octets)) {
++    return 'Only private LAN addresses are allowed (10.x.x.x, 172.16–31.x.x, 192.168.x.x).';
++  }
++  const last = octets[3];
++  if (last === 0 || last === 255) return 'Network and broadcast addresses are not valid device addresses.';
++  return null;
++}
++
++function validateCliHost(host: string): string | null {
++  if (host === 'localhost' || host === '[::1]' || host === '::1') return null;
++  const octets = parseIPv4(host);
++  if (octets && octets[0] === 127) return null;
++  return 'The companion CLI must run on this machine: use 127.0.0.1, localhost, or [::1].';
++}
++
++function validatePort(port: string): string | null {
++  if (!/^\d{1,5}$/.test(port)) return 'Port must be a number.';
++  const n = Number(port);
++  if (n < 1024 || n > 65535) return 'Port must be between 1024 and 65535.';
++  return null;
++}
++
++function buildUrl(host: string, port: string): string {
++  const h = host === '::1' ? '[::1]' : host;
++  // Build via URL so the path can never be influenced by the inputs.
++  const url = new URL(`http://${h}:${port}`);
++  url.pathname = DIAGNOSTICS_PATH;
++  return url.toString();
++}
++
++async function readLimitedJson(response: Response): Promise<unknown> {
++  const declared = Number(response.headers.get('content-length') ?? '0');
++  if (declared > MAX_RESPONSE_BYTES) throw new Error('Response too large.');
++
++  const reader = response.body?.getReader();
++  if (!reader) return null;
++  const chunks: Uint8Array[] = [];
++  let total = 0;
++  for (;;) {
++    const { done, value } = await reader.read();
++    if (done) break;
++    total += value.byteLength;
++    if (total > MAX_RESPONSE_BYTES) {
++      await reader.cancel();
++      throw new Error('Response too large.');
++    }
++    chunks.push(value);
++  }
++  const buf = new Uint8Array(total);
++  let offset = 0;
++  for (const c of chunks) {
++    buf.set(c, offset);
++    offset += c.byteLength;
++  }
++  const text = new TextDecoder().decode(buf);
++  try {
++    return JSON.parse(text);
++  } catch {
++    throw new Error('Target did not return valid JSON.');
++  }
++}
++
++const TARGETS: TargetConfig[] = [
++  {
++    kind: 'device',
++    title: 'Hardware test device',
++    description: 'A test rig on your private Wi-Fi network.',
++    defaultHost: '192.168.1.50',
++    defaultPort: '8080',
++    hostPlaceholder: '192.168.1.50',
++    hostHelp: 'Private LAN IPv4 address shown on the device display.',
++    addressSpace: 'local',
++    validateHost: validateDeviceHost,
++  },
++  {
++    kind: 'cli',
++    title: 'Companion CLI',
++    description: 'The diagnostics CLI running on this computer.',
++    defaultHost: '127.0.0.1',
++    defaultPort: '47800',
++    hostPlaceholder: '127.0.0.1',
++    hostHelp: 'Run `devtools-times-cli serve` and copy the token it prints.',
++    addressSpace: 'loopback',
++    validateHost: validateCliHost,
++  },
++];
++
++function TargetPanel({ config }: { config: TargetConfig }) {
++  const [host, setHost] = useState(config.defaultHost);
++  const [port, setPort] = useState(config.defaultPort);
++  const [token, setToken] = useState('');
++  const [status, setStatus] = useState<Status>({ state: 'idle' });
++  const abortRef = useRef<AbortController | null>(null);
++
++  const idPrefix = `diag-${config.kind}`;
++
++  const connect = async (e: React.FormEvent) => {
++    e.preventDefault();
++    const trimmedHost = host.trim();
++    const trimmedPort = port.trim();
++    const trimmedToken = token.trim();
++
++    const validationError =
++      config.validateHost(trimmedHost) ??
++      validatePort(trimmedPort) ??
++      (TOKEN_PATTERN.test(trimmedToken)
++        ? null
++        : 'Pairing token must be 8–128 characters (letters, digits, . _ ~ -).');
++    if (validationError) {
++      setStatus({ state: 'error', message: validationError });
++      return;
++    }
++
++    abortRef.current?.abort();
++    const controller = new AbortController();
++    abortRef.current = controller;
++    const timeout = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
++
++    setStatus({ state: 'connecting' });
++    const started = performance.now();
++    try {
++      const init: RequestInit & { targetAddressSpace?: string } = {
++        method: 'GET',
++        mode: 'cors',
++        credentials: 'omit',
++        redirect: 'error',
++        cache: 'no-store',
++        referrerPolicy: 'no-referrer',
++        signal: controller.signal,
++        headers: {
++          Accept: 'application/json',
++          Authorization: `Bearer ${trimmedToken}`,
++        },
++        // Chrome Local Network Access: triggers the permission prompt and
++        // allows the HTTP request from this HTTPS page. Ignored elsewhere.
++        targetAddressSpace: config.addressSpace,
++      };
++      const response = await fetch(buildUrl(trimmedHost, trimmedPort), init);
++      if (response.status === 401 || response.status === 403) {
++        throw new Error('Pairing token was rejected by the target.');
++      }
++      if (!response.ok) throw new Error(`Target responded with HTTP ${response.status}.`);
++      const data = await readLimitedJson(response);
++      if (controller.signal.aborted) return;
++      setStatus({ state: 'connected', latencyMs: Math.round(performance.now() - started), data });
++    } catch (err) {
++      if (abortRef.current !== controller) return; // superseded by a newer attempt
++      const message =
++        err instanceof DOMException && err.name === 'AbortError'
++          ? `Timed out after ${REQUEST_TIMEOUT_MS / 1000}s. Is the target running and reachable?`
++          : err instanceof TypeError
++            ? 'Could not connect. Check the address, that local network access was allowed, and that the target allows this origin (CORS).'
++            : err instanceof Error
++              ? err.message
++              : 'Unknown error.';
++      setStatus({ state: 'error', message });
++    } finally {
++      window.clearTimeout(timeout);
++    }
++  };
++
++  const disconnect = () => {
++    abortRef.current?.abort();
++    abortRef.current = null;
++    setToken('');
++    setStatus({ state: 'idle' });
++  };
++
++  const badge = {
++    idle: 'bg-gray-100 text-gray-700',
++    connecting: 'bg-yellow-100 text-yellow-800',
++    connected: 'bg-green-100 text-green-800',
++    error: 'bg-red-100 text-red-700',
++  }[status.state];
++  const badgeLabel = {
++    idle: 'Not connected',
++    connecting: 'Connecting…',
++    connected: 'Connected',
++    error: 'Error',
++  }[status.state];
++
++  return (
++    <section
++      aria-labelledby={`${idPrefix}-title`}
++      className="p-5 border border-gray-200 rounded-lg bg-white shadow-sm flex flex-col"
++    >
++      <div className="flex items-start justify-between gap-3 mb-1">
++        <h3 id={`${idPrefix}-title`} className="text-lg font-bold text-gray-900">
++          {config.title}
++        </h3>
++        <span className={`text-xs font-semibold px-2 py-1 rounded-full whitespace-nowrap ${badge}`}>
++          {badgeLabel}
++        </span>
++      </div>
++      <p className="text-sm text-gray-600 mb-4">{config.description}</p>
++
++      <form onSubmit={connect} className="space-y-3" noValidate>
++        <div className="grid grid-cols-3 gap-3">
++          <div className="col-span-2">
++            <label htmlFor={`${idPrefix}-host`} className="block text-sm font-medium text-gray-700 mb-1">
++              Host
++            </label>
++            <input
++              id={`${idPrefix}-host`}
++              type="text"
++              inputMode="decimal"
++              autoComplete="off"
++              spellCheck={false}
++              value={host}
++              placeholder={config.hostPlaceholder}
++              onChange={(e) => setHost(e.target.value)}
++              aria-describedby={`${idPrefix}-host-help`}
++              className="w-full px-3 py-2 border border-gray-300 rounded-md font-mono text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
++            />
++          </div>
++          <div>
++            <label htmlFor={`${idPrefix}-port`} className="block text-sm font-medium text-gray-700 mb-1">
++              Port
++            </label>
++            <input
++              id={`${idPrefix}-port`}
++              type="text"
++              inputMode="numeric"
++              autoComplete="off"
++              value={port}
++              onChange={(e) => setPort(e.target.value)}
++              className="w-full px-3 py-2 border border-gray-300 rounded-md font-mono text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
++            />
++          </div>
++        </div>
++        <p id={`${idPrefix}-host-help`} className="text-xs text-gray-500">
++          {config.hostHelp}
++        </p>
++        <div>
++          <label htmlFor={`${idPrefix}-token`} className="block text-sm font-medium text-gray-700 mb-1">
++            Pairing token
++          </label>
++          <input
++            id={`${idPrefix}-token`}
++            type="password"
++            autoComplete="off"
++            spellCheck={false}
++            value={token}
++            onChange={(e) => setToken(e.target.value)}
++            className="w-full px-3 py-2 border border-gray-300 rounded-md font-mono text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
++          />
++        </div>
++        <div className="flex gap-2 pt-1">
++          <button
++            type="submit"
++            disabled={status.state === 'connecting'}
++            className="flex-1 py-2 px-4 rounded-md text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50"
++          >
++            {status.state === 'connected' ? 'Refresh' : 'Connect'}
++          </button>
++          {status.state !== 'idle' && (
++            <button
++              type="button"
++              onClick={disconnect}
++              className="py-2 px-4 rounded-md text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-gray-400"
++            >
++              Disconnect
++            </button>
++          )}
++        </div>
++      </form>
++
++      <div aria-live="polite" className="mt-4">
++        {status.state === 'error' && (
++          <div className="p-3 text-sm text-red-700 bg-red-50 rounded-md" role="alert">
++            {status.message}
++          </div>
++        )}
++        {status.state === 'connected' && (
++          <div>
++            <p className="text-xs text-gray-500 mb-1">Round trip: {status.latencyMs} ms</p>
++            <pre className="p-3 bg-gray-900 text-green-200 text-xs rounded-md overflow-auto max-h-64">
++              {JSON.stringify(status.data, null, 2)}
++            </pre>
++          </div>
++        )}
++      </div>
++    </section>
++  );
++}
++
++export default function DiagnosticsConnect() {
++  return (
++    <div>
++      <div className="grid gap-6 md:grid-cols-2">
++        {TARGETS.map((t) => (
++          <TargetPanel key={t.kind} config={t} />
++        ))}
++      </div>
++      <p className="mt-4 text-xs text-gray-500">
++        Connections go directly from your browser to your device and computer. Nothing you enter here is sent to
++        The DevTools Times. Your browser may ask for permission to access devices on your local network.
++      </p>
++    </div>
++  );
++}
+diff --git a/src/components/Footer.astro b/src/components/Footer.astro
+index 5f2d281..d742b89 100644
+--- a/src/components/Footer.astro
++++ b/src/components/Footer.astro
+@@ -51,6 +51,7 @@ const baseUrl = import.meta.env.BASE_URL;
+             <h3 class="font-bold text-xs uppercase tracking-wider mb-3">Science & Tech</h3>
+             <ul class="space-y-2">
+                 <li><a href="/category/science" class="text-sm hover:underline">Science</a></li>
++                <li><a href={`${baseUrl}diagnostics`} class="text-sm hover:underline">Developer Diagnostics</a></li>
+             </ul>
+         </div>
+ 
+diff --git a/src/pages/diagnostics.astro b/src/pages/diagnostics.astro
+new file mode 100644
+index 0000000..a918212
+--- /dev/null
++++ b/src/pages/diagnostics.astro
+@@ -0,0 +1,49 @@
++---
++import Layout from '../layouts/Layout.astro';
++import DiagnosticsConnect from '../components/DiagnosticsConnect';
++
++const siteOrigin = Astro.url.origin;
++---
++
++<Layout title="Developer Diagnostics | The DevTools Times">
++  <div class="max-w-5xl mx-auto px-4 py-8 md:py-12">
++    <h1 class="text-3xl md:text-4xl font-bold text-gray-900 mb-2 pb-2 border-b-2">Developer Diagnostics</h1>
++    <p class="text-gray-700 mb-8">
++      Connect this page to a hardware test device on your private network and to the companion CLI on your
++      computer to check that both are reachable and healthy.
++    </p>
++
++    <DiagnosticsConnect client:only="react" />
++
++    <details class="mt-10 border-t border-gray-200 pt-6">
++      <summary class="cursor-pointer font-semibold text-gray-900">Setting up a target</summary>
++      <div class="prose prose-sm max-w-none mt-4">
++        <p>
++          The widget sends a single read-only <code>GET /diagnostics/v1/status</code> request with an
++          <code>Authorization: Bearer &lt;pairing-token&gt;</code> header. To accept it, the device or CLI must:
++        </p>
++        <ul>
++          <li>Generate a random pairing token and show it locally (device display or terminal output).</li>
++          <li>
++            Answer the CORS preflight (<code>OPTIONS</code>) and the <code>GET</code> with
++            <code>Access-Control-Allow-Origin: {siteOrigin}</code> (this exact origin, never <code>*</code>),
++            <code>Access-Control-Allow-Headers: Authorization, Accept</code>,
++            <code>Access-Control-Allow-Methods: GET</code>, and
++            <code>Access-Control-Allow-Private-Network: true</code>.
++          </li>
++          <li>Reject requests with a missing or wrong token with <code>401</code>.</li>
++          <li>
++            Validate the <code>Host</code> header (accept only its own IP / <code>127.0.0.1</code> /
++            <code>localhost</code>) to defend against DNS rebinding.
++          </li>
++          <li>Return a small JSON body (under 64 KB), e.g. <code>{'{"name":"rig-01","firmware":"2.4.1","uptime":3600}'}</code>.</li>
++          <li>The companion CLI should bind to <code>127.0.0.1</code> only, not <code>0.0.0.0</code>.</li>
++        </ul>
++        <p>
++          In Chrome, the first connection triggers a Local Network Access permission prompt; you must allow it for the
++          request to go through.
++        </p>
++      </div>
++    </details>
++  </div>
++</Layout>

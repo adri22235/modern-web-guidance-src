@@ -1,0 +1,266 @@
+diff --git a/index.html b/index.html
+index 66c9173..d2c7ca9 100644
+--- a/index.html
++++ b/index.html
+@@ -4,6 +4,8 @@
+ <head>
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <meta http-equiv="Content-Security-Policy"
++    content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https://images.unsplash.com; object-src 'none'; base-uri 'none'; form-action 'self'; require-trusted-types-for 'script'; trusted-types daily-grind-html daily-grind-inert">
+   <title>The Daily Grind | Artisanal Coffee</title>
+   <style>
+     :root {
+@@ -153,6 +155,7 @@
+       font-size: 0.85rem;
+     }
+   </style>
++  <script type="module" src="/js/seasonal-favorites.js"></script>
+ </head>
+ 
+ <body>
+@@ -177,22 +180,10 @@
+   <main class="container">
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+-      <div class="grid">
+-        <div class="card">
+-          <h3>Maple Oat Latte</h3>
+-          <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+-          <a href="/menu/seasonal" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Dark Roast Espresso</h3>
+-          <p>Bold, smokey, and perfect for a morning boost.</p>
+-          <a href="/menu/espresso" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Cold Brew</h3>
+-          <p>Steeped for 18 hours for maximum smoothness.</p>
+-          <a href="/menu/cold-brew" class="btn">View Details</a>
+-        </div>
++      <div class="grid" id="seasonal-favorites" aria-live="polite">
++        <noscript>
++          <p>Enable JavaScript to see our Seasonal Favorites, or <a href="/menu/seasonal">browse the seasonal menu</a>.</p>
++        </noscript>
+       </div>
+     </section>
+   </main>
+diff --git a/js/safe-html.js b/js/safe-html.js
+new file mode 100644
+index 0000000..dac7150
+--- /dev/null
++++ b/js/safe-html.js
+@@ -0,0 +1,168 @@
++/**
++ * Safe HTML insertion for The Daily Grind.
++ *
++ * Every HTML string that reaches the DOM goes through `setSafeHTML()`, which:
++ *   1. parses the string in an inert document (no scripts run, no images load),
++ *   2. walks the tree and keeps only allowlisted elements/attributes/URLs,
++ *   3. hands the result to the sink as a TrustedHTML value created by the
++ *      `daily-grind-html` Trusted Types policy.
++ *
++ * index.html enforces `require-trusted-types-for 'script'` via CSP, so any code
++ * that tries to assign a raw string to innerHTML / outerHTML /
++ * insertAdjacentHTML / document.write etc. throws instead of executing.
++ */
++
++const POLICY_NAME = 'daily-grind-html';
++const INERT_POLICY_NAME = 'daily-grind-inert';
++
++// Elements allowed to survive sanitization. Anything not listed is removed;
++// "transparent" containers have their children kept, while dangerous ones
++// (script, style, svg, iframe, template, noscript, ...) are dropped entirely.
++const ALLOWED_TAGS = new Set([
++  'a', 'article', 'b', 'br', 'div', 'em', 'h2', 'h3', 'h4', 'i', 'img',
++  'li', 'ol', 'p', 'small', 'span', 'strong', 'ul',
++]);
++
++const DROP_WITH_CONTENT = new Set([
++  'script', 'style', 'template', 'noscript', 'noembed', 'noframes', 'iframe',
++  'frame', 'frameset', 'object', 'embed', 'svg', 'math', 'xmp', 'plaintext',
++  'textarea', 'title', 'select', 'option', 'form', 'base', 'link', 'meta',
++]);
++
++const GLOBAL_ATTRS = new Set(['class', 'title', 'aria-label', 'aria-hidden', 'role']);
++const TAG_ATTRS = {
++  a: new Set(['href']),
++  img: new Set(['src', 'alt', 'width', 'height', 'loading', 'decoding']),
++};
++
++const URL_ATTRS = new Set(['href', 'src']);
++const SAFE_LINK_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
++const SAFE_IMG_PROTOCOLS = new Set(['https:']);
++
++const trustedTypesSupported =
++  typeof window !== 'undefined' && typeof window.trustedTypes?.createPolicy === 'function';
++
++// Private policy used only to parse untrusted markup into an *inert* document.
++// It is never exported, and the CSP `trusted-types` directive forbids creating
++// a second policy with the same name, so other scripts cannot obtain it.
++const inertPolicy = trustedTypesSupported
++  ? window.trustedTypes.createPolicy(INERT_POLICY_NAME, { createHTML: (s) => s })
++  : null;
++
++function parseInert(html) {
++  const doc = document.implementation.createHTMLDocument('');
++  const container = doc.createElement('div');
++  container.innerHTML = inertPolicy ? inertPolicy.createHTML(html) : html;
++  return container;
++}
++
++function isSafeUrl(value, attrName) {
++  const trimmed = value.trim();
++  // Reject control characters / whitespace tricks like "java\nscript:".
++  if (/[\u0000-\u001F\u007F]/.test(trimmed)) return false;
++  let url;
++  try {
++    url = new URL(trimmed, window.location.href);
++  } catch {
++    return false;
++  }
++  const allowed = attrName === 'src' ? SAFE_IMG_PROTOCOLS : SAFE_LINK_PROTOCOLS;
++  return allowed.has(url.protocol);
++}
++
++function sanitizeAttributes(el) {
++  const tag = el.localName;
++  const tagAttrs = TAG_ATTRS[tag];
++  for (const { name, value } of Array.from(el.attributes)) {
++    const allowed = GLOBAL_ATTRS.has(name) || (tagAttrs && tagAttrs.has(name));
++    if (!allowed || (URL_ATTRS.has(name) && !isSafeUrl(value, name))) {
++      el.removeAttribute(name);
++    }
++  }
++  if (tag === 'a' && el.hasAttribute('href')) {
++    const url = new URL(el.getAttribute('href'), window.location.href);
++    if (url.origin !== window.location.origin) {
++      el.setAttribute('rel', 'noopener noreferrer');
++    }
++  }
++}
++
++function sanitizeNode(node) {
++  for (const child of Array.from(node.childNodes)) {
++    if (child.nodeType === Node.TEXT_NODE) continue;
++    if (child.nodeType !== Node.ELEMENT_NODE) {
++      child.remove(); // comments, processing instructions, CDATA
++      continue;
++    }
++    const tag = child.localName;
++    if (child.namespaceURI !== 'http://www.w3.org/1999/xhtml' || DROP_WITH_CONTENT.has(tag)) {
++      child.remove();
++      continue;
++    }
++    sanitizeNode(child);
++    if (ALLOWED_TAGS.has(tag)) {
++      sanitizeAttributes(child);
++    } else {
++      child.replaceWith(...Array.from(child.childNodes));
++    }
++  }
++}
++
++/** Returns an allowlist-sanitized HTML string. */
++export function sanitizeHTML(dirty) {
++  const container = parseInert(String(dirty));
++  sanitizeNode(container);
++  const clean = container.innerHTML;
++  // Guard against mutation XSS: the serialized output must be stable when
++  // re-parsed and re-sanitized. If not, refuse to render anything.
++  const reparsed = parseInert(clean);
++  sanitizeNode(reparsed);
++  return reparsed.innerHTML === clean ? clean : '';
++}
++
++const htmlPolicy = trustedTypesSupported
++  ? window.trustedTypes.createPolicy(POLICY_NAME, {
++      createHTML: sanitizeHTML,
++      createScript: () => {
++        throw new TypeError('Dynamic script creation is not allowed.');
++      },
++      createScriptURL: () => {
++        throw new TypeError('Dynamic script URLs are not allowed.');
++      },
++    })
++  : null;
++
++/** Sanitizes `html` and returns a TrustedHTML (or a clean string as fallback). */
++export function toTrustedHTML(html) {
++  return htmlPolicy ? htmlPolicy.createHTML(html) : sanitizeHTML(html);
++}
++
++/** The single sanctioned way to put an HTML string into the live DOM. */
++export function setSafeHTML(element, html) {
++  element.innerHTML = toTrustedHTML(html);
++}
++
++const ESCAPE_MAP = {
++  '&': '&amp;',
++  '<': '&lt;',
++  '>': '&gt;',
++  '"': '&quot;',
++  "'": '&#39;',
++  '`': '&#96;',
++};
++
++/** Escapes a value for safe interpolation into HTML text or quoted attributes. */
++export function escapeHTML(value) {
++  return String(value ?? '').replace(/[&<>"'`]/g, (ch) => ESCAPE_MAP[ch]);
++}
++
++/**
++ * Tagged template that escapes every interpolated value:
++ *   html`<h3>${name}</h3>`
++ */
++export function html(strings, ...values) {
++  return strings.reduce(
++    (out, str, i) => out + str + (i < values.length ? escapeHTML(values[i]) : ''),
++    '',
++  );
++}
+diff --git a/js/seasonal-favorites.js b/js/seasonal-favorites.js
+new file mode 100644
+index 0000000..f625fc0
+--- /dev/null
++++ b/js/seasonal-favorites.js
+@@ -0,0 +1,38 @@
++import { html, setSafeHTML } from './safe-html.js';
++
++// Card content is treated as untrusted (it may later come from a CMS or API),
++// so every field is escaped by the `html` template and the final markup is
++// sanitized again by setSafeHTML() before it touches the DOM.
++const SEASONAL_FAVORITES = [
++  {
++    name: 'Maple Oat Latte',
++    description: 'Creamy oat milk with a hint of Vermont maple syrup.',
++    href: '/menu/seasonal',
++  },
++  {
++    name: 'Dark Roast Espresso',
++    description: 'Bold, smokey, and perfect for a morning boost.',
++    href: '/menu/espresso',
++  },
++  {
++    name: 'Cold Brew',
++    description: 'Steeped for 18 hours for maximum smoothness.',
++    href: '/menu/cold-brew',
++  },
++];
++
++function renderCard({ name, description, href }) {
++  return html`
++    <div class="card">
++      <h3>${name}</h3>
++      <p>${description}</p>
++      <a href="${href}" class="btn">View Details</a>
++    </div>`;
++}
++
++export function renderSeasonalFavorites(container, items = SEASONAL_FAVORITES) {
++  setSafeHTML(container, items.map(renderCard).join(''));
++}
++
++const grid = document.getElementById('seasonal-favorites');
++if (grid) renderSeasonalFavorites(grid);

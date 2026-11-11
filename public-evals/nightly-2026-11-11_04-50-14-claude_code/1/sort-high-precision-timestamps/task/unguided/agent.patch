@@ -1,0 +1,354 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -151,8 +151,114 @@
+       color: var(--text);
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    /* Order Event Timeline */
++    .events-section {
++      margin-top: 50px;
++      background: white;
++      padding: 25px;
++      border-radius: 8px;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++    }
++
++    .events-section h2 {
++      text-align: center;
++    }
++
++    .events-section .intro {
++      text-align: center;
++      color: #6d4c41;
++      font-size: 0.95rem;
++    }
++
++    .events-actions {
++      text-align: center;
++    }
++
++    button.btn {
++      border: none;
++      font: inherit;
++      cursor: pointer;
++    }
++
++    button.btn:disabled {
++      opacity: 0.6;
++      cursor: wait;
++    }
++
++    .events-status {
++      margin-top: 15px;
++      text-align: center;
++      font-size: 0.9rem;
++    }
++
++    .events-status.error {
++      color: #b71c1c;
++    }
++
++    .events-summary {
++      display: grid;
++      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
++      gap: 12px;
++      margin-top: 20px;
++    }
++
++    .events-summary div {
++      background: var(--secondary);
++      border-radius: 6px;
++      padding: 10px;
++      text-align: center;
++    }
++
++    .events-summary dt {
++      font-size: 0.75rem;
++      text-transform: uppercase;
++      letter-spacing: 0.5px;
++    }
++
++    .events-summary dd {
++      font-weight: bold;
++      font-family: Consolas, 'Courier New', monospace;
++    }
++
++    .events-table-wrap {
++      overflow-x: auto;
++      margin-top: 20px;
++    }
++
++    .events-table {
++      width: 100%;
++      border-collapse: collapse;
++      font-size: 0.85rem;
++    }
++
++    .events-table th,
++    .events-table td {
++      padding: 8px 10px;
++      border-bottom: 1px solid #eee;
++      text-align: left;
++      white-space: nowrap;
++    }
++
++    .events-table th {
++      background: var(--primary);
++      color: white;
++    }
++
++    .events-table .mono {
++      font-family: Consolas, 'Courier New', monospace;
++    }
++
++    .events-table .num {
++      text-align: right;
++    }
++
++    .events-table tr.tie td.delta {
++      color: #e65100;
++      font-weight: bold;
++    }
+   </style>
+ </head>
+ 
+ <body>
+@@ -194,8 +300,35 @@
+           <a href="/menu/cold-brew" class="btn">View Details</a>
+         </div>
+       </div>
+     </section>
++
++    <section class="events-section" aria-labelledby="events-heading">
++      <h2 id="events-heading">Order Event Timeline</h2>
++      <p class="intro">Load the latest batch of order events reported by our backend services, put them back in
++        chronological order with full nanosecond precision, and see how long each step took.</p>
++      <div class="events-actions">
++        <button type="button" id="load-events-btn" class="btn">Load &amp; Sort Order Events</button>
++      </div>
++      <p id="events-status" class="events-status" role="status" aria-live="polite"></p>
++      <dl id="events-summary" class="events-summary" hidden></dl>
++      <div class="events-table-wrap">
++        <table id="events-table" class="events-table" hidden>
++          <thead>
++            <tr>
++              <th scope="col">#</th>
++              <th scope="col">Timestamp (UTC, ns)</th>
++              <th scope="col">Service</th>
++              <th scope="col">Event</th>
++              <th scope="col">Order</th>
++              <th scope="col" class="num">Δ since previous</th>
++              <th scope="col" class="num">Δ (ns)</th>
++            </tr>
++          </thead>
++          <tbody></tbody>
++        </table>
++      </div>
++    </section>
+   </main>
+ 
+   <footer>
+     <div class="footer-links">
+@@ -206,7 +339,199 @@
+     </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script>
++    (() => {
++      const EVENTS_URL = 'order-events.json';
++      const NS_PER_SEC = 1000000000n;
++
++      // RFC 3339 / ISO-8601 timestamp with up to 9 fractional digits.
++      // JavaScript Date only keeps milliseconds, so the fractional part is parsed
++      // separately and the whole instant is held as a BigInt count of epoch nanoseconds.
++      const TS_RE = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:[.,](\d{1,9}))?(Z|[+-]\d{2}:?\d{2})$/i;
++
++      function parseTimestampNs(value) {
++        if (typeof value !== 'string') throw new Error('timestamp must be a string');
++        const m = TS_RE.exec(value.trim());
++        if (!m) throw new Error(`unrecognised timestamp "${value}"`);
++        const [, y, mo, d, h, mi, sec, frac = '', zone] = m;
++        const [Y, MO, D, H, MI, S] = [y, mo, d, h, mi, sec].map(Number);
++        const wholeMs = Date.UTC(Y, MO - 1, D, H, MI, S);
++        const check = new Date(wholeMs);
++        if (Number.isNaN(wholeMs) || check.getUTCFullYear() !== Y || check.getUTCMonth() !== MO - 1 ||
++            check.getUTCDate() !== D || H > 23 || MI > 59 || S > 59) {
++          throw new Error(`invalid date/time in "${value}"`);
++        }
++        let ns = BigInt(wholeMs / 1000) * NS_PER_SEC + BigInt(frac.padEnd(9, '0') || '0');
++        if (zone.toUpperCase() !== 'Z') {
++          const sign = zone[0] === '-' ? -1n : 1n;
++          const digits = zone.slice(1).replace(':', '');
++          const offsetSec = BigInt(Number(digits.slice(0, 2)) * 3600 + Number(digits.slice(2)) * 60);
++          ns -= sign * offsetSec * NS_PER_SEC; // convert local time to UTC
++        }
++        return ns;
++      }
++
++      function formatUtcNs(ns) {
++        let sec = ns / NS_PER_SEC;
++        let frac = ns % NS_PER_SEC;
++        if (frac < 0n) { frac += NS_PER_SEC; sec -= 1n; }
++        const base = new Date(Number(sec) * 1000).toISOString().slice(0, 19);
++        return `${base}.${frac.toString().padStart(9, '0')}Z`;
++      }
++
++      function formatDuration(ns) {
++        const neg = ns < 0n;
++        const abs = neg ? -ns : ns;
++        const units = [[3600n * NS_PER_SEC, 'h'], [60n * NS_PER_SEC, 'min'], [NS_PER_SEC, 's'],
++                       [1000000n, 'ms'], [1000n, 'µs'], [1n, 'ns']];
++        for (const [size, label] of units) {
++          if (abs >= size || size === 1n) {
++            const whole = abs / size;
++            const rem = abs % size;
++            // Show 3 decimals using exact integer arithmetic (no float rounding of large values).
++            const decimals = size >= 1000n ? ((rem * 1000n) / size).toString().padStart(3, '0') : '';
++            const text = decimals && decimals !== '000' ? `${whole}.${decimals}` : `${whole}`;
++            return `${neg ? '-' : ''}${text} ${label}`;
++          }
++        }
++      }
++
++      const groupDigits = (n) => n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
++
++      function processEvents(rawEvents) {
++        const valid = [];
++        const rejected = [];
++        rawEvents.forEach((evt, index) => {
++          try {
++            valid.push({ ...evt, index, ns: parseTimestampNs(evt && evt.timestamp) });
++          } catch (err) {
++            rejected.push({ id: (evt && evt.id) || `#${index + 1}`, reason: err.message });
++          }
++        });
++
++        // Compare BigInts directly; ties broken by event id then original position for a deterministic order.
++        valid.sort((a, b) => {
++          if (a.ns !== b.ns) return a.ns < b.ns ? -1 : 1;
++          const ida = String(a.id ?? ''), idb = String(b.id ?? '');
++          if (ida !== idb) return ida < idb ? -1 : 1;
++          return a.index - b.index;
++        });
++
++        const intervals = [];
++        valid.forEach((evt, i) => {
++          evt.delta = i === 0 ? null : evt.ns - valid[i - 1].ns;
++          if (evt.delta !== null) intervals.push(evt.delta);
++        });
++
++        let stats = null;
++        if (intervals.length) {
++          const total = intervals.reduce((a, b) => a + b, 0n);
++          const sorted = [...intervals].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
++          const mid = Math.floor(sorted.length / 2);
++          stats = {
++            span: total,
++            min: sorted[0],
++            max: sorted[sorted.length - 1],
++            mean: total / BigInt(intervals.length),
++            median: sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2n,
++            ties: intervals.filter((d) => d === 0n).length,
++          };
++        }
++        return { events: valid, rejected, stats };
++      }
++
++      const btn = document.getElementById('load-events-btn');
++      const statusEl = document.getElementById('events-status');
++      const summaryEl = document.getElementById('events-summary');
++      const table = document.getElementById('events-table');
++      const tbody = table.querySelector('tbody');
++
++      function setStatus(text, isError = false) {
++        statusEl.textContent = text;
++        statusEl.classList.toggle('error', isError);
++      }
++
++      function cell(row, text, className) {
++        const td = document.createElement('td');
++        td.textContent = text;
++        if (className) td.className = className;
++        row.appendChild(td);
++      }
++
++      function render(batch, result) {
++        const { events, rejected, stats } = result;
++        tbody.replaceChildren();
++        events.forEach((evt, i) => {
++          const tr = document.createElement('tr');
++          if (evt.delta === 0n) tr.classList.add('tie');
++          cell(tr, String(i + 1));
++          cell(tr, formatUtcNs(evt.ns), 'mono');
++          cell(tr, evt.service ?? '—');
++          cell(tr, evt.type ?? '—');
++          cell(tr, evt.orderId ?? '—');
++          cell(tr, evt.delta === null ? '—' : formatDuration(evt.delta), 'mono num delta');
++          cell(tr, evt.delta === null ? '—' : groupDigits(evt.delta), 'mono num');
++          tbody.appendChild(tr);
++        });
++        table.hidden = events.length === 0;
++
++        summaryEl.replaceChildren();
++        const items = [['Events sorted', String(events.length)]];
++        if (stats) {
++          items.push(
++            ['Total span', formatDuration(stats.span)],
++            ['Shortest gap', formatDuration(stats.min)],
++            ['Longest gap', formatDuration(stats.max)],
++            ['Mean gap', formatDuration(stats.mean)],
++            ['Median gap', formatDuration(stats.median)],
++            ['Simultaneous', String(stats.ties)],
++          );
++        }
++        if (rejected.length) items.push(['Rejected', String(rejected.length)]);
++        for (const [label, value] of items) {
++          const wrap = document.createElement('div');
++          const dt = document.createElement('dt');
++          const dd = document.createElement('dd');
++          dt.textContent = label;
++          dd.textContent = value;
++          wrap.append(dt, dd);
++          summaryEl.appendChild(wrap);
++        }
++        summaryEl.hidden = false;
++
++        let msg = `Loaded ${events.length + rejected.length} events` +
++          (batch.batchId ? ` from batch ${batch.batchId}` : '') + ' and sorted them chronologically.';
++        if (rejected.length) {
++          msg += ` Skipped ${rejected.length}: ` + rejected.map((r) => `${r.id} (${r.reason})`).join('; ');
++        }
++        setStatus(msg, rejected.length > 0 && events.length === 0);
++      }
++
++      btn.addEventListener('click', async () => {
++        btn.disabled = true;
++        setStatus('Loading order events…');
++        try {
++          const res = await fetch(EVENTS_URL, { cache: 'no-store' });
++          if (!res.ok) throw new Error(`HTTP ${res.status}`);
++          const batch = await res.json();
++          const raw = Array.isArray(batch) ? batch : batch.events;
++          if (!Array.isArray(raw)) throw new Error('response does not contain an events array');
++          render(Array.isArray(batch) ? {} : batch, processEvents(raw));
++        } catch (err) {
++          table.hidden = true;
++          summaryEl.hidden = true;
++          setStatus(`Could not load order events: ${err.message}`, true);
++        } finally {
++          btn.disabled = false;
++        }
++      });
++
++      // Exposed for testing/debugging.
++      window.DailyGrindEvents = { parseTimestampNs, formatUtcNs, formatDuration, processEvents };
++    })();
++  </script>
++
+ </body>
+ 
+ </html>

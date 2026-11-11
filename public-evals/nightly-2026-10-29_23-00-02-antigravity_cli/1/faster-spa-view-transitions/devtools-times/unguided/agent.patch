@@ -1,0 +1,227 @@
+diff --git a/src/components/BottomNav.tsx b/src/components/BottomNav.tsx
+index 6d031f5..fbf9b5b 100644
+--- a/src/components/BottomNav.tsx
++++ b/src/components/BottomNav.tsx
+@@ -1,4 +1,4 @@
+-import React, { useState } from 'react';
++import React, { useState, useEffect } from 'react';
+ import FlyoutMenu from './FlyoutMenu';
+ 
+ interface BottomNavProps {
+@@ -11,6 +11,12 @@ interface BottomNavProps {
+ const BottomNav: React.FC<BottomNavProps> = ({ categories, articles, reports, multimedia }) => {
+     const [activeCategory, setActiveCategory] = useState<string | null>(null);
+ 
++    useEffect(() => {
++        const handleClose = () => setActiveCategory(null);
++        document.addEventListener('astro:before-swap', handleClose);
++        return () => document.removeEventListener('astro:before-swap', handleClose);
++    }, []);
++
+     const groupedCategories = {
+         'News & Politics': ['news', 'National', 'Politics', 'Economy', 'Labor', 'Business'],
+         'Arts & Culture': ['Culture', 'Media'],
+diff --git a/src/components/ReadingListButton.tsx b/src/components/ReadingListButton.tsx
+index 29642be..14c4ef8 100644
+--- a/src/components/ReadingListButton.tsx
++++ b/src/components/ReadingListButton.tsx
+@@ -20,6 +20,10 @@ export default function ReadingListButton() {
+       setArticles(data);
+     };
+     fetchArticles();
++
++    const handleClose = () => setIsOpen(false);
++    document.addEventListener('astro:before-swap', handleClose);
++    return () => document.removeEventListener('astro:before-swap', handleClose);
+   }, []);
+ 
+   return (
+diff --git a/src/components/SearchButton.tsx b/src/components/SearchButton.tsx
+index 3f57913..82cdf01 100644
+--- a/src/components/SearchButton.tsx
++++ b/src/components/SearchButton.tsx
+@@ -1,5 +1,5 @@
+ 
+-import React, { useState } from 'react';
++import React, { useState, useEffect } from 'react';
+ import SearchFlyout from './SearchFlyout';
+ 
+ interface Article {
+@@ -13,6 +13,12 @@ export default function SearchButton() {
+     const [articles, setArticles] = useState<Article[]>([]);
+     const [isLoading, setIsLoading] = useState(false);
+ 
++    useEffect(() => {
++        const handleClose = () => setIsFlyoutOpen(false);
++        document.addEventListener('astro:before-swap', handleClose);
++        return () => document.removeEventListener('astro:before-swap', handleClose);
++    }, []);
++
+     const openSearch = async () => {
+         try {
+             setArticles([]);
+diff --git a/src/layouts/Layout.astro b/src/layouts/Layout.astro
+index dcf9696..5cda102 100644
+--- a/src/layouts/Layout.astro
++++ b/src/layouts/Layout.astro
+@@ -38,18 +38,156 @@ const baseUrl = import.meta.env.BASE_URL;
+   </head>
+   <body class="bg-gray-100">
+     <div class="mx-auto">
+-      <AdSlotFireplace client:load />
++      <AdSlotFireplace client:load transition:persist />
+       <div
+         class="max-w-6xl w-full bg-white shadow-sm min-h-screen z-10 m-auto"
+       >
+-        <div>
++        <div transition:persist>
+           <Header />
+         </div>
+-        <main class="bg-white relative">
++        <main id="app-view-container" class="bg-white relative">
+           <slot />
+         </main>
+       </div>
+     </div>
+-    <Footer />
++    <Footer transition:persist />
++
++    <script>
++      import {
++        deselectScripts,
++        swapRootAttributes,
++      } from "astro:transitions/client";
++
++      interface CachedView {
++        main: HTMLElement;
++        title: string;
++      }
++
++      const viewCache = new Map<string, CachedView>();
++      (window as any).__viewCache = viewCache;
++      (window as any).viewCache = viewCache;
++
++      function getCacheKey(url: URL | Location): string {
++        return url.pathname + url.search;
++      }
++
++      function getMainContainer(doc: Document = document): HTMLElement | null {
++        return (
++          (doc.getElementById("app-view-container") as HTMLElement | null) ||
++          (doc.querySelector("main.bg-white.relative") as HTMLElement | null) ||
++          (doc.querySelector("main") as HTMLElement | null)
++        );
++      }
++
++      function preserveIslands(root: ParentNode) {
++        const islands = root.querySelectorAll("astro-island");
++        islands.forEach((island) => {
++          (island as any).unmount = () => {};
++          island.addEventListener(
++            "astro:unmount",
++            (e) => {
++              e.stopImmediatePropagation();
++            },
++            { capture: true }
++          );
++        });
++      }
++
++      function syncHeadAndDirectiveScripts(newDocument: Document, newMain: HTMLElement) {
++        document.title = newDocument.title;
++
++        // Append any newly introduced styles or links from newDocument.head without removing existing ones
++        const headElements = newDocument.head.querySelectorAll(
++          "style, link[rel='stylesheet'], script"
++        );
++        headElements.forEach((el) => {
++          const isDuplicate = Array.from(
++            document.head.querySelectorAll(el.tagName)
++          ).some((existing) => existing.isEqualNode(el));
++          if (!isDuplicate) {
++            document.head.appendChild(el.cloneNode(true));
++          }
++        });
++
++        // Ensure any body-level scripts outside <main> (e.g. Astro client directive scripts like client:visible) are preserved
++        const bodyScripts = Array.from(newDocument.body.querySelectorAll("script")).filter(
++          (script) => !newMain.contains(script)
++        );
++        bodyScripts.forEach((script) => {
++          const isDuplicate = Array.from(
++            document.querySelectorAll("script")
++          ).some((existing) => existing.isEqualNode(script));
++          if (!isDuplicate) {
++            newMain.appendChild(script);
++          }
++        });
++      }
++
++      function cacheCurrentView(url: URL | Location = window.location) {
++        const currentMain = getMainContainer(document);
++        if (currentMain) {
++          preserveIslands(currentMain);
++          viewCache.set(getCacheKey(url), {
++            main: currentMain,
++            title: document.title,
++          });
++        }
++      }
++
++      // Cache initial page view on load
++      cacheCurrentView(window.location);
++
++      document.addEventListener("astro:before-preparation", (event: any) => {
++        cacheCurrentView(event.from || window.location);
++
++        const targetKey = getCacheKey(event.to);
++        if (viewCache.has(targetKey) && !event.formData) {
++          // Skip network fetch and DOM parsing when transitioning back to a cached view
++          event.loader = async () => {};
++        }
++      });
++
++      document.addEventListener("astro:before-swap", (event: any) => {
++        const fromKey = getCacheKey(event.from || window.location);
++        const toKey = getCacheKey(event.to);
++
++        event.swap = () => {
++          const currentMain = getMainContainer(document);
++          if (currentMain) {
++            preserveIslands(currentMain);
++            viewCache.set(fromKey, {
++              main: currentMain,
++              title: document.title,
++            });
++          }
++
++          const cached = viewCache.get(toKey);
++          if (cached && !event.formData) {
++            document.title = cached.title;
++            if (currentMain && currentMain !== cached.main) {
++              preserveIslands(cached.main);
++              currentMain.replaceWith(cached.main);
++            }
++            return;
++          }
++
++          if (event.newDocument) {
++            deselectScripts(event.newDocument);
++            swapRootAttributes(event.newDocument);
++
++            const newMain = getMainContainer(event.newDocument);
++            if (currentMain && newMain) {
++              syncHeadAndDirectiveScripts(event.newDocument, newMain);
++              preserveIslands(newMain);
++              currentMain.replaceWith(newMain);
++              viewCache.set(toKey, {
++                main: newMain,
++                title: document.title,
++              });
++            }
++          }
++        };
++      });
++    </script>
+   </body>
+ </html>

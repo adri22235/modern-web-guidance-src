@@ -1,0 +1,109 @@
+diff --git a/docs/inp-monitoring.md b/docs/inp-monitoring.md
+new file mode 100644
+--- a/docs/inp-monitoring.md
++++ b/docs/inp-monitoring.md
+@@ -0,0 +1,104 @@
++# Field INP monitoring
++
++The homepage loads `/js/inp-monitor.js` (async, no dependencies). It measures
++[Interaction to Next Paint](https://web.dev/articles/inp) for real visitors and
++explains *why* slow interactions are slow.
++
++## How it works
++
++| Signal | API | Used for |
++| --- | --- | --- |
++| Interaction latency | Event Timing (`event`, `first-input`) | INP value (98th percentile over the page's interactions), target element, phases |
++| Script & render attribution | Long Animation Frames (`long-animation-frame`) | Which scripts ran, which phase they delayed, style/layout/paint cost |
++
++Each interaction is split into the three INP phases:
++
++- **inputDelay**: from the user's input to the first event handler starting (main thread busy with other work, often timers or third-party tags).
++- **processingDuration**: time spent in event handlers.
++- **presentationDelay**: from the end of the handlers to the next paint (rendering work).
++
++Every script in an overlapping long animation frame is assigned to the phase it
++overlapped most. Frame rendering time is broken down into animation-frame callbacks,
++style & layout (including forced synchronous layout), and paint/composite.
++
++## Configuration
++
++```html
++<script src="/js/inp-monitor.js"
++        data-endpoint="/api/rum/inp"   <!-- POST target for beacons -->
++        data-sample-rate="1"           <!-- 0..1 share of page views reported -->
++        data-slow-threshold="200"      <!-- ms; interactions this slow or slower are sent individually -->
++        async></script>
++```
++
++Debug locally with `?inp-debug` (or `localStorage.inpDebug = "1"`). Every interaction
++is then logged to the console with its phase, script and rendering tables.
++`window.dailyGrindINP.getINP()` returns the current value and its attribution.
++
++## Beacon payload
++
++A beacon is sent with `navigator.sendBeacon` (falling back to `fetch` with `keepalive`)
++when the page is hidden or unloaded, and only if something changed since the last one:
++
++```jsonc
++{
++  "v": 1,
++  "pageId": "lr3x…",              // unique per page view (reset on bfcache restore)
++  "url": "https://…/",
++  "final": true,
++  "sampleRate": 1,
++  "inp": {                        // null if unchanged since last beacon
++    "value": 336, "rating": "needs-improvement", "interactionCount": 3,
++    "interaction": { /* see below */ }
++  },
++  "slowInteractions": [ /* interactions >= slow threshold, max 20 per page */ ],
++  "context": { "navigationType": "navigate", "deviceMemory": 8, "hardwareConcurrency": 8,
++               "effectiveType": "4g", "saveData": false, "viewport": "390x844", "userAgent": "…" }
++}
++```
++
++Interaction object:
++
++```jsonc
++{
++  "type": "pointer", "eventTypes": ["pointerdown", "click"],
++  "target": "header.hero>a.btn", "duration": 336, "loadState": "complete",
++  "attribution": {
++    "phases": { "inputDelay": 35, "processingDuration": 210, "presentationDelay": 91 },
++    "dominantPhase": "processing",
++    "primaryCause": "processing: /js/app.js#onOrderClick (event-listener)",
++    "scriptsByPhase": { "input-delay": 35, "processing": 200, "presentation": 0 },
++    "rendering": {
++      "totalScriptDuration": 235, "forcedStyleAndLayoutDuration": 30,
++      "renderCallbacksDuration": 20, "styleAndLayoutDuration": 40,
++      "paintAndCompositeDuration": 26, "unattributedDuration": 15
++    },
++    "longestScript": { /* same shape as scripts[] */ },
++    "scripts": [{ "phase": "processing", "durationInInteraction": 200,
++                  "sourceURL": "https://…/js/app.js", "sourceFunctionName": "onOrderClick",
++                  "sourceCharPosition": 1234, "invoker": "A.onclick", "invokerType": "event-listener",
++                  "forcedStyleAndLayoutDuration": 30, "thirdParty": false }],
++    "scriptsBySource": [{ "sourceURL": "…", "thirdParty": false, "duration": 200, "count": 1 }],
++    "blockingDuration": 270, "loafCount": 1, "loafSupported": true
++  }
++}
++```
++
++## Suggested dashboard queries
++
++- **p75 INP** of `inp.value` per URL and device class (use one row per `pageId`, keeping the last beacon).
++- **Worst offenders**: group `slowInteractions[].attribution.scriptsBySource[]` by `sourceURL` and sum `duration`; split by `thirdParty`.
++- **Phase mix**: average `phases` per `target` to tell blocked main thread (input delay), heavy handlers (processing) and rendering cost (presentation) apart.
++- **Load-time contention**: share of slow interactions by `loadState`.
++
++## Browser support
++
++Event Timing (with `interactionId`) is available in Chromium and recent Firefox. Long Animation Frames is
++Chromium only (123+). Without it, beacons still contain the phase breakdown, with
++`loafSupported: false`. Browsers without Event Timing (Safari) don't load the monitor.
++
++## Backend
++
++This is a static site, so nothing serves `/api/rum/inp` yet. Point `data-endpoint` at
++your RUM collector, or add a handler that stores the JSON body. Beacons that fail are
++dropped silently.

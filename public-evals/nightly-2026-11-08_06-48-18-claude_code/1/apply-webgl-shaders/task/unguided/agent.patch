@@ -1,0 +1,373 @@
+diff --git a/hero-ripple.js b/hero-ripple.js
+new file mode 100644
+--- a/hero-ripple.js
++++ b/hero-ripple.js
+@@ -0,0 +1,368 @@
++/*
++ * Hero ripple: GPU-accelerated water-ripple distortion of the hero section.
++ *
++ * How it works
++ *  1. The hero's background, heading, tagline and "Order Now" button are
++ *     rasterised into an offscreen 2D canvas, using the live DOM layout
++ *     (per-word rects via Range), so the picture matches the HTML exactly,
++ *     including line wrapping.
++ *  2. That canvas is uploaded as a WebGL texture and drawn through a fragment
++ *     shader that displaces UVs with expanding, decaying ripple rings spawned
++ *     by pointer movement / clicks.
++ *  3. The real HTML stays on top with transparent text, and the WebGL canvas
++ *     has `pointer-events: none`, so text is still selectable, the button is
++ *     still a real clickable/focusable link, and assistive tech is unaffected.
++ *
++ * If WebGL is unavailable, the background image can't be read (CORS), or the
++ * user prefers reduced motion, the plain HTML hero is left untouched.
++ */
++(function () {
++  'use strict';
++
++  var hero = document.getElementById('hero');
++  if (!hero) return;
++  var canvas = hero.querySelector('.hero-gl');
++  if (!canvas) return;
++
++  var reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
++  if (reduceMotion.matches) return;
++
++  var gl = canvas.getContext('webgl', { premultipliedAlpha: false, antialias: false, alpha: false });
++  if (!gl) return;
++
++  var BG_URL = 'https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?auto=format&fit=crop&w=1600&q=80';
++  var MAX_RIPPLES = 16;
++
++  // ---------------------------------------------------------------- shaders
++  var vertSrc = [
++    'attribute vec2 a_pos;',
++    'varying vec2 v_uv;',
++    'void main() {',
++    '  v_uv = a_pos * 0.5 + 0.5;',
++    '  gl_Position = vec4(a_pos, 0.0, 1.0);',
++    '}'
++  ].join('\n');
++
++  var fragSrc = [
++    'precision highp float;',
++    'varying vec2 v_uv;',
++    'uniform sampler2D u_tex;',
++    'uniform vec2 u_res;',
++    'uniform float u_time;',
++    'uniform vec4 u_ripples[' + MAX_RIPPLES + ']; // xy = center (uv), z = start time, w = strength',
++    '',
++    'void main() {',
++    '  float aspect = u_res.x / u_res.y;',
++    '  vec2 p = vec2(v_uv.x * aspect, v_uv.y);',
++    '  vec2 offset = vec2(0.0);',
++    '  float shade = 0.0;',
++    '',
++    '  for (int i = 0; i < ' + MAX_RIPPLES + '; i++) {',
++    '    vec4 r = u_ripples[i];',
++    '    if (r.w <= 0.0) continue;',
++    '    float age = u_time - r.z;',
++    '    if (age < 0.0 || age > 3.0) continue;',
++    '    vec2 c = vec2(r.x * aspect, r.y);',
++    '    vec2 d = p - c;',
++    '    float dist = length(d);',
++    '    float radius = age * 0.45;',
++    '    float ring = dist - radius;',
++    '    float envelope = exp(-ring * ring * 90.0) * exp(-age * 1.6) * r.w;',
++    '    float wave = sin(ring * 55.0) * envelope;',
++    '    vec2 dir = dist > 0.0001 ? d / dist : vec2(0.0);',
++    '    offset += dir * wave * 0.018;',
++    '    shade += cos(ring * 55.0) * envelope;',
++    '  }',
++    '',
++    '  offset.x /= aspect;',
++    '  vec2 uv = clamp(v_uv + offset, 0.0, 1.0);',
++    '',
++    '  // Slight chromatic split along the displacement for a liquid feel.',
++    '  vec2 ca = offset * 0.35;',
++    '  float cr = texture2D(u_tex, uv + ca).r;',
++    '  vec4 base = texture2D(u_tex, uv);',
++    '  float cb = texture2D(u_tex, uv - ca).b;',
++    '  vec3 col = vec3(cr, base.g, cb);',
++    '',
++    '  // Specular-ish highlight on ring crests.',
++    '  col += vec3(1.0, 0.85, 0.6) * max(shade, 0.0) * 0.08;',
++    '  col -= max(-shade, 0.0) * 0.05;',
++    '  gl_FragColor = vec4(col, 1.0);',
++    '}'
++  ].join('\n');
++
++  function compile(type, src) {
++    var sh = gl.createShader(type);
++    gl.shaderSource(sh, src);
++    gl.compileShader(sh);
++    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
++      console.warn('[hero-ripple] shader error:', gl.getShaderInfoLog(sh));
++      return null;
++    }
++    return sh;
++  }
++
++  var vs = compile(gl.VERTEX_SHADER, vertSrc);
++  var fs = compile(gl.FRAGMENT_SHADER, fragSrc);
++  if (!vs || !fs) return;
++  var prog = gl.createProgram();
++  gl.attachShader(prog, vs);
++  gl.attachShader(prog, fs);
++  gl.linkProgram(prog);
++  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
++    console.warn('[hero-ripple] link error:', gl.getProgramInfoLog(prog));
++    return;
++  }
++  gl.useProgram(prog);
++
++  var buf = gl.createBuffer();
++  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
++  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
++  var aPos = gl.getAttribLocation(prog, 'a_pos');
++  gl.enableVertexAttribArray(aPos);
++  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
++
++  var uRes = gl.getUniformLocation(prog, 'u_res');
++  var uTime = gl.getUniformLocation(prog, 'u_time');
++  var uRipples = gl.getUniformLocation(prog, 'u_ripples');
++  gl.uniform1i(gl.getUniformLocation(prog, 'u_tex'), 0);
++
++  var tex = gl.createTexture();
++  gl.bindTexture(gl.TEXTURE_2D, tex);
++  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
++  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
++  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
++  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
++  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
++
++  // ------------------------------------------------------ HTML rasteriser
++  var source = document.createElement('canvas');
++  var ctx = source.getContext('2d');
++  var bgImg = null;
++  var btn = hero.querySelector('.btn');
++  var btnHover = false;
++  var textEls = Array.prototype.slice.call(hero.querySelectorAll('h1, p'));
++  var width = 0, height = 0, dpr = 1;
++
++  function cssVar(name, fallback) {
++    var v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
++    return v || fallback;
++  }
++
++  function fontOf(cs) {
++    return cs.fontStyle + ' ' + cs.fontWeight + ' ' + cs.fontSize + ' ' + cs.fontFamily;
++  }
++
++  // Draw each word of an element's text at its exact laid-out position.
++  function drawTextOf(el, origin, color) {
++    var cs = getComputedStyle(el);
++    ctx.font = fontOf(cs);
++    ctx.fillStyle = color;
++    ctx.textBaseline = 'alphabetic';
++    var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
++    var range = document.createRange();
++    var node;
++    while ((node = walker.nextNode())) {
++      var text = node.nodeValue;
++      var re = /\S+/g, m;
++      while ((m = re.exec(text))) {
++        range.setStart(node, m.index);
++        range.setEnd(node, m.index + m[0].length);
++        var rects = range.getClientRects();
++        if (!rects.length) continue;
++        var r = rects[0];
++        var metrics = ctx.measureText(m[0]);
++        var asc = metrics.fontBoundingBoxAscent || metrics.actualBoundingBoxAscent || r.height * 0.8;
++        var desc = metrics.fontBoundingBoxDescent || metrics.actualBoundingBoxDescent || r.height * 0.2;
++        var y = r.top - origin.top + (r.height - (asc + desc)) / 2 + asc;
++        ctx.fillText(m[0], r.left - origin.left, y);
++      }
++    }
++  }
++
++  function roundRect(x, y, w, h, rad) {
++    ctx.beginPath();
++    ctx.moveTo(x + rad, y);
++    ctx.arcTo(x + w, y, x + w, y + h, rad);
++    ctx.arcTo(x + w, y + h, x, y + h, rad);
++    ctx.arcTo(x, y + h, x, y, rad);
++    ctx.arcTo(x, y, x + w, y, rad);
++    ctx.closePath();
++  }
++
++  function drawCover(img, w, h) {
++    var ir = img.naturalWidth / img.naturalHeight;
++    var cr = w / h;
++    var dw, dh;
++    if (ir > cr) { dh = h; dw = h * ir; } else { dw = w; dh = w / ir; }
++    ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
++  }
++
++  function rasterize() {
++    var origin = hero.getBoundingClientRect();
++    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
++    ctx.clearRect(0, 0, width, height);
++
++    // Background (matches the CSS: cover image + 50% black overlay).
++    ctx.fillStyle = '#1b120f';
++    ctx.fillRect(0, 0, width, height);
++    if (bgImg) drawCover(bgImg, width, height);
++    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
++    ctx.fillRect(0, 0, width, height);
++
++    textEls.forEach(function (el) { drawTextOf(el, origin, '#ffffff'); });
++
++    if (btn) {
++      var b = btn.getBoundingClientRect();
++      var radius = parseFloat(getComputedStyle(btn).borderTopLeftRadius) || 5;
++      ctx.fillStyle = btnHover ? cssVar('--text', '#3e2723') : cssVar('--primary', '#4e342e');
++      roundRect(b.left - origin.left, b.top - origin.top, b.width, b.height, radius);
++      ctx.fill();
++      drawTextOf(btn, origin, '#ffffff');
++    }
++
++    gl.bindTexture(gl.TEXTURE_2D, tex);
++    try {
++      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
++    } catch (e) {
++      // Tainted canvas (image served without CORS) – fall back to plain HTML.
++      disable();
++      return false;
++    }
++    return true;
++  }
++
++  function resize() {
++    var rect = hero.getBoundingClientRect();
++    dpr = Math.min(window.devicePixelRatio || 1, 2);
++    width = Math.max(1, Math.round(rect.width));
++    height = Math.max(1, Math.round(rect.height));
++    var pw = Math.round(width * dpr), ph = Math.round(height * dpr);
++    if (canvas.width !== pw || canvas.height !== ph) {
++      canvas.width = source.width = pw;
++      canvas.height = source.height = ph;
++    }
++    gl.viewport(0, 0, pw, ph);
++    gl.uniform2f(uRes, pw, ph);
++    if (rasterize()) requestFrame();
++  }
++
++  // ---------------------------------------------------------- ripples
++  var ripples = new Float32Array(MAX_RIPPLES * 4);
++  var nextSlot = 0;
++  var start = performance.now();
++  var lastSpawn = 0;
++  var lastRippleTime = -10;
++
++  function now() { return (performance.now() - start) / 1000; }
++
++  function addRipple(clientX, clientY, strength) {
++    var rect = hero.getBoundingClientRect();
++    var x = (clientX - rect.left) / rect.width;
++    var y = 1 - (clientY - rect.top) / rect.height;
++    var t = now();
++    var i = nextSlot * 4;
++    ripples[i] = x;
++    ripples[i + 1] = y;
++    ripples[i + 2] = t;
++    ripples[i + 3] = strength;
++    nextSlot = (nextSlot + 1) % MAX_RIPPLES;
++    lastRippleTime = t;
++    requestFrame();
++  }
++
++  // Listen on the hero itself; the canvas has pointer-events:none, so these
++  // events come from the real HTML and never block selection or clicks.
++  hero.addEventListener('pointermove', function (e) {
++    var t = performance.now();
++    if (t - lastSpawn < 70) return;
++    lastSpawn = t;
++    addRipple(e.clientX, e.clientY, e.pointerType === 'touch' ? 0.8 : 0.55);
++  }, { passive: true });
++
++  hero.addEventListener('pointerdown', function (e) {
++    addRipple(e.clientX, e.clientY, 1.6);
++  }, { passive: true });
++
++  if (btn) {
++    var setHover = function (v) {
++      if (btnHover === v) return;
++      btnHover = v;
++      if (active && rasterize()) requestFrame();
++    };
++    btn.addEventListener('pointerenter', function () { setHover(true); });
++    btn.addEventListener('pointerleave', function () { setHover(false); });
++    btn.addEventListener('focus', function () {
++      var b = btn.getBoundingClientRect();
++      addRipple(b.left + b.width / 2, b.top + b.height / 2, 1.0);
++    });
++  }
++
++  // ------------------------------------------------------- render loop
++  var rafId = 0;
++  var visible = true;
++  var active = false;
++
++  function render() {
++    rafId = 0;
++    if (!active) return;
++    var t = now();
++    gl.uniform1f(uTime, t);
++    gl.uniform4fv(uRipples, ripples);
++    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
++    // Keep animating only while ripples are alive; idle = zero GPU work.
++    if (visible && t - lastRippleTime < 3.0) rafId = requestAnimationFrame(render);
++  }
++
++  function requestFrame() {
++    if (!rafId && active) rafId = requestAnimationFrame(render);
++  }
++
++  if ('IntersectionObserver' in window) {
++    new IntersectionObserver(function (entries) {
++      visible = entries[0].isIntersecting;
++      if (visible) requestFrame();
++    }).observe(hero);
++  }
++
++  function disable() {
++    active = false;
++    hero.classList.remove('hero--gl');
++  }
++
++  canvas.addEventListener('webglcontextlost', function (e) {
++    e.preventDefault();
++    disable();
++  });
++
++  reduceMotion.addEventListener && reduceMotion.addEventListener('change', function (e) {
++    if (e.matches) disable();
++  });
++
++  // ------------------------------------------------------------- boot
++  function boot() {
++    active = true;
++    resize();
++    if (!active) return;
++    hero.classList.add('hero--gl');
++    // Gentle welcome ripple from the centre.
++    var r = hero.getBoundingClientRect();
++    addRipple(r.left + r.width / 2, r.top + r.height / 2, 1.0);
++
++    if ('ResizeObserver' in window) {
++      new ResizeObserver(function () { if (active) resize(); }).observe(hero);
++    } else {
++      window.addEventListener('resize', function () { if (active) resize(); });
++    }
++  }
++
++  var img = new Image();
++  img.crossOrigin = 'anonymous';
++  img.decoding = 'async';
++  img.onload = function () {
++    bgImg = img;
++    (document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve()).then(boot);
++  };
++  img.onerror = function () { /* keep the plain HTML hero */ };
++  img.src = BG_URL;
++})();

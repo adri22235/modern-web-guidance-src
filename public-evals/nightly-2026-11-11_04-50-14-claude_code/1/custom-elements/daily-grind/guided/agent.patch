@@ -1,0 +1,309 @@
+diff --git a/coffee-card.js b/coffee-card.js
+new file mode 100644
+index 0000000..2e975d7
+--- /dev/null
++++ b/coffee-card.js
+@@ -0,0 +1,233 @@
++/**
++ * <coffee-card> — an autonomous custom element for a menu item.
++ *
++ * Attributes (all reflected to same-named properties):
++ *   name      string   Drink name shown as the card heading.
++ *   href      string   Link target for the "View Details" button.
++ *   price     number   Price in USD; omitted/invalid hides the price.
++ *   featured  boolean  Shows a "Seasonal" badge.
++ *   sold-out  boolean  (prop: soldOut) Dims the card and disables the link.
++ *   favorite  boolean  Toggled by the heart button; fires `favorite-change`.
++ *
++ * The description is supplied as light-DOM children (default slot).
++ */
++
++const sheet = new CSSStyleSheet();
++sheet.replaceSync(`
++  :host {
++    display: block;
++    position: relative;
++    background: white;
++    padding: 20px;
++    border-radius: 8px;
++    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++    text-align: center;
++    transition: opacity 0.3s, box-shadow 0.3s;
++  }
++  :host([hidden]) { display: none; }
++  :host([featured]) { box-shadow: 0 0 0 2px var(--accent, #ffab40), 0 2px 5px rgba(0, 0, 0, 0.1); }
++  :host([sold-out]) { opacity: 0.6; }
++
++  h3 { margin: 0 0 10px; color: var(--primary, #4e342e); }
++
++  .badge {
++    position: absolute;
++    top: 10px;
++    left: 10px;
++    background: var(--accent, #ffab40);
++    color: var(--text, #3e2723);
++    font-size: 0.7rem;
++    font-weight: bold;
++    text-transform: uppercase;
++    letter-spacing: 0.5px;
++    padding: 2px 8px;
++    border-radius: 999px;
++  }
++  .badge[hidden], .price[hidden], .sold-out[hidden] { display: none; }
++
++  .price { font-weight: bold; color: var(--primary, #4e342e); margin: 0 0 8px; }
++  .sold-out { color: #b71c1c; font-weight: bold; margin: 8px 0 0; }
++
++  .fav {
++    position: absolute;
++    top: 6px;
++    right: 6px;
++    border: none;
++    background: none;
++    font-size: 1.4rem;
++    line-height: 1;
++    padding: 4px;
++    cursor: pointer;
++    color: var(--primary, #4e342e);
++    border-radius: 4px;
++  }
++  .fav[aria-pressed="true"] { color: #d84315; }
++  .fav:focus-visible { outline: 2px solid var(--accent, #ffab40); outline-offset: 2px; }
++
++  .btn {
++    display: inline-block;
++    background: var(--primary, #4e342e);
++    color: white;
++    padding: 10px 20px;
++    text-decoration: none;
++    border-radius: 5px;
++    margin-top: 15px;
++    transition: background 0.3s;
++  }
++  .btn:hover { background: #3e2723; }
++  .btn[aria-disabled="true"] { pointer-events: none; background: #9e9e9e; }
++`);
++
++const template = document.createElement('template');
++template.innerHTML = `
++  <span class="badge" part="badge" hidden>Seasonal</span>
++  <button class="fav" part="favorite" type="button" aria-pressed="false">♡</button>
++  <h3 part="name"></h3>
++  <p class="price" part="price" hidden></p>
++  <slot></slot>
++  <p class="sold-out" hidden>Sold out today</p>
++  <a class="btn" part="link">View Details</a>
++`;
++
++const currency = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
++
++export class CoffeeCard extends HTMLElement {
++  static observedAttributes = ['name', 'href', 'price', 'featured', 'sold-out', 'favorite'];
++
++  #els;
++  #abort = null;
++
++  constructor() {
++    super();
++    const root = this.attachShadow({ mode: 'open' });
++    root.adoptedStyleSheets = [sheet];
++    root.append(template.content.cloneNode(true));
++    this.#els = {
++      badge: root.querySelector('.badge'),
++      fav: root.querySelector('.fav'),
++      name: root.querySelector('h3'),
++      price: root.querySelector('.price'),
++      soldOut: root.querySelector('.sold-out'),
++      link: root.querySelector('.btn'),
++    };
++  }
++
++  // ---- String attributes ----
++  get name() { return this.getAttribute('name') ?? ''; }
++  set name(v) { v ? this.setAttribute('name', String(v)) : this.removeAttribute('name'); }
++
++  get href() { return this.getAttribute('href') ?? ''; }
++  set href(v) { v ? this.setAttribute('href', String(v)) : this.removeAttribute('href'); }
++
++  // ---- Numeric attribute ----
++  get price() {
++    const raw = this.getAttribute('price');
++    const n = raw === null || raw.trim() === '' ? NaN : Number(raw);
++    return Number.isFinite(n) && n >= 0 ? n : null;
++  }
++  set price(v) {
++    const n = v === null || v === undefined || v === '' ? NaN : Number(v);
++    Number.isFinite(n) ? this.setAttribute('price', String(n)) : this.removeAttribute('price');
++  }
++
++  // ---- Boolean attributes (presence = true; never "false") ----
++  get featured() { return this.hasAttribute('featured'); }
++  set featured(on) { this.toggleAttribute('featured', Boolean(on)); }
++
++  get soldOut() { return this.hasAttribute('sold-out'); }
++  set soldOut(on) { this.toggleAttribute('sold-out', Boolean(on)); }
++
++  get favorite() { return this.hasAttribute('favorite'); }
++  set favorite(on) { this.toggleAttribute('favorite', Boolean(on)); }
++
++  toggleFavorite(force) {
++    this.favorite = force ?? !this.favorite;
++    this.dispatchEvent(new CustomEvent('favorite-change', {
++      bubbles: true,
++      composed: true,
++      detail: { name: this.name, favorite: this.favorite },
++    }));
++  }
++
++  // ---- Lifecycle ----
++
++  // May run multiple times (each insertion), so setup is idempotent.
++  connectedCallback() {
++    // Handle properties assigned before upgrade so they go through our setters.
++    for (const prop of ['name', 'href', 'price', 'featured', 'soldOut', 'favorite']) {
++      this.#upgradeProperty(prop);
++    }
++    if (!this.#abort) {
++      this.#abort = new AbortController();
++      this.#els.fav.addEventListener('click', () => this.toggleFavorite(), { signal: this.#abort.signal });
++    }
++    this.#render();
++  }
++
++  // Tear down listeners; the element may be re-inserted later.
++  disconnectedCallback() {
++    this.#abort?.abort();
++    this.#abort = null;
++  }
++
++  // Moved via Node.moveBefore(): keep listeners/state, skip teardown + setup.
++  connectedMoveCallback() {}
++
++  adoptedCallback() {
++    this.#render();
++  }
++
++  attributeChangedCallback(name, oldVal, newVal) {
++    if (oldVal === newVal) return;
++    this.#render(name);
++  }
++
++  // ---- Internals ----
++
++  #upgradeProperty(prop) {
++    if (Object.hasOwn(this, prop)) {
++      const value = this[prop];
++      delete this[prop];
++      this[prop] = value;
++    }
++  }
++
++  #render(changed) {
++    const els = this.#els;
++    const all = changed === undefined;
++
++    if (all || changed === 'name') {
++      els.name.textContent = this.name;
++      els.fav.setAttribute('aria-label', `Favorite ${this.name}`.trim());
++    }
++    if (all || changed === 'price') {
++      const price = this.price;
++      els.price.hidden = price === null;
++      els.price.textContent = price === null ? '' : currency.format(price);
++    }
++    if (all || changed === 'featured') {
++      els.badge.hidden = !this.featured;
++    }
++    if (all || changed === 'favorite') {
++      const on = this.favorite;
++      els.fav.setAttribute('aria-pressed', String(on));
++      els.fav.textContent = on ? '♥' : '♡';
++    }
++    if (all || changed === 'href' || changed === 'sold-out' || changed === 'name') {
++      const soldOut = this.soldOut;
++      els.soldOut.hidden = !soldOut;
++      if (soldOut || !this.href) {
++        els.link.removeAttribute('href');
++        els.link.setAttribute('aria-disabled', 'true');
++      } else {
++        els.link.href = this.href;
++        els.link.removeAttribute('aria-disabled');
++      }
++      els.link.setAttribute('aria-label', `View details for ${this.name}`.trim());
++    }
++  }
++}
++
++if (!customElements.get('coffee-card')) {
++  customElements.define('coffee-card', CoffeeCard);
++}
+diff --git a/index.html b/index.html
+index 66c9173..a375cff 100644
+--- a/index.html
++++ b/index.html
+@@ -107,17 +107,17 @@
+       margin-top: 20px;
+     }
+ 
+-    .card {
+-      background: white;
+-      padding: 20px;
+-      border-radius: 8px;
+-      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+-      text-align: center;
++    /* Fail open: hide un-upgraded cards briefly, reveal anyway if the script never loads. */
++    coffee-card:not(:defined) {
++      display: block;
++      opacity: 0;
++      animation: defined-fallback 0.2s 2s forwards;
+     }
+ 
+-    .card h3 {
+-      margin-bottom: 10px;
+-      color: var(--primary);
++    @keyframes defined-fallback {
++      to {
++        opacity: 1;
++      }
+     }
+ 
+     .btn {
+@@ -153,6 +153,7 @@
+       font-size: 0.85rem;
+     }
+   </style>
++  <script type="module" src="/coffee-card.js"></script>
+ </head>
+ 
+ <body>
+@@ -178,21 +179,15 @@
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+       <div class="grid">
+-        <div class="card">
+-          <h3>Maple Oat Latte</h3>
+-          <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+-          <a href="/menu/seasonal" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Dark Roast Espresso</h3>
+-          <p>Bold, smokey, and perfect for a morning boost.</p>
+-          <a href="/menu/espresso" class="btn">View Details</a>
+-        </div>
+-        <div class="card">
+-          <h3>Cold Brew</h3>
+-          <p>Steeped for 18 hours for maximum smoothness.</p>
+-          <a href="/menu/cold-brew" class="btn">View Details</a>
+-        </div>
++        <coffee-card name="Maple Oat Latte" price="5.75" href="/menu/seasonal" featured>
++          Creamy oat milk with a hint of Vermont maple syrup.
++        </coffee-card>
++        <coffee-card name="Dark Roast Espresso" price="3.25" href="/menu/espresso">
++          Bold, smokey, and perfect for a morning boost.
++        </coffee-card>
++        <coffee-card name="Cold Brew" price="4.50" href="/menu/cold-brew">
++          Steeped for 18 hours for maximum smoothness.
++        </coffee-card>
+       </div>
+     </section>
+   </main>

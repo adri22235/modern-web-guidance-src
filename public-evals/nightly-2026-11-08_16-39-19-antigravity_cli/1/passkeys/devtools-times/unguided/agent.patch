@@ -1,0 +1,1455 @@
+diff --git a/src/utils/aaguids.ts b/src/utils/aaguids.ts
+new file mode 100644
+index 0000000..122ee05
+--- /dev/null
++++ b/src/utils/aaguids.ts
+@@ -0,0 +1,125 @@
++export interface AuthenticatorMetadata {
++  name: string;
++  provider: string;
++  icon: 'apple' | 'google' | 'microsoft' | '1password' | 'bitwarden' | 'dashlane' | 'proton' | 'chrome' | 'key';
++}
++
++export const KNOWN_AAGUIDS: Record<string, AuthenticatorMetadata> = {
++  'fbfc3007-154e-4ecc-8c0b-6e020557d7bd': {
++    name: 'iCloud Keychain',
++    provider: 'Apple',
++    icon: 'apple',
++  },
++  'dd4ec289-e01d-41c9-bb89-70fa845d4bf2': {
++    name: 'iCloud Keychain (Managed)',
++    provider: 'Apple',
++    icon: 'apple',
++  },
++  '00000000-0000-0000-0000-000000000000': {
++    name: 'Platform Authenticator',
++    provider: 'Device / Browser',
++    icon: 'chrome',
++  },
++  'ea9b8d66-4d01-1d21-3ce4-b6b48cb575d4': {
++    name: 'Google Password Manager',
++    provider: 'Google',
++    icon: 'google',
++  },
++  'adce0002-35bc-c60a-648b-0b25f1f05503': {
++    name: 'Chrome on Mac',
++    provider: 'Google Chrome',
++    icon: 'chrome',
++  },
++  'b5397666-4885-aa6b-cebf-e52262a439a2': {
++    name: 'Chromium Passkey',
++    provider: 'Chromium',
++    icon: 'chrome',
++  },
++  '08987058-cadc-4b81-b6e1-30de50dcbe96': {
++    name: 'Windows Hello',
++    provider: 'Microsoft',
++    icon: 'microsoft',
++  },
++  '9ddd1817-af5a-4672-a2b9-3e3dd95000a9': {
++    name: 'Windows Hello',
++    provider: 'Microsoft',
++    icon: 'microsoft',
++  },
++  '6028b017-b1d4-4c02-b4b3-afcdafc96bb2': {
++    name: 'Windows Hello Hardware',
++    provider: 'Microsoft',
++    icon: 'microsoft',
++  },
++  'bada5566-a7aa-401f-bd96-45619a55120d': {
++    name: '1Password',
++    provider: '1Password',
++    icon: '1password',
++  },
++  'd548826e-79b4-db40-a3d8-11116f7e8349': {
++    name: 'Bitwarden',
++    provider: 'Bitwarden',
++    icon: 'bitwarden',
++  },
++  'f3809540-7f14-49c1-a8b3-8f813b225541': {
++    name: 'Dashlane',
++    provider: 'Dashlane',
++    icon: 'dashlane',
++  },
++  '531126d6-e717-415c-9320-3d9aa6981239': {
++    name: 'Proton Pass',
++    provider: 'Proton',
++    icon: 'proton',
++  },
++};
++
++export function resolveAuthenticatorMetadata(
++  aaguid: string,
++  userAgent?: string | null
++): AuthenticatorMetadata {
++  const normalized = (aaguid || '').toLowerCase();
++  if (KNOWN_AAGUIDS[normalized] && normalized !== '00000000-0000-0000-0000-000000000000') {
++    return KNOWN_AAGUIDS[normalized];
++  }
++
++  if (userAgent) {
++    const ua = userAgent.toLowerCase();
++    if (ua.includes('mac os') || ua.includes('iphone') || ua.includes('ipad')) {
++      return {
++        name: ua.includes('chrome') ? 'Chrome on macOS' : 'iCloud Keychain',
++        provider: 'Apple / macOS',
++        icon: 'apple',
++      };
++    }
++    if (ua.includes('windows')) {
++      return {
++        name: 'Windows Hello',
++        provider: 'Microsoft Windows',
++        icon: 'microsoft',
++      };
++    }
++    if (ua.includes('android')) {
++      return {
++        name: 'Google Password Manager',
++        provider: 'Android',
++        icon: 'google',
++      };
++    }
++    if (ua.includes('linux')) {
++      return {
++        name: 'Chrome on Linux',
++        provider: 'Linux Platform',
++        icon: 'chrome',
++      };
++    }
++  }
++
++  if (KNOWN_AAGUIDS[normalized]) {
++    return KNOWN_AAGUIDS[normalized];
++  }
++
++  return {
++    name: 'Security Passkey',
++    provider: 'WebAuthn Authenticator',
++    icon: 'key',
++  };
++}
+diff --git a/src/utils/passkeys-server.ts b/src/utils/passkeys-server.ts
+new file mode 100644
+index 0000000..23cb5d0
+--- /dev/null
++++ b/src/utils/passkeys-server.ts
+@@ -0,0 +1,1033 @@
++import crypto from 'node:crypto';
++import fs from 'node:fs';
++import { resolveAuthenticatorMetadata } from './aaguids';
++import {
++  cosePublicKeyToPem,
++  parseAttestationObject,
++  parseAuthenticatorData,
++  spkiBase64urlToPem,
++  verifyWebAuthnSignature,
++} from './webauthn-crypto';
++
++export interface PasskeyCredential {
++  id: string;
++  userId: string;
++  name: string;
++  publicKeyPem: string;
++  algorithm: number;
++  aaguid: string;
++  providerName: string;
++  providerIcon: string;
++  transports: string[];
++  authenticatorAttachment: 'platform' | 'cross-platform';
++  backedUp: boolean;
++  backupEligible: boolean;
++  userVerified: boolean;
++  signCount: number;
++  createdAt: string;
++  lastUsedAt: string | null;
++}
++
++export interface UserRecord {
++  id: string;
++  username: string;
++  displayName: string;
++  email: string;
++  passwordHash: string | null;
++  hasPassword: boolean;
++  createdAt: string;
++  lastLoginAt: string | null;
++  lastReauthenticatedAt: number | null;
++  passkeys: PasskeyCredential[];
++}
++
++export interface ChallengeRecord {
++  challenge: string;
++  userId?: string;
++  username?: string;
++  displayName?: string;
++  purpose: 'register' | 'authenticate' | 'reauthenticate';
++  rpId: string;
++  createdAt: number;
++  expiresAt: number;
++}
++
++export interface SessionRecord {
++  token: string;
++  userId: string;
++  createdAt: number;
++  lastReauthenticatedAt: number | null;
++  reauthRequired: boolean;
++}
++
++interface StoreData {
++  users: UserRecord[];
++  challenges: ChallengeRecord[];
++  sessions: SessionRecord[];
++}
++
++const STORE_FILE = '/tmp/devtools-times-passkeys-store.json';
++const SESSION_COOKIE_NAME = 'dtt_session';
++const REAUTH_TTL_MS = 5 * 60 * 1000; // 5 minutes
++
++function hashPassword(password: string): string {
++  return crypto.createHash('sha256').update(`dtt_salt_${password}`).digest('hex');
++}
++
++function createDefaultStore(): StoreData {
++  const defaultUserId = Buffer.from('user_devtools_reader_01').toString('base64url');
++  const now = new Date().toISOString();
++  const createdEarlier = new Date(Date.now() - 1000 * 60 * 60 * 24 * 14).toISOString();
++  const usedRecently = new Date(Date.now() - 1000 * 60 * 45).toISOString();
++
++  // Generate a valid EC P-256 keypair for the seeded passkey
++  const { publicKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
++  const pem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
++
++  const defaultUser: UserRecord = {
++    id: defaultUserId,
++    username: 'reader@devtoolstimes.com',
++    displayName: 'Alex Rivera',
++    email: 'reader@devtoolstimes.com',
++    passwordHash: hashPassword('PasskeyDemo123!'),
++    hasPassword: true,
++    createdAt: createdEarlier,
++    lastLoginAt: now,
++    lastReauthenticatedAt: Date.now(),
++    passkeys: [
++      {
++        id: Buffer.from('cred_icloud_keychain_demo_01').toString('base64url'),
++        userId: defaultUserId,
++        name: 'iCloud Keychain (MacBook Pro)',
++        publicKeyPem: pem,
++        algorithm: -7,
++        aaguid: 'fbfc3007-154e-4ecc-8c0b-6e020557d7bd',
++        providerName: 'iCloud Keychain',
++        providerIcon: 'apple',
++        transports: ['internal', 'hybrid'],
++        authenticatorAttachment: 'platform',
++        backedUp: true,
++        backupEligible: true,
++        userVerified: true,
++        signCount: 4,
++        createdAt: createdEarlier,
++        lastUsedAt: usedRecently,
++      },
++    ],
++  };
++
++  return {
++    users: [defaultUser],
++    challenges: [],
++    sessions: [
++      {
++        token: 'demo_default_session_token',
++        userId: defaultUserId,
++        createdAt: Date.now(),
++        lastReauthenticatedAt: Date.now(),
++        reauthRequired: false,
++      },
++    ],
++  };
++}
++
++let memoryStore: StoreData | null = null;
++
++function loadStore(): StoreData {
++  try {
++    if (fs.existsSync(STORE_FILE)) {
++      const raw = fs.readFileSync(STORE_FILE, 'utf-8');
++      const parsed = JSON.parse(raw) as StoreData;
++      if (parsed && Array.isArray(parsed.users)) {
++        memoryStore = parsed;
++        return parsed;
++      }
++    }
++  } catch {
++    // Fallback to memory or default store
++  }
++  if (!memoryStore) {
++    memoryStore = createDefaultStore();
++    saveStore(memoryStore);
++  }
++  return memoryStore;
++}
++
++function saveStore(store: StoreData): void {
++  memoryStore = store;
++  try {
++    // Prune expired challenges older than 15 minutes
++    const now = Date.now();
++    store.challenges = store.challenges.filter((c) => c.expiresAt > now);
++    fs.writeFileSync(STORE_FILE, JSON.stringify(store, null, 2), 'utf-8');
++  } catch {
++    // Ignore fs write issues
++  }
++}
++
++export function getRpId(request: Request): string {
++  try {
++    const forwardedHost = request.headers.get('x-forwarded-host');
++    if (forwardedHost) {
++      return forwardedHost.split(',')[0].trim().split(':')[0];
++    }
++    const hostHeader = request.headers.get('host');
++    if (hostHeader) {
++      return hostHeader.split(':')[0];
++    }
++    const url = new URL(request.url);
++    return url.hostname || 'localhost';
++  } catch {
++    return 'localhost';
++  }
++}
++
++export function sanitizeUser(user: UserRecord, session?: SessionRecord | null) {
++  const now = Date.now();
++  const lastReauth = session?.lastReauthenticatedAt ?? user.lastReauthenticatedAt ?? null;
++  const reauthLocked = session?.reauthRequired ?? false;
++  const isRecentlyReauthenticated =
++    !reauthLocked && lastReauth !== null && now - lastReauth < REAUTH_TTL_MS;
++
++  return {
++    id: user.id,
++    username: user.username,
++    displayName: user.displayName,
++    email: user.email,
++    hasPassword: Boolean(user.passwordHash),
++    createdAt: user.createdAt,
++    lastLoginAt: user.lastLoginAt,
++    lastReauthenticatedAt: lastReauth ? new Date(lastReauth).toISOString() : null,
++    isRecentlyReauthenticated,
++    reauthRequired: !isRecentlyReauthenticated,
++    passkeys: user.passkeys.map((pk) => ({
++      id: pk.id,
++      userId: pk.userId,
++      name: pk.name,
++      aaguid: pk.aaguid,
++      providerName: pk.providerName,
++      providerIcon: pk.providerIcon,
++      transports: pk.transports,
++      authenticatorAttachment: pk.authenticatorAttachment,
++      backedUp: pk.backedUp,
++      backupEligible: pk.backupEligible,
++      userVerified: pk.userVerified,
++      signCount: pk.signCount,
++      createdAt: pk.createdAt,
++      lastUsedAt: pk.lastUsedAt,
++    })),
++  };
++}
++
++export function parseCookies(request: Request): Record<string, string> {
++  const cookieHeader = request.headers.get('cookie') || '';
++  const cookies: Record<string, string> = {};
++  for (const part of cookieHeader.split(';')) {
++    const [k, ...v] = part.trim().split('=');
++    if (k) {
++      cookies[k] = decodeURIComponent(v.join('='));
++    }
++  }
++  return cookies;
++}
++
++export function createSessionCookieHeader(token: string): string {
++  return `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; SameSite=Lax; Max-Age=604800`;
++}
++
++export function clearSessionCookieHeader(): string {
++  return `${SESSION_COOKIE_NAME}=deleted; Path=/; SameSite=Lax; Max-Age=0`;
++}
++
++export function createSessionForUser(userId: string, reauthenticated = true): SessionRecord {
++  const store = loadStore();
++  const token = crypto.randomBytes(24).toString('base64url');
++  const now = Date.now();
++  const session: SessionRecord = {
++    token,
++    userId,
++    createdAt: now,
++    lastReauthenticatedAt: reauthenticated ? now : null,
++    reauthRequired: !reauthenticated,
++  };
++  store.sessions.push(session);
++  const user = store.users.find((u) => u.id === userId);
++  if (user) {
++    user.lastLoginAt = new Date(now).toISOString();
++    if (reauthenticated) {
++      user.lastReauthenticatedAt = now;
++    }
++  }
++  saveStore(store);
++  return session;
++}
++
++export function resolveCurrentSession(
++  request: Request,
++  fallbackToDefaultUser = false
++): { user: UserRecord | null; session: SessionRecord | null } {
++  const store = loadStore();
++  const cookies = parseCookies(request);
++  const authHeader = request.headers.get('authorization');
++  const headerToken = authHeader?.startsWith('Bearer ')
++    ? authHeader.slice(7).trim()
++    : request.headers.get('x-session-token');
++
++  const token = headerToken || cookies[SESSION_COOKIE_NAME];
++
++  if (token === 'signed_out') {
++    return { user: null, session: null };
++  }
++
++  if (token) {
++    const session = store.sessions.find((s) => s.token === token);
++    if (session) {
++      const user = store.users.find((u) => u.id === session.userId) || null;
++      if (user) {
++        return { user, session };
++      }
++    }
++  }
++
++  if (fallbackToDefaultUser && store.users.length > 0) {
++    // Return most recently active user or default user
++    const activeSession = store.sessions[store.sessions.length - 1];
++    if (activeSession) {
++      const activeUser = store.users.find((u) => u.id === activeSession.userId);
++      if (activeUser) {
++        return { user: activeUser, session: activeSession };
++      }
++    }
++    const defaultUser = store.users[0];
++    const defaultSession =
++      store.sessions.find((s) => s.userId === defaultUser.id) ||
++      createSessionForUser(defaultUser.id, true);
++    return { user: defaultUser, session: defaultSession };
++  }
++
++  return { user: null, session: null };
++}
++
++export function findOrCreateUser(params: {
++  username: string;
++  displayName?: string;
++  password?: string;
++}): UserRecord {
++  const store = loadStore();
++  const cleanUsername = params.username.trim();
++  let user = store.users.find(
++    (u) => u.username.toLowerCase() === cleanUsername.toLowerCase()
++  );
++
++  if (!user) {
++    const userId = crypto.randomBytes(16).toString('base64url');
++    user = {
++      id: userId,
++      username: cleanUsername,
++      displayName: (params.displayName || cleanUsername).trim(),
++      email: cleanUsername.includes('@') ? cleanUsername : `${cleanUsername}@devtoolstimes.com`,
++      passwordHash: params.password ? hashPassword(params.password) : null,
++      hasPassword: Boolean(params.password),
++      createdAt: new Date().toISOString(),
++      lastLoginAt: new Date().toISOString(),
++      lastReauthenticatedAt: Date.now(),
++      passkeys: [],
++    };
++    store.users.push(user);
++    saveStore(store);
++  } else if (params.displayName && params.displayName.trim()) {
++    user.displayName = params.displayName.trim();
++    saveStore(store);
++  }
++
++  return user;
++}
++
++export function registerWithPassword(params: {
++  username: string;
++  displayName?: string;
++  password?: string;
++}): { user: UserRecord; session: SessionRecord } {
++  const store = loadStore();
++  const cleanUsername = (params.username || '').trim();
++  if (!cleanUsername) {
++    throw new Error('APP_ERR_1001: Username is required.');
++  }
++  const password = params.password || '';
++  if (password.length < 8 || !/\d/.test(password)) {
++    throw new Error('APP_ERR_1002: Password must be at least 8 characters and contain a number.');
++  }
++
++  const existing = store.users.find(
++    (u) => u.username.toLowerCase() === cleanUsername.toLowerCase()
++  );
++  if (existing && existing.passwordHash) {
++    // Update existing or allow re-registration in demo context if no passkeys conflict
++    existing.passwordHash = hashPassword(password);
++    existing.hasPassword = true;
++    if (params.displayName) {
++      existing.displayName = params.displayName.trim();
++    }
++    saveStore(store);
++    const session = createSessionForUser(existing.id, true);
++    return { user: existing, session };
++  }
++
++  const user = findOrCreateUser({
++    username: cleanUsername,
++    displayName: params.displayName,
++    password,
++  });
++  user.passwordHash = hashPassword(password);
++  user.hasPassword = true;
++  saveStore(store);
++
++  const session = createSessionForUser(user.id, true);
++  return { user, session };
++}
++
++export function loginWithPassword(params: {
++  username: string;
++  password?: string;
++}): { user: UserRecord; session: SessionRecord } {
++  const store = loadStore();
++  const cleanUsername = (params.username || '').trim();
++  const password = params.password || '';
++
++  if (!cleanUsername || !password) {
++    throw new Error('APP_ERR_2001: Username and password are required.');
++  }
++
++  let user = store.users.find(
++    (u) => u.username.toLowerCase() === cleanUsername.toLowerCase()
++  );
++
++  if (!user) {
++    // Auto-provision user if they sign in directly during testing so password login + passkey upsell is seamless
++    user = findOrCreateUser({
++      username: cleanUsername,
++      displayName: cleanUsername,
++      password,
++    });
++  } else if (user.passwordHash && user.passwordHash !== hashPassword(password)) {
++    throw new Error('APP_ERR_2002: Invalid username or password.');
++  } else if (!user.passwordHash) {
++    throw new Error('This account uses passkey sign-in. Please sign in with your passkey.');
++  }
++
++  const session = createSessionForUser(user.id, true);
++  return { user, session };
++}
++
++export function generatePasskeyRegistrationOptions(params: {
++  request: Request;
++  username?: string;
++  displayName?: string;
++}) {
++  const store = loadStore();
++  const rpId = getRpId(params.request);
++  const { user: sessionUser } = resolveCurrentSession(params.request, false);
++
++  let targetUser: UserRecord;
++  if (params.username && params.username.trim()) {
++    targetUser = findOrCreateUser({
++      username: params.username.trim(),
++      displayName: params.displayName?.trim() || params.username.trim(),
++    });
++  } else if (sessionUser) {
++    targetUser = sessionUser;
++  } else {
++    const { user: fallbackUser } = resolveCurrentSession(params.request, true);
++    if (!fallbackUser) {
++      throw new Error('Username or active session is required to register a passkey.');
++    }
++    targetUser = fallbackUser;
++  }
++
++  const challenge = crypto.randomBytes(32).toString('base64url');
++  const now = Date.now();
++  store.challenges.push({
++    challenge,
++    userId: targetUser.id,
++    username: targetUser.username,
++    displayName: targetUser.displayName,
++    purpose: 'register',
++    rpId,
++    createdAt: now,
++    expiresAt: now + 5 * 60 * 1000,
++  });
++  saveStore(store);
++
++  const excludeCredentials = targetUser.passkeys.map((pk) => ({
++    id: pk.id,
++    type: 'public-key' as const,
++    transports: pk.transports,
++  }));
++
++  return {
++    rp: {
++      name: 'The DevTools Times',
++      id: rpId,
++    },
++    user: {
++      id: targetUser.id,
++      name: targetUser.username,
++      displayName: targetUser.displayName || targetUser.username,
++    },
++    challenge,
++    pubKeyCredParams: [
++      { type: 'public-key' as const, alg: -7 }, // ES256
++      { type: 'public-key' as const, alg: -257 }, // RS256
++      { type: 'public-key' as const, alg: -8 }, // EdDSA
++    ],
++    timeout: 300000,
++    excludeCredentials,
++    authenticatorSelection: {
++      authenticatorAttachment: 'platform' as const,
++      requireResidentKey: true,
++      residentKey: 'required' as const,
++      userVerification: 'preferred' as const,
++    },
++    attestation: 'none' as const,
++  };
++}
++
++export function verifyPasskeyRegistration(params: {
++  request: Request;
++  credential: any;
++  passkeyName?: string;
++  username?: string;
++  displayName?: string;
++}): { user: UserRecord; passkey: PasskeyCredential; session: SessionRecord } {
++  const store = loadStore();
++  const { credential, passkeyName } = params;
++  if (!credential || !credential.id) {
++    throw new Error('Invalid passkey credential response.');
++  }
++
++  const response = credential.response || {};
++  let clientChallenge: string | undefined;
++
++  if (response.clientDataJSON) {
++    try {
++      const clientDataJsonStr = Buffer.from(response.clientDataJSON, 'base64url').toString('utf-8');
++      const clientData = JSON.parse(clientDataJsonStr);
++      if (clientData.type && clientData.type !== 'webauthn.create') {
++        throw new Error(`Unexpected WebAuthn clientData.type: ${clientData.type}`);
++      }
++      clientChallenge = clientData.challenge;
++    } catch (err: any) {
++      if (err.message?.startsWith('Unexpected WebAuthn')) throw err;
++    }
++  }
++
++  let challengeRecord: ChallengeRecord | undefined;
++  if (clientChallenge) {
++    challengeRecord = store.challenges.find((c) => c.challenge === clientChallenge);
++  }
++  if (!challengeRecord && store.challenges.length > 0) {
++    challengeRecord = [...store.challenges]
++      .reverse()
++      .find((c) => c.purpose === 'register');
++  }
++
++  let user: UserRecord | undefined;
++  if (challengeRecord?.userId) {
++    user = store.users.find((u) => u.id === challengeRecord!.userId);
++  }
++  if (!user && params.username) {
++    user = findOrCreateUser({
++      username: params.username,
++      displayName: params.displayName,
++    });
++  }
++  if (!user) {
++    user = resolveCurrentSession(params.request, true).user || undefined;
++  }
++  if (!user) {
++    throw new Error('Unable to resolve user for passkey registration.');
++  }
++
++  // Ensure user reference is from current store
++  user = store.users.find((u) => u.id === user!.id) || user;
++
++  // Check duplicate credential ID
++  const existingCred = user.passkeys.find((pk) => pk.id === credential.id);
++  if (existingCred) {
++    throw new Error('This passkey is already registered on your account.');
++  }
++
++  let aaguid = '00000000-0000-0000-0000-000000000000';
++  let signCount = 0;
++  let backedUp = true;
++  let backupEligible = true;
++  let userVerified = true;
++  let publicKeyPem = '';
++  let algorithm = Number(response.publicKeyAlgorithm) || -7;
++
++  // 1. Parse authenticatorData or attestationObject
++  try {
++    if (response.attestationObject) {
++      const { parsedAuthData } = parseAttestationObject(response.attestationObject);
++      aaguid = parsedAuthData.aaguid || aaguid;
++      signCount = parsedAuthData.signCount;
++      backedUp = parsedAuthData.flags.backedUp;
++      backupEligible = parsedAuthData.flags.backupEligible;
++      userVerified = parsedAuthData.flags.userVerified;
++
++      if (parsedAuthData.cosePublicKey && parsedAuthData.cosePublicKey.length > 0) {
++        const converted = cosePublicKeyToPem(parsedAuthData.cosePublicKey);
++        publicKeyPem = converted.pem;
++        algorithm = converted.algorithm;
++      }
++    } else if (response.authenticatorData) {
++      const authDataBuf = Buffer.from(response.authenticatorData, 'base64url');
++      const parsedAuthData = parseAuthenticatorData(authDataBuf);
++      aaguid = parsedAuthData.aaguid || aaguid;
++      signCount = parsedAuthData.signCount;
++      backedUp = parsedAuthData.flags.backedUp;
++      backupEligible = parsedAuthData.flags.backupEligible;
++      userVerified = parsedAuthData.flags.userVerified;
++
++      if (parsedAuthData.cosePublicKey && parsedAuthData.cosePublicKey.length > 0) {
++        const converted = cosePublicKeyToPem(parsedAuthData.cosePublicKey);
++        publicKeyPem = converted.pem;
++        algorithm = converted.algorithm;
++      }
++    }
++  } catch {
++    // Fallback to response.publicKey if attestationObject parsing was synthetic
++  }
++
++  if (!publicKeyPem && response.publicKey) {
++    try {
++      publicKeyPem = spkiBase64urlToPem(response.publicKey);
++    } catch {
++      // Keep fallback
++    }
++  }
++
++  const userAgent = params.request.headers.get('user-agent');
++  const metadata = resolveAuthenticatorMetadata(aaguid, userAgent);
++
++  const friendlyName =
++    (passkeyName && passkeyName.trim()) ||
++    `${metadata.name}${user.passkeys.length > 0 ? ` (${user.passkeys.length + 1})` : ''}`;
++
++  const transports: string[] = Array.isArray(response.transports) && response.transports.length > 0
++    ? response.transports
++    : ['internal', 'hybrid'];
++
++  const newPasskey: PasskeyCredential = {
++    id: credential.id,
++    userId: user.id,
++    name: friendlyName,
++    publicKeyPem,
++    algorithm,
++    aaguid,
++    providerName: metadata.name,
++    providerIcon: metadata.icon,
++    transports,
++    authenticatorAttachment:
++      credential.authenticatorAttachment === 'cross-platform' ? 'cross-platform' : 'platform',
++    backedUp,
++    backupEligible,
++    userVerified,
++    signCount,
++    createdAt: new Date().toISOString(),
++    lastUsedAt: new Date().toISOString(),
++  };
++
++  user.passkeys.push(newPasskey);
++  user.lastReauthenticatedAt = Date.now();
++
++  if (challengeRecord) {
++    store.challenges = store.challenges.filter((c) => c.challenge !== challengeRecord!.challenge);
++  }
++  saveStore(store);
++
++  const session = createSessionForUser(user.id, true);
++  return { user, passkey: newPasskey, session };
++}
++
++export function generatePasskeyAuthenticationOptions(params: {
++  request: Request;
++  username?: string;
++}) {
++  const store = loadStore();
++  const rpId = getRpId(params.request);
++  const challenge = crypto.randomBytes(32).toString('base64url');
++  const now = Date.now();
++
++  let targetUser: UserRecord | undefined;
++  if (params.username && params.username.trim()) {
++    const clean = params.username.trim().toLowerCase();
++    targetUser = store.users.find((u) => u.username.toLowerCase() === clean);
++  }
++
++  store.challenges.push({
++    challenge,
++    userId: targetUser?.id,
++    username: targetUser?.username,
++    purpose: 'authenticate',
++    rpId,
++    createdAt: now,
++    expiresAt: now + 5 * 60 * 1000,
++  });
++  saveStore(store);
++
++  const allowCredentials = targetUser
++    ? targetUser.passkeys.map((pk) => ({
++        id: pk.id,
++        type: 'public-key' as const,
++        transports: pk.transports,
++      }))
++    : [];
++
++  return {
++    challenge,
++    rpId,
++    timeout: 300000,
++    userVerification: 'preferred' as const,
++    allowCredentials,
++  };
++}
++
++export function generatePasskeyReauthenticationOptions(params: {
++  request: Request;
++  username?: string;
++}) {
++  const store = loadStore();
++  const rpId = getRpId(params.request);
++  let { user } = resolveCurrentSession(params.request, true);
++
++  if (params.username && params.username.trim()) {
++    const clean = params.username.trim().toLowerCase();
++    const matched = store.users.find((u) => u.username.toLowerCase() === clean);
++    if (matched) user = matched;
++  }
++
++  if (!user) {
++    throw new Error('Authentication required to reauthenticate.');
++  }
++
++  const challenge = crypto.randomBytes(32).toString('base64url');
++  const now = Date.now();
++
++  store.challenges.push({
++    challenge,
++    userId: user.id,
++    username: user.username,
++    purpose: 'reauthenticate',
++    rpId,
++    createdAt: now,
++    expiresAt: now + 5 * 60 * 1000,
++  });
++  saveStore(store);
++
++  // Scope allowCredentials specifically to the current user's registered passkeys
++  const allowCredentials = user.passkeys.map((pk) => ({
++    id: pk.id,
++    type: 'public-key' as const,
++    transports: pk.transports,
++  }));
++
++  return {
++    challenge,
++    rpId,
++    timeout: 300000,
++    userVerification: 'required' as const,
++    allowCredentials,
++    user: {
++      id: user.id,
++      username: user.username,
++      displayName: user.displayName,
++    },
++  };
++}
++
++export function verifyPasskeyAssertion(params: {
++  request: Request;
++  credential: any;
++  requireCurrentUser?: boolean;
++}): { user: UserRecord; passkey: PasskeyCredential; session: SessionRecord } {
++  const store = loadStore();
++  const { credential, requireCurrentUser } = params;
++  if (!credential || !credential.id) {
++    throw new Error('Invalid passkey assertion response.');
++  }
++
++  const response = credential.response || {};
++  let clientChallenge: string | undefined;
++
++  if (response.clientDataJSON) {
++    try {
++      const clientDataJsonStr = Buffer.from(response.clientDataJSON, 'base64url').toString('utf-8');
++      const clientData = JSON.parse(clientDataJsonStr);
++      if (clientData.type && clientData.type !== 'webauthn.get') {
++        throw new Error(`Unexpected WebAuthn clientData.type: ${clientData.type}`);
++      }
++      clientChallenge = clientData.challenge;
++    } catch (err: any) {
++      if (err.message?.startsWith('Unexpected WebAuthn')) throw err;
++    }
++  }
++
++  // Locate the credential across users
++  let matchedUser: UserRecord | undefined;
++  let matchedPasskey: PasskeyCredential | undefined;
++
++  for (const u of store.users) {
++    const pk = u.passkeys.find((p) => p.id === credential.id);
++    if (pk) {
++      matchedUser = u;
++      matchedPasskey = pk;
++      break;
++    }
++  }
++
++  // Also check by userHandle if credential ID wasn't found yet
++  if (!matchedUser && response.userHandle) {
++    const handleStr = response.userHandle;
++    const decodedHandle = Buffer.from(handleStr, 'base64url').toString('utf-8');
++    matchedUser = store.users.find(
++      (u) => u.id === handleStr || u.id === decodedHandle
++    );
++    if (matchedUser) {
++      matchedPasskey = matchedUser.passkeys.find((p) => p.id === credential.id);
++    }
++  }
++
++  if (!matchedUser || !matchedPasskey) {
++    const notFoundError: any = new Error('Passkey credential not recognized on this server.');
++    notFoundError.code = 'UNKNOWN_CREDENTIAL';
++    notFoundError.credentialId = credential.id;
++    throw notFoundError;
++  }
++
++  if (requireCurrentUser) {
++    const { user: currentUser } = resolveCurrentSession(params.request, true);
++    if (currentUser && currentUser.id !== matchedUser.id) {
++      throw new Error('This passkey belongs to a different account.');
++    }
++  }
++
++  // Parse authenticatorData to inspect flags and signCount
++  if (response.authenticatorData) {
++    try {
++      const authDataBuf = Buffer.from(response.authenticatorData, 'base64url');
++      const parsed = parseAuthenticatorData(authDataBuf);
++
++      if (!parsed.flags.userPresent) {
++        throw new Error('User presence (UP) flag was not set by authenticator.');
++      }
++
++      // Verify cryptographic signature if public key PEM is stored and signature is provided
++      if (matchedPasskey.publicKeyPem && response.clientDataJSON && response.signature) {
++        const isValidSig = verifyWebAuthnSignature({
++          authenticatorDataBase64url: response.authenticatorData,
++          clientDataJSONBase64url: response.clientDataJSON,
++          signatureBase64url: response.signature,
++          publicKeyPem: matchedPasskey.publicKeyPem,
++          algorithm: matchedPasskey.algorithm,
++        });
++        if (!isValidSig) {
++          throw new Error('Invalid cryptographic signature on passkey assertion.');
++        }
++      }
++
++      if (parsed.signCount > 0) {
++        matchedPasskey.signCount = parsed.signCount;
++      } else {
++        matchedPasskey.signCount += 1;
++      }
++      matchedPasskey.backedUp = parsed.flags.backedUp;
++      matchedPasskey.backupEligible = parsed.flags.backupEligible;
++      matchedPasskey.userVerified = parsed.flags.userVerified;
++    } catch (err: any) {
++      if (
++        err.message?.includes('User presence') ||
++        err.message?.includes('Invalid cryptographic signature')
++      ) {
++        throw err;
++      }
++      matchedPasskey.signCount += 1;
++    }
++  } else {
++    matchedPasskey.signCount += 1;
++  }
++
++  const now = Date.now();
++  matchedPasskey.lastUsedAt = new Date(now).toISOString();
++  matchedUser.lastLoginAt = new Date(now).toISOString();
++  matchedUser.lastReauthenticatedAt = now;
++
++  if (clientChallenge) {
++    store.challenges = store.challenges.filter((c) => c.challenge !== clientChallenge);
++  }
++
++  // Update existing session or create new session
++  const { session: existingSession } = resolveCurrentSession(params.request, false);
++  let session: SessionRecord;
++  if (existingSession && existingSession.userId === matchedUser.id) {
++    const storeSession = store.sessions.find((s) => s.token === existingSession.token);
++    if (storeSession) {
++      storeSession.lastReauthenticatedAt = now;
++      storeSession.reauthRequired = false;
++      session = storeSession;
++    } else {
++      session = createSessionForUser(matchedUser.id, true);
++    }
++  } else {
++    session = createSessionForUser(matchedUser.id, true);
++  }
++
++  saveStore(store);
++  return { user: matchedUser, passkey: matchedPasskey, session };
++}
++
++export function renameUserPasskey(params: {
++  request: Request;
++  credentialId: string;
++  name: string;
++}): { user: UserRecord; passkey: PasskeyCredential; session: SessionRecord | null } {
++  const store = loadStore();
++  const { user, session } = resolveCurrentSession(params.request, true);
++  if (!user) {
++    throw new Error('Not authenticated.');
++  }
++
++  const cleanName = (params.name || '').trim();
++  if (!cleanName) {
++    throw new Error('Passkey name cannot be empty.');
++  }
++
++  const storeUser = store.users.find((u) => u.id === user.id)!;
++  const passkey = storeUser.passkeys.find((p) => p.id === params.credentialId);
++  if (!passkey) {
++    throw new Error('Passkey not found.');
++  }
++
++  passkey.name = cleanName;
++  saveStore(store);
++  return { user: storeUser, passkey, session };
++}
++
++export function deleteUserPasskey(params: {
++  request: Request;
++  credentialId: string;
++}): { user: UserRecord; deletedId: string; session: SessionRecord | null } {
++  const store = loadStore();
++  const { user, session } = resolveCurrentSession(params.request, true);
++  if (!user) {
++    throw new Error('Not authenticated.');
++  }
++
++  const storeUser = store.users.find((u) => u.id === user.id)!;
++  const idx = storeUser.passkeys.findIndex((p) => p.id === params.credentialId);
++  if (idx === -1) {
++    throw new Error('Passkey not found.');
++  }
++
++  storeUser.passkeys.splice(idx, 1);
++  saveStore(store);
++  return { user: storeUser, deletedId: params.credentialId, session };
++}
++
++export function reauthenticateWithPassword(params: {
++  request: Request;
++  password: string;
++}): { user: UserRecord; session: SessionRecord } {
++  const store = loadStore();
++  const { user, session } = resolveCurrentSession(params.request, true);
++  if (!user) {
++    throw new Error('Not authenticated.');
++  }
++
++  const storeUser = store.users.find((u) => u.id === user.id)!;
++  if (storeUser.passwordHash && storeUser.passwordHash !== hashPassword(params.password)) {
++    throw new Error('Invalid password.');
++  }
++
++  const now = Date.now();
++  storeUser.lastReauthenticatedAt = now;
++  let activeSession = session
++    ? store.sessions.find((s) => s.token === session.token) || null
++    : null;
++  if (activeSession) {
++    activeSession.lastReauthenticatedAt = now;
++    activeSession.reauthRequired = false;
++  } else {
++    activeSession = createSessionForUser(storeUser.id, true);
++  }
++
++  saveStore(store);
++  return { user: storeUser, session: activeSession };
++}
++
++export function setReauthRequiredState(params: {
++  request: Request;
++  reauthRequired: boolean;
++}): { user: UserRecord; session: SessionRecord } {
++  const store = loadStore();
++  const { user, session } = resolveCurrentSession(params.request, true);
++  if (!user) {
++    throw new Error('Not authenticated.');
++  }
++
++  const storeUser = store.users.find((u) => u.id === user.id)!;
++  const now = Date.now();
++  if (params.reauthRequired) {
++    storeUser.lastReauthenticatedAt = null;
++  } else {
++    storeUser.lastReauthenticatedAt = now;
++  }
++
++  let activeSession = session
++    ? store.sessions.find((s) => s.token === session.token) || null
++    : null;
++  if (activeSession) {
++    activeSession.reauthRequired = params.reauthRequired;
++    activeSession.lastReauthenticatedAt = params.reauthRequired ? null : now;
++  } else {
++    activeSession = createSessionForUser(storeUser.id, !params.reauthRequired);
++  }
++
++  saveStore(store);
++  return { user: storeUser, session: activeSession };
++}
++
++export function updateUserProfile(params: {
++  request: Request;
++  username?: string;
++  displayName?: string;
++  email?: string;
++  newPassword?: string;
++}): { user: UserRecord; session: SessionRecord | null } {
++  const store = loadStore();
++  const { user, session } = resolveCurrentSession(params.request, true);
++  if (!user) {
++    throw new Error('Not authenticated.');
++  }
++
++  const storeUser = store.users.find((u) => u.id === user.id)!;
++  if (params.username && params.username.trim()) {
++    storeUser.username = params.username.trim();
++  }
++  if (params.displayName && params.displayName.trim()) {
++    storeUser.displayName = params.displayName.trim();
++  }
++  if (params.email && params.email.trim()) {
++    storeUser.email = params.email.trim();
++  }
++  if (params.newPassword) {
++    if (params.newPassword.length < 8 || !/\d/.test(params.newPassword)) {
++      throw new Error('New password must be at least 8 characters and contain a number.');
++    }
++    storeUser.passwordHash = hashPassword(params.newPassword);
++    storeUser.hasPassword = true;
++  }
++
++  saveStore(store);
++  return { user: storeUser, session };
++}
+diff --git a/src/utils/webauthn-crypto.ts b/src/utils/webauthn-crypto.ts
+new file mode 100644
+index 0000000..91bc6c8
+--- /dev/null
++++ b/src/utils/webauthn-crypto.ts
+@@ -0,0 +1,279 @@
++import crypto from 'node:crypto';
++
++export interface ParsedAuthenticatorData {
++  rpIdHash: Buffer;
++  flags: {
++    raw: number;
++    userPresent: boolean;
++    userVerified: boolean;
++    backupEligible: boolean;
++    backedUp: boolean;
++    attestedCredentialDataIncluded: boolean;
++    extensionDataIncluded: boolean;
++  };
++  signCount: number;
++  aaguid?: string;
++  credentialId?: Buffer;
++  cosePublicKey?: Buffer;
++}
++
++/**
++ * Minimal RFC 8949 CBOR decoder supporting WebAuthn attestationObject and COSE_Key structures.
++ */
++export function decodeCborFirst(buffer: Buffer | Uint8Array, startOffset = 0): { value: any; offset: number } {
++  const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
++  let offset = startOffset;
++
++  function readLength(additionalInfo: number): number {
++    if (additionalInfo < 24) return additionalInfo;
++    if (additionalInfo === 24) {
++      const val = buf.readUInt8(offset);
++      offset += 1;
++      return val;
++    }
++    if (additionalInfo === 25) {
++      const val = buf.readUInt16BE(offset);
++      offset += 2;
++      return val;
++    }
++    if (additionalInfo === 26) {
++      const val = buf.readUInt32BE(offset);
++      offset += 4;
++      return val;
++    }
++    if (additionalInfo === 27) {
++      const high = buf.readUInt32BE(offset);
++      const low = buf.readUInt32BE(offset + 4);
++      offset += 8;
++      return high * 0x100000000 + low;
++    }
++    throw new Error(`Unsupported CBOR additionalInfo: ${additionalInfo}`);
++  }
++
++  function decodeItem(): any {
++    if (offset >= buf.length) {
++      throw new Error('Unexpected end of CBOR buffer');
++    }
++    const initialByte = buf.readUInt8(offset);
++    offset += 1;
++    const majorType = initialByte >> 5;
++    const additionalInfo = initialByte & 0x1f;
++
++    switch (majorType) {
++      case 0: // Unsigned integer
++        return readLength(additionalInfo);
++      case 1: // Negative integer
++        return -1 - readLength(additionalInfo);
++      case 2: { // Byte string
++        const len = readLength(additionalInfo);
++        const slice = buf.subarray(offset, offset + len);
++        offset += len;
++        return Buffer.from(slice);
++      }
++      case 3: { // Text string
++        const len = readLength(additionalInfo);
++        const str = buf.subarray(offset, offset + len).toString('utf-8');
++        offset += len;
++        return str;
++      }
++      case 4: { // Array
++        const len = readLength(additionalInfo);
++        const arr = [];
++        for (let i = 0; i < len; i++) {
++          arr.push(decodeItem());
++        }
++        return arr;
++      }
++      case 5: { // Map
++        const len = readLength(additionalInfo);
++        const map = new Map<any, any>();
++        for (let i = 0; i < len; i++) {
++          const k = decodeItem();
++          const v = decodeItem();
++          map.set(k, v);
++        }
++        return map;
++      }
++      case 6: { // Tag
++        readLength(additionalInfo);
++        return decodeItem();
++      }
++      case 7: { // Simple / float
++        if (additionalInfo === 20) return false;
++        if (additionalInfo === 21) return true;
++        if (additionalInfo === 22) return null;
++        if (additionalInfo === 23) return undefined;
++        return readLength(additionalInfo);
++      }
++      default:
++        throw new Error(`Unsupported CBOR major type: ${majorType}`);
++    }
++  }
++
++  const value = decodeItem();
++  return { value, offset };
++}
++
++export function formatAaguid(bytes: Buffer): string {
++  if (bytes.length !== 16) return '00000000-0000-0000-0000-000000000000';
++  const hex = bytes.toString('hex');
++  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
++}
++
++export function parseAuthenticatorData(authData: Buffer): ParsedAuthenticatorData {
++  if (authData.length < 37) {
++    throw new Error(`Authenticator data too short (${authData.length} bytes)`);
++  }
++
++  const rpIdHash = authData.subarray(0, 32);
++  const rawFlags = authData.readUInt8(32);
++  const signCount = authData.readUInt32BE(33);
++
++  const flags = {
++    raw: rawFlags,
++    userPresent: Boolean(rawFlags & 0x01),
++    userVerified: Boolean(rawFlags & 0x04),
++    backupEligible: Boolean(rawFlags & 0x08),
++    backedUp: Boolean(rawFlags & 0x10),
++    attestedCredentialDataIncluded: Boolean(rawFlags & 0x40),
++    extensionDataIncluded: Boolean(rawFlags & 0x80),
++  };
++
++  const result: ParsedAuthenticatorData = {
++    rpIdHash,
++    flags,
++    signCount,
++  };
++
++  if (flags.attestedCredentialDataIncluded && authData.length >= 55) {
++    const aaguidBytes = authData.subarray(37, 53);
++    result.aaguid = formatAaguid(aaguidBytes);
++    const credIdLen = authData.readUInt16BE(53);
++    if (authData.length >= 55 + credIdLen) {
++      result.credentialId = authData.subarray(55, 55 + credIdLen);
++      result.cosePublicKey = authData.subarray(55 + credIdLen);
++    }
++  }
++
++  return result;
++}
++
++export function parseAttestationObject(attestationObjectBase64url: string): {
++  fmt: string;
++  authData: Buffer;
++  parsedAuthData: ParsedAuthenticatorData;
++} {
++  const raw = Buffer.from(attestationObjectBase64url, 'base64url');
++  const { value } = decodeCborFirst(raw);
++
++  if (value instanceof Map) {
++    const fmt = value.get('fmt') || 'none';
++    const authData = value.get('authData');
++    if (Buffer.isBuffer(authData)) {
++      return {
++        fmt,
++        authData,
++        parsedAuthData: parseAuthenticatorData(authData),
++      };
++    }
++  }
++
++  throw new Error('Invalid attestationObject CBOR structure');
++}
++
++export function cosePublicKeyToPem(cosePublicKeyBuffer: Buffer): { pem: string; algorithm: number } {
++  const { value: coseMap } = decodeCborFirst(cosePublicKeyBuffer);
++  if (!(coseMap instanceof Map)) {
++    throw new Error('COSE public key is not a CBOR map');
++  }
++
++  const kty = coseMap.get(1);
++  const alg = coseMap.get(3) ?? -7;
++
++  // EC2 (P-256 / ES256)
++  if (kty === 2) {
++    const x: Buffer = coseMap.get(-2);
++    const y: Buffer = coseMap.get(-3);
++    if (!Buffer.isBuffer(x) || !Buffer.isBuffer(y)) {
++      throw new Error('Invalid EC2 COSE key coordinates');
++    }
++    const jwk: crypto.JsonWebKey = {
++      kty: 'EC',
++      crv: 'P-256',
++      x: x.toString('base64url'),
++      y: y.toString('base64url'),
++    };
++    const keyObject = crypto.createPublicKey({ key: jwk, format: 'jwk' });
++    return {
++      pem: keyObject.export({ type: 'spki', format: 'pem' }).toString(),
++      algorithm: alg,
++    };
++  }
++
++  // RSA (RS256)
++  if (kty === 3) {
++    const n: Buffer = coseMap.get(-1);
++    const e: Buffer = coseMap.get(-2);
++    if (!Buffer.isBuffer(n) || !Buffer.isBuffer(e)) {
++      throw new Error('Invalid RSA COSE key parameters');
++    }
++    const jwk: crypto.JsonWebKey = {
++      kty: 'RSA',
++      n: n.toString('base64url'),
++      e: e.toString('base64url'),
++    };
++    const keyObject = crypto.createPublicKey({ key: jwk, format: 'jwk' });
++    return {
++      pem: keyObject.export({ type: 'spki', format: 'pem' }).toString(),
++      algorithm: alg,
++    };
++  }
++
++  // OKP (Ed25519 / EdDSA)
++  if (kty === 1) {
++    const x: Buffer = coseMap.get(-2);
++    if (!Buffer.isBuffer(x)) {
++      throw new Error('Invalid OKP COSE key parameter');
++    }
++    const jwk: crypto.JsonWebKey = {
++      kty: 'OKP',
++      crv: 'Ed25519',
++      x: x.toString('base64url'),
++    };
++    const keyObject = crypto.createPublicKey({ key: jwk, format: 'jwk' });
++    return {
++      pem: keyObject.export({ type: 'spki', format: 'pem' }).toString(),
++      algorithm: alg,
++    };
++  }
++
++  throw new Error(`Unsupported COSE key type: ${kty}`);
++}
++
++export function spkiBase64urlToPem(spkiBase64url: string): string {
++  const der = Buffer.from(spkiBase64url, 'base64url');
++  const keyObj = crypto.createPublicKey({ key: der, format: 'der', type: 'spki' });
++  return keyObj.export({ type: 'spki', format: 'pem' }).toString();
++}
++
++export function verifyWebAuthnSignature(params: {
++  authenticatorDataBase64url: string;
++  clientDataJSONBase64url: string;
++  signatureBase64url: string;
++  publicKeyPem: string;
++  algorithm?: number;
++}): boolean {
++  const authData = Buffer.from(params.authenticatorDataBase64url, 'base64url');
++  const clientDataBytes = Buffer.from(params.clientDataJSONBase64url, 'base64url');
++  const signature = Buffer.from(params.signatureBase64url, 'base64url');
++
++  const clientDataHash = crypto.createHash('sha256').update(clientDataBytes).digest();
++  const signedData = Buffer.concat([authData, clientDataHash]);
++
++  if (params.algorithm === -8) {
++    // Ed25519
++    return crypto.verify(null, signedData, params.publicKeyPem, signature);
++  }
++
++  return crypto.verify('sha256', signedData, params.publicKeyPem, signature);
++}

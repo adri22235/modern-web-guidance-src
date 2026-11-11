@@ -1,0 +1,438 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -134,8 +134,91 @@
+     .btn:hover {
+       background: #3e2723;
+     }
+ 
++    /* Auth Section */
++    .auth-section {
++      max-width: 440px;
++      margin: 40px auto;
++      background: white;
++      padding: 30px;
++      border-radius: 8px;
++      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
++      text-align: center;
++    }
++
++    .auth-section h2 {
++      color: var(--primary);
++      margin-bottom: 8px;
++    }
++
++    .auth-section p {
++      color: #666;
++      font-size: 0.95rem;
++      margin-bottom: 24px;
++    }
++
++    .form-group {
++      margin-bottom: 20px;
++      text-align: left;
++    }
++
++    .form-group label {
++      display: block;
++      font-weight: 600;
++      margin-bottom: 6px;
++      font-size: 0.9rem;
++      color: var(--text);
++    }
++
++    .form-group input {
++      width: 100%;
++      padding: 10px 12px;
++      border: 1px solid #ccc;
++      border-radius: 4px;
++      font-size: 1rem;
++      transition: border-color 0.2s, box-shadow 0.2s;
++    }
++
++    .form-group input:focus {
++      outline: none;
++      border-color: var(--accent);
++      box-shadow: 0 0 0 3px rgba(255, 171, 64, 0.3);
++    }
++
++    .btn-auth {
++      width: 100%;
++      cursor: pointer;
++      border: none;
++      font-size: 1rem;
++      font-weight: 600;
++      margin-top: 10px;
++    }
++
++    .auth-status {
++      margin-top: 16px;
++      font-size: 0.95rem;
++      font-weight: 600;
++      min-height: 20px;
++      transition: all 0.3s ease;
++    }
++
++    .auth-status.success {
++      padding: 10px;
++      border-radius: 4px;
++      background-color: #e8f5e9;
++      color: #2e7d32;
++      border: 1px solid #a5d6a7;
++    }
++
++    .auth-status.error {
++      padding: 10px;
++      border-radius: 4px;
++      background-color: #ffebee;
++      color: #c62828;
++      border: 1px solid #ef9a9a;
++    }
++
+     footer {
+       background: var(--secondary);
+       text-align: center;
+       padding: 40px 20px;
+@@ -174,8 +257,39 @@
+     <a href="/order-online" class="btn">Order Now</a>
+   </header>
+ 
+   <main class="container">
++    <section class="auth-section" id="auth-section">
++      <h2>Member Sign In</h2>
++      <p>Use your passkey or biometric sensor to sign in quickly and securely.</p>
++      <form id="auth-form" onsubmit="return false;">
++        <div class="form-group">
++          <label for="username">Username</label>
++          <input
++            type="text"
++            id="username"
++            name="username"
++            autocomplete="username webauthn"
++            data-testid="username-field"
++            placeholder="Username"
++          />
++        </div>
++        <button
++          type="button"
++          id="auth-button"
++          data-testid="auth-button"
++          class="btn btn-auth"
++        >
++          Sign In with Passkey
++        </button>
++        <div
++          id="auth-status"
++          data-testid="auth-status"
++          class="auth-status"
++        ></div>
++      </form>
++    </section>
++
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+       <div class="grid">
+         <div class="card">
+@@ -206,7 +320,302 @@
+     </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script>
++    (function () {
++      let conditionalAbortController = null;
++      let isConditionalRunning = false;
++      let isModalRunning = false;
++      let isAuthenticated = false;
++
++      function toBufferSource(val) {
++        if (!val) return val;
++        if (val instanceof ArrayBuffer) return val;
++        if (ArrayBuffer.isView(val)) return val.buffer;
++        if (Array.isArray(val)) return new Uint8Array(val).buffer;
++        if (typeof val === 'string') {
++          let base64 = val.replace(/-/g, '+').replace(/_/g, '/');
++          while (base64.length % 4 !== 0) {
++            base64 += '=';
++          }
++          try {
++            const binary = atob(base64);
++            const bytes = new Uint8Array(binary.length);
++            for (let i = 0; i < binary.length; i++) {
++              bytes[i] = binary.charCodeAt(i);
++            }
++            return bytes.buffer;
++          } catch {
++            return new TextEncoder().encode(val).buffer;
++          }
++        }
++        return val;
++      }
++
++      function bufferToBase64Url(buffer) {
++        if (!buffer) return '';
++        if (typeof buffer === 'string') return buffer;
++        const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
++        let binary = '';
++        for (let i = 0; i < bytes.byteLength; i++) {
++          binary += String.fromCharCode(bytes[i]);
++        }
++        return btoa(binary)
++          .replace(/\+/g, '-')
++          .replace(/\//g, '_')
++          .replace(/=+$/, '');
++      }
++
++      function preparePublicKeyOptions(raw) {
++        if (!raw) return {};
++        const options = (raw && raw.publicKey) ? { ...raw.publicKey } : { ...raw };
++
++        if (typeof PublicKeyCredential !== 'undefined' &&
++            typeof PublicKeyCredential.parseRequestOptionsFromJSON === 'function' &&
++            typeof options.challenge === 'string') {
++          try {
++            return PublicKeyCredential.parseRequestOptionsFromJSON(options);
++          } catch (e) {
++            // fallback to manual conversion below
++          }
++        }
++
++        const converted = { ...options };
++        if (converted.challenge) {
++          converted.challenge = toBufferSource(converted.challenge);
++        }
++        if (Array.isArray(converted.allowCredentials)) {
++          converted.allowCredentials = converted.allowCredentials.map(cred => {
++            if (!cred) return cred;
++            const copy = { ...cred };
++            if (copy.id) {
++              copy.id = toBufferSource(copy.id);
++            }
++            return copy;
++          });
++        }
++        return converted;
++      }
++
++      function serializeCredential(credential) {
++        if (typeof credential.toJSON === 'function') {
++          try {
++            const json = credential.toJSON();
++            if (json && json.id) return json;
++          } catch (e) {
++            console.warn('credential.toJSON() error:', e);
++          }
++        }
++
++        const res = credential.response || {};
++        return {
++          id: credential.id,
++          rawId: bufferToBase64Url(credential.rawId),
++          type: credential.type || 'public-key',
++          response: {
++            authenticatorData: bufferToBase64Url(res.authenticatorData),
++            clientDataJSON: bufferToBase64Url(res.clientDataJSON),
++            signature: bufferToBase64Url(res.signature),
++            userHandle: res.userHandle ? bufferToBase64Url(res.userHandle) : null
++          },
++          clientExtensionResults: credential.getClientExtensionResults ? credential.getClientExtensionResults() : (credential.clientExtensionResults || {}),
++          authenticatorAttachment: credential.authenticatorAttachment || undefined
++        };
++      }
++
++      async function fetchLoginOptions() {
++        const res = await fetch('/api/login/options');
++        if (!res.ok) {
++          if (res.status === 405) {
++            const postRes = await fetch('/api/login/options', {
++              method: 'POST',
++              headers: { 'Content-Type': 'application/json' },
++              body: JSON.stringify({})
++            });
++            if (postRes.ok) {
++              return await postRes.json();
++            }
++          }
++          throw new Error('Failed to fetch login options');
++        }
++        return await res.json();
++      }
++
++      async function verifyCredential(credential) {
++        const serialized = serializeCredential(credential);
++        const res = await fetch('/api/login/verify', {
++          method: 'POST',
++          headers: {
++            'Content-Type': 'application/json'
++          },
++          body: JSON.stringify(serialized)
++        });
++
++        const statusEl = document.querySelector('[data-testid="auth-status"]');
++        if (res.ok) {
++          isAuthenticated = true;
++          let successMessage = 'Authentication successful';
++          try {
++            const data = await res.json();
++            if (typeof data === 'string') {
++              successMessage = data;
++            } else if (data && typeof data === 'object') {
++              if (data.message) {
++                successMessage = data.message;
++              } else if (data.status && data.status !== 'ok') {
++                successMessage = data.status;
++              } else if (data.username) {
++                successMessage = `Authentication successful. Welcome, ${data.username}!`;
++              }
++              if (data.username) {
++                const usernameInput = document.querySelector('[data-testid="username-field"]');
++                if (usernameInput && !usernameInput.value) {
++                  usernameInput.value = data.username;
++                }
++              }
++            }
++          } catch {
++            try {
++              const text = await res.text();
++              if (text && text.trim()) successMessage = text.trim();
++            } catch {}
++          }
++
++          if (statusEl) {
++            statusEl.textContent = successMessage;
++            statusEl.className = 'auth-status success';
++          }
++        } else {
++          let errorMessage = 'Authentication failed';
++          try {
++            const data = await res.json();
++            if (data && data.message) errorMessage = data.message;
++          } catch {}
++          if (statusEl) {
++            statusEl.textContent = errorMessage;
++            statusEl.className = 'auth-status error';
++          }
++        }
++      }
++
++      async function startConditionalAuth() {
++        if (isAuthenticated || isConditionalRunning) return;
++        if (typeof navigator === 'undefined' || !navigator.credentials || typeof navigator.credentials.get !== 'function') {
++          return;
++        }
++
++        try {
++          if (conditionalAbortController) {
++            conditionalAbortController.abort();
++          }
++          conditionalAbortController = new AbortController();
++          isConditionalRunning = true;
++
++          const options = await fetchLoginOptions();
++          if (conditionalAbortController.signal.aborted) return;
++
++          const publicKey = preparePublicKeyOptions(options);
++          const getOptions = {
++            publicKey,
++            mediation: 'conditional',
++            signal: conditionalAbortController.signal
++          };
++
++          const credential = await navigator.credentials.get(getOptions);
++          if (credential) {
++            await verifyCredential(credential);
++          }
++        } catch (err) {
++          if (err && err.name !== 'AbortError') {
++            console.warn('Conditional authentication error:', err);
++          }
++        } finally {
++          isConditionalRunning = false;
++        }
++      }
++
++      async function handleModalAuth() {
++        if (isModalRunning) return;
++        isModalRunning = true;
++
++        if (conditionalAbortController) {
++          conditionalAbortController.abort();
++          conditionalAbortController = null;
++        }
++        isConditionalRunning = false;
++
++        const statusEl = document.querySelector('[data-testid="auth-status"]');
++
++        if (typeof navigator === 'undefined' || !navigator.credentials || typeof navigator.credentials.get !== 'function') {
++          if (statusEl) {
++            statusEl.textContent = 'WebAuthn is not supported in this browser';
++            statusEl.className = 'auth-status error';
++          }
++          isModalRunning = false;
++          return;
++        }
++
++        try {
++          const options = await fetchLoginOptions();
++          const publicKey = preparePublicKeyOptions(options);
++          const getOptions = {
++            publicKey
++          };
++
++          const credential = await navigator.credentials.get(getOptions);
++          if (credential) {
++            await verifyCredential(credential);
++          }
++        } catch (err) {
++          if (err && err.name !== 'AbortError') {
++            console.error('Modal authentication error:', err);
++            if (statusEl) {
++              statusEl.textContent = 'Authentication failed';
++              statusEl.className = 'auth-status error';
++            }
++          }
++        } finally {
++          isModalRunning = false;
++        }
++      }
++
++      function init() {
++        const usernameInput = document.querySelector('[data-testid="username-field"]');
++        const authButton = document.querySelector('[data-testid="auth-button"]');
++        const authForm = document.getElementById('auth-form');
++
++        if (usernameInput) {
++          usernameInput.addEventListener('focus', function () {
++            if (!isAuthenticated && !isConditionalRunning) {
++              return startConditionalAuth();
++            }
++          });
++        }
++
++        if (authButton) {
++          authButton.addEventListener('click', function (e) {
++            e.preventDefault();
++            return handleModalAuth();
++          });
++        }
++
++        if (authForm) {
++          authForm.addEventListener('submit', function (e) {
++            e.preventDefault();
++            return handleModalAuth();
++          });
++        }
++
++        startConditionalAuth();
++      }
++
++      if (document.readyState === 'loading') {
++        document.addEventListener('DOMContentLoaded', init);
++      } else {
++        init();
++      }
++    })();
++  </script>
+ </body>
+ 
+ </html>

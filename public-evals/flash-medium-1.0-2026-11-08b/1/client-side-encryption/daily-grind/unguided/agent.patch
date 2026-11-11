@@ -1,0 +1,1167 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..2752eb9
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,2 @@
++node_modules/
++.DS_Store
+diff --git a/index.html b/index.html
+index 66c9173..e1ab1f9 100644
+--- a/index.html
++++ b/index.html
+@@ -153,6 +153,7 @@
+       font-size: 0.85rem;
+     }
+   </style>
++  <link rel="stylesheet" href="dist/delivery-notes.css">
+ </head>
+ 
+ <body>
+@@ -162,6 +163,7 @@
+     <ul>
+       <li><a href="/menu">Menu</a></li>
+       <li><a href="/locations">Locations</a></li>
++      <li><a href="#encrypted-delivery">Encrypted Delivery</a></li>
+       <li><a href="/rewards">Rewards</a></li>
+       <li><a href="/account">My Account</a></li>
+       <li><a href="/logout" class="logout-link">Logout</a></li>
+@@ -195,6 +197,11 @@
+         </div>
+       </div>
+     </section>
++
++    <!-- Encrypted Delivery Notes Feature -->
++    <section id="encrypted-delivery" class="edn-section">
++      <div id="encrypted-delivery-container"></div>
++    </section>
+   </main>
+ 
+   <footer>
+@@ -207,6 +214,7 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script src="dist/delivery-notes.bundle.js"></script>
+ </body>
+ 
+ </html>
+diff --git a/package.json b/package.json
+index 2bd4d77..f7ecf2e 100644
+--- a/package.json
++++ b/package.json
+@@ -1,10 +1,21 @@
+ {
+   "name": "daily-grind",
+   "version": "1.0.0",
++  "type": "module",
+   "scripts": {
++    "build": "esbuild src/index.js --bundle --minify --format=iife --outfile=dist/delivery-notes.bundle.js",
++    "test": "node test/crypto.test.js",
+     "start": "pnpm dlx statikk --port ${PORT:-11222}"
+   },
+   "pnpm": {
+     "onlyBuiltDependencies": []
++  },
++  "devDependencies": {
++    "esbuild": "^0.28.2"
++  },
++  "dependencies": {
++    "@noble/curves": "^2.4.0",
++    "@noble/hashes": "^2.4.0",
++    "@noble/post-quantum": "^0.7.1"
+   }
+ }
+diff --git a/src/crypto.js b/src/crypto.js
+new file mode 100644
+index 0000000..1396e45
+--- /dev/null
++++ b/src/crypto.js
+@@ -0,0 +1,338 @@
++import { ml_kem512, ml_kem768, ml_kem1024 } from '@noble/post-quantum/ml-kem.js';
++import { ml_kem768_x25519, ml_kem768_p256, _ecdhKem } from '@noble/post-quantum/hybrid.js';
++import { x25519 } from '@noble/curves/ed25519.js';
++import { p256 } from '@noble/curves/nist.js';
++import { hkdf } from '@noble/hashes/hkdf.js';
++import { sha256 } from '@noble/hashes/sha2.js';
++
++// Algorithm registry supporting Post-Quantum, Hybrid, and Classical key encapsulation / key agreement
++export const KEM_ALGORITHMS = {
++  'hybrid-x25519-mlkem768': {
++    id: 'hybrid-x25519-mlkem768',
++    name: 'Hybrid X25519 + ML-KEM-768 (Recommended)',
++    type: 'Hybrid Post-Quantum + Classical',
++    category: 'hybrid',
++    description: 'Combines classical X25519 ECDH with FIPS 203 ML-KEM-768 (Kyber). Dual-layer protection: secure if either scheme holds.',
++    pqcProtected: true,
++    classicalProtected: true,
++    kem: ml_kem768_x25519,
++    securityLevel: 'NIST Level 3 (128+ bit post-quantum & classical)'
++  },
++  'hybrid-p256-mlkem768': {
++    id: 'hybrid-p256-mlkem768',
++    name: 'Hybrid NIST P-256 + ML-KEM-768',
++    type: 'Hybrid Post-Quantum + Classical',
++    category: 'hybrid',
++    description: 'Combines NIST P-256 elliptic curve key agreement with FIPS 203 ML-KEM-768. Ideal for FIPS/NIST compliance.',
++    pqcProtected: true,
++    classicalProtected: true,
++    kem: ml_kem768_p256,
++    securityLevel: 'NIST Level 3 (128+ bit post-quantum & classical)'
++  },
++  'mlkem768': {
++    id: 'mlkem768',
++    name: 'ML-KEM-768 (FIPS 203 / Kyber-768)',
++    type: 'Pure Post-Quantum Lattice KEM',
++    category: 'post-quantum',
++    description: 'NIST standard for post-quantum key encapsulation based on Module Learning with Errors (MLWE). Resistant to quantum Shor attacks.',
++    pqcProtected: true,
++    classicalProtected: false,
++    kem: ml_kem768,
++    securityLevel: 'NIST Level 3 (AES-192 equivalent)'
++  },
++  'mlkem1024': {
++    id: 'mlkem1024',
++    name: 'ML-KEM-1024 (FIPS 203 / Kyber-1024)',
++    type: 'High-Security Post-Quantum Lattice KEM',
++    category: 'post-quantum',
++    description: 'Highest security level parameter set for NIST FIPS 203 Module-Lattice-Based Key-Encapsulation Mechanism.',
++    pqcProtected: true,
++    classicalProtected: false,
++    kem: ml_kem1024,
++    securityLevel: 'NIST Level 5 (AES-256 equivalent)'
++  },
++  'x25519': {
++    id: 'x25519',
++    name: 'Classical X25519 (ECDH Key Agreement)',
++    type: 'Classical Elliptic Curve Diffie-Hellman',
++    category: 'classical',
++    description: 'High-speed Montgomery curve Diffie-Hellman (RFC 7748). Provides classical forward secrecy (vulnerable to future cryptanalytically relevant quantum computers).',
++    pqcProtected: false,
++    classicalProtected: true,
++    kem: _ecdhKem(x25519),
++    securityLevel: '128-bit Classical Security'
++  },
++  'p256': {
++    id: 'p256',
++    name: 'Classical NIST P-256 (ECDH Key Agreement)',
++    type: 'Classical Elliptic Curve Diffie-Hellman',
++    category: 'classical',
++    description: 'Standard NIST P-256 prime-field elliptic curve Diffie-Hellman key agreement (SP 800-56A).',
++    pqcProtected: false,
++    classicalProtected: true,
++    kem: _ecdhKem(p256, true),
++    securityLevel: '128-bit Classical Security'
++  }
++};
++
++// Utilities for byte manipulation and base64 conversions
++export function bytesToBase64(bytes) {
++  let binary = '';
++  const len = bytes.byteLength;
++  for (let i = 0; i < len; i++) {
++    binary += String.fromCharCode(bytes[i]);
++  }
++  return btoa(binary);
++}
++
++export function base64ToBytes(base64) {
++  const binary = atob(base64);
++  const bytes = new Uint8Array(binary.length);
++  for (let i = 0; i < binary.length; i++) {
++    bytes[i] = binary.charCodeAt(i);
++  }
++  return bytes;
++}
++
++export function bytesToHex(bytes) {
++  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
++}
++
++export function hexToBytes(hex) {
++  const cleanHex = hex.replace(/[^0-9a-fA-F]/g, '');
++  const bytes = new Uint8Array(cleanHex.length / 2);
++  for (let i = 0; i < cleanHex.length; i += 2) {
++    bytes[i / 2] = parseInt(cleanHex.slice(i, i + 2), 16);
++  }
++  return bytes;
++}
++
++/**
++ * Compute short SHA-256 fingerprint for display (e.g. key verification)
++ */
++export function getPublicKeyFingerprint(publicKeyBytes) {
++  const digest = sha256(publicKeyBytes);
++  const hex = bytesToHex(digest.slice(0, 8));
++  return hex.match(/.{1,4}/g).join(':').toUpperCase();
++}
++
++/**
++ * Generate a recipient public/private keypair using chosen KEM / key agreement algorithm
++ */
++export function generateKeyPair(algorithmId = 'hybrid-x25519-mlkem768') {
++  const algo = KEM_ALGORITHMS[algorithmId];
++  if (!algo) {
++    throw new Error(`Unsupported KEM algorithm: ${algorithmId}`);
++  }
++
++  const keys = algo.kem.keygen();
++  return {
++    algorithm: algorithmId,
++    publicKeyBytes: keys.publicKey,
++    secretKeyBytes: keys.secretKey,
++    publicKeyBase64: bytesToBase64(keys.publicKey),
++    secretKeyBase64: bytesToBase64(keys.secretKey),
++    fingerprint: getPublicKeyFingerprint(keys.publicKey)
++  };
++}
++
++/**
++ * Derive AES-256-GCM symmetric key from KEM shared secret via HKDF-SHA256
++ */
++export function deriveSymmetricKey(sharedSecretBytes, contextString = 'TheDailyGrind-DeliveryNote-v1') {
++  const encoder = new TextEncoder();
++  const salt = encoder.encode('DailyGrind-HKDF-Salt-2026');
++  const info = encoder.encode(contextString);
++  const keyBytes = hkdf(sha256, sharedSecretBytes, salt, info, 32);
++  return keyBytes;
++}
++
++/**
++ * Encapsulate a shared secret and encrypt sensitive delivery notes using Authenticated Encryption (AES-256-GCM)
++ * 
++ * @param {Object} options
++ * @param {string} options.recipientPublicKeyBase64 - Recipient's public key in base64
++ * @param {string} options.algorithmId - Key agreement / KEM algorithm
++ * @param {string} options.note - Sensitive customer note plaintext
++ * @param {string} options.orderId - Customer Order ID (used as Additional Authenticated Data)
++ * @param {Object} [options.metadata] - Optional additional metadata bound to encryption
++ * @returns {Promise<Object>} Encrypted delivery note envelope
++ */
++export async function sealDeliveryNote({
++  recipientPublicKeyBase64,
++  algorithmId = 'hybrid-x25519-mlkem768',
++  note,
++  orderId = 'DG-' + Math.floor(100000 + Math.random() * 900000),
++  metadata = {}
++}) {
++  const algo = KEM_ALGORITHMS[algorithmId];
++  if (!algo) {
++    throw new Error(`Unsupported KEM algorithm: ${algorithmId}`);
++  }
++
++  if (!note || note.trim().length === 0) {
++    throw new Error('Delivery note content cannot be empty.');
++  }
++
++  const recipientPublicKey = base64ToBytes(recipientPublicKeyBase64);
++
++  // 1. Establish shared secret via Public-Key Encapsulation (KEM) / Key Agreement
++  const encapResult = algo.kem.encapsulate(recipientPublicKey);
++  const kemCipherText = encapResult.cipherText;
++  const rawSharedSecret = encapResult.sharedSecret;
++
++  // 2. Derive 256-bit AEAD key using HKDF-SHA256
++  const aesKeyBytes = deriveSymmetricKey(rawSharedSecret, `TheDailyGrind:${algorithmId}:AES-256-GCM`);
++
++  // 3. Import key into Web Crypto API for hardware-accelerated AES-256-GCM
++  const cryptoKey = await crypto.subtle.importKey(
++    'raw',
++    aesKeyBytes,
++    { name: 'AES-GCM' },
++    false,
++    ['encrypt']
++  );
++
++  // 4. Generate 96-bit (12-byte) cryptographically secure random nonce/IV
++  const iv = crypto.getRandomValues(new Uint8Array(12));
++
++  // 5. Construct Additional Authenticated Data (AAD) to bind ciphertext to order context
++  const timestamp = new Date().toISOString();
++  const aadPayload = JSON.stringify({
++    orderId,
++    algorithm: algorithmId,
++    timestamp,
++    ...metadata
++  });
++  const encoder = new TextEncoder();
++  const aadBytes = encoder.encode(aadPayload);
++  const plaintextBytes = encoder.encode(note);
++
++  // 6. Encrypt with Authenticated Encryption (AES-256-GCM)
++  // Web Crypto encrypt with AES-GCM appends the 128-bit authentication tag at the end of ciphertext
++  const encryptedBuffer = await crypto.subtle.encrypt(
++    {
++      name: 'AES-GCM',
++      iv,
++      additionalData: aadBytes,
++      tagLength: 128
++    },
++    cryptoKey,
++    plaintextBytes
++  );
++  const cipherTextWithTag = new Uint8Array(encryptedBuffer);
++
++  // 7. Assemble complete, self-contained encrypted envelope
++  const envelope = {
++    version: '1.0',
++    type: 'DailyGrindEncryptedDeliveryNote',
++    orderId,
++    algorithm: algorithmId,
++    algorithmName: algo.name,
++    pqcProtected: algo.pqcProtected,
++    classicalProtected: algo.classicalProtected,
++    securityLevel: algo.securityLevel,
++    timestamp,
++    aad: aadPayload,
++    kemCiphertext: bytesToBase64(kemCipherText),
++    iv: bytesToBase64(iv),
++    ciphertext: bytesToBase64(cipherTextWithTag),
++    recipientFingerprint: getPublicKeyFingerprint(recipientPublicKey)
++  };
++
++  return {
++    envelope,
++    sharedSecretHex: bytesToHex(rawSharedSecret),
++    sharedSecretFingerprint: getPublicKeyFingerprint(rawSharedSecret),
++    aesKeyFingerprint: getPublicKeyFingerprint(aesKeyBytes),
++    kemCiphertextBytes: kemCipherText.length,
++    ciphertextBytes: cipherTextWithTag.length,
++    aadString: aadPayload
++  };
++}
++
++/**
++ * Decapsulate shared secret and decrypt sensitive delivery notes with AEAD tag verification
++ * 
++ * @param {Object} options
++ * @param {Object} options.envelope - The encrypted delivery note envelope
++ * @param {string} options.recipientSecretKeyBase64 - Recipient's secret key in base64
++ * @returns {Promise<Object>} Decrypted note and verification report
++ */
++export async function openDeliveryNote({
++  envelope,
++  recipientSecretKeyBase64
++}) {
++  if (!envelope || !envelope.algorithm || !envelope.kemCiphertext || !envelope.ciphertext || !envelope.iv) {
++    throw new Error('Invalid envelope format: missing required cryptographic fields.');
++  }
++
++  const algo = KEM_ALGORITHMS[envelope.algorithm];
++  if (!algo) {
++    throw new Error(`Unsupported KEM algorithm in envelope: ${envelope.algorithm}`);
++  }
++
++  let secretKeyBytes, kemCipherText, cipherTextWithTag, iv, aadBytes;
++  try {
++    secretKeyBytes = base64ToBytes(recipientSecretKeyBase64);
++    kemCipherText = base64ToBytes(envelope.kemCiphertext);
++    cipherTextWithTag = base64ToBytes(envelope.ciphertext);
++    iv = base64ToBytes(envelope.iv);
++    aadBytes = new TextEncoder().encode(envelope.aad);
++  } catch (err) {
++    throw new Error(`Invalid base64 payload in envelope or key: ${err.message}`);
++  }
++
++  // 1. Decapsulate shared secret using Recipient's Private Key
++  let rawSharedSecret;
++  try {
++    rawSharedSecret = algo.kem.decapsulate(kemCipherText, secretKeyBytes);
++  } catch (err) {
++    throw new Error(`KEM decapsulation failed: ${err.message || 'Invalid ciphertext or private key'}`);
++  }
++
++  // 2. Derive 256-bit AEAD key using HKDF-SHA256
++  const aesKeyBytes = deriveSymmetricKey(rawSharedSecret, `TheDailyGrind:${envelope.algorithm}:AES-256-GCM`);
++
++  // 3. Import key for AES-GCM decryption
++  const cryptoKey = await crypto.subtle.importKey(
++    'raw',
++    aesKeyBytes,
++    { name: 'AES-GCM' },
++    false,
++    ['decrypt']
++  );
++
++  // 4. Decrypt and verify authenticated ciphertext & tag against AAD
++  let decryptedBuffer;
++  try {
++    decryptedBuffer = await crypto.subtle.decrypt(
++      {
++        name: 'AES-GCM',
++        iv,
++        additionalData: aadBytes,
++        tagLength: 128
++      },
++      cryptoKey,
++      cipherTextWithTag
++    );
++  } catch (err) {
++    throw new Error('Authenticated decryption failed: Ciphertext, IV, or Additional Authenticated Data has been tampered with or corrupted!');
++  }
++
++  const decryptedNote = new TextDecoder().decode(decryptedBuffer);
++
++  return {
++    plaintextNote: decryptedNote,
++    orderId: envelope.orderId,
++    algorithm: envelope.algorithm,
++    algorithmName: envelope.algorithmName,
++    pqcProtected: envelope.pqcProtected,
++    classicalProtected: envelope.classicalProtected,
++    timestamp: envelope.timestamp,
++    sharedSecretHex: bytesToHex(rawSharedSecret),
++    sharedSecretFingerprint: getPublicKeyFingerprint(rawSharedSecret),
++    aesKeyFingerprint: getPublicKeyFingerprint(aesKeyBytes),
++    verified: true
++  };
++}
+diff --git a/src/index.js b/src/index.js
+new file mode 100644
+index 0000000..3728bae
+--- /dev/null
++++ b/src/index.js
+@@ -0,0 +1,620 @@
++import {
++  KEM_ALGORITHMS,
++  generateKeyPair,
++  sealDeliveryNote,
++  openDeliveryNote,
++  getPublicKeyFingerprint,
++  bytesToHex,
++  base64ToBytes
++} from './crypto.js';
++
++// Application State for the Encrypted Delivery Notes feature
++const state = {
++  selectedAlgorithm: 'hybrid-x25519-mlkem768',
++  keyPairs: {}, // Cache of keypairs per algorithm
++  lastSealedEnvelope: null,
++  orderId: 'DG-' + Math.floor(100000 + Math.random() * 900000)
++};
++
++// Preset sample delivery notes
++const PRESETS = [
++  {
++    title: '🚪 Gate Code & Pet Warning',
++    text: 'Gate code is #8421. Please place cold brew on the wooden bench by the side door. Watch out for Buster (friendly Golden Retriever in yard)!'
++  },
++  {
++    title: '🏢 Apartment Intercom & Elevator',
++    text: 'Buzzer #14B (Smith). Please take elevator to 4th floor and leave whole-bean espresso package outside unit 402. No need to knock.'
++  },
++  {
++    title: '📦 Porch Lockbox Dropoff',
++    text: 'Porch lockbox code is 9204. Please slide the coffee tins inside and latch closed so they stay out of direct morning sunlight.'
++  },
++  {
++    title: '🛎️ Front Desk Concierge',
++    text: 'Building concierge holds all deliveries. Deliver to security desk under order name "Sarah M." Contact (555) 019-2831 upon arrival.'
++  }
++];
++
++function initializeKeyPairs() {
++  // Generate keypairs for each algorithm once on init
++  for (const algoId of Object.keys(KEM_ALGORITHMS)) {
++    try {
++      state.keyPairs[algoId] = generateKeyPair(algoId);
++    } catch (err) {
++      console.warn(`Failed to initialize keypair for ${algoId}:`, err);
++    }
++  }
++}
++
++export function initEncryptedNotes() {
++  initializeKeyPairs();
++  renderApp();
++}
++
++function renderApp() {
++  const container = document.getElementById('encrypted-delivery-container');
++  if (!container) return;
++
++  container.innerHTML = `
++    <div class="edn-card">
++      <div class="edn-header">
++        <div class="edn-title-group">
++          <span class="edn-badge-pqc">FIPS 203 Quantum-Resilient</span>
++          <h2>Encrypted Delivery Notes</h2>
++          <p>
++            Protect sensitive customer dropoff instructions (gate codes, lockboxes, alarm details) with 
++            browser-side authenticated encryption and post-quantum hybrid key encapsulation.
++          </p>
++        </div>
++        <div class="edn-tabs">
++          <button id="edn-tab-seal" class="edn-tab-btn active">1. Customer: Seal Delivery Note</button>
++          <button id="edn-tab-open" class="edn-tab-btn">2. Courier: Dispatch Reader Terminal</button>
++        </div>
++      </div>
++
++      <!-- TAB 1: CUSTOMER ENCRYPTION -->
++      <div id="edn-panel-seal" class="edn-panel active">
++        <div class="edn-grid">
++          <!-- Left Column: Configuration & Input -->
++          <div class="edn-col">
++            <div class="edn-form-group">
++              <label for="edn-algo-select"><strong>1. Key Encapsulation & Agreement Scheme:</strong></label>
++              <select id="edn-algo-select" class="edn-select">
++                ${Object.values(KEM_ALGORITHMS).map(algo => `
++                  <option value="${algo.id}" ${algo.id === state.selectedAlgorithm ? 'selected' : ''}>
++                    ${algo.name}
++                  </option>
++                `).join('')}
++              </select>
++            </div>
++
++            <!-- Algorithm Details Card -->
++            <div id="edn-algo-info" class="edn-info-card">
++              <!-- Dynamically populated -->
++            </div>
++
++            <div class="edn-form-group">
++              <div class="edn-label-row">
++                <label><strong>Recipient Courier Public Key:</strong></label>
++                <button id="edn-regen-keys" class="edn-btn-link" title="Generate a fresh keypair for this algorithm">🔄 New Keypair</button>
++              </div>
++              <div class="edn-key-display">
++                <div class="edn-key-meta">
++                  <span>Fingerprint: <strong id="edn-pk-fingerprint">--</strong></span>
++                  <span id="edn-pk-length">-- bytes</span>
++                </div>
++                <textarea id="edn-public-key" class="edn-textarea-mono" rows="2" readonly></textarea>
++              </div>
++            </div>
++
++            <div class="edn-form-group">
++              <label for="edn-order-id"><strong>Order Reference ID (Authenticated Data):</strong></label>
++              <input type="text" id="edn-order-id" class="edn-input" value="${state.orderId}">
++              <small class="edn-help">Bound into AES-GCM as Additional Authenticated Data (AAD) to prevent replay or order-swap tampering.</small>
++            </div>
++
++            <div class="edn-form-group">
++              <div class="edn-label-row">
++                <label for="edn-note-input"><strong>Confidential Delivery Instructions:</strong></label>
++                <span id="edn-char-count">0 characters</span>
++              </div>
++              <textarea id="edn-note-input" class="edn-textarea" rows="4" placeholder="Enter sensitive instructions (e.g. gate code, buzzer code, drop-off location, phone contact)..."></textarea>
++              
++              <div class="edn-presets">
++                <span class="edn-presets-label">Quick Presets:</span>
++                <div class="edn-presets-list">
++                  ${PRESETS.map((p, idx) => `
++                    <button type="button" class="edn-chip-btn" data-preset="${idx}">${p.title}</button>
++                  `).join('')}
++                </div>
++              </div>
++            </div>
++
++            <button id="edn-btn-encrypt" class="btn btn-primary edn-btn-block">
++              🔒 Encrypt & Seal Delivery Note
++            </button>
++          </div>
++
++          <!-- Right Column: Cryptographic Inspection & Sealed Envelope -->
++          <div class="edn-col">
++            <div class="edn-audit-trail">
++              <h3>Cryptographic Audit Pipeline</h3>
++              <div class="edn-pipeline-steps">
++                <div class="edn-step" id="edn-step-kem">
++                  <div class="edn-step-icon">1</div>
++                  <div class="edn-step-content">
++                    <h4>Public-Key Encapsulation (KEM)</h4>
++                    <p>Generates ephemeral shared secret and encapsulates ciphertext against Courier's public key.</p>
++                    <div class="edn-step-data" id="edn-step-kem-data">Awaiting sealing...</div>
++                  </div>
++                </div>
++
++                <div class="edn-step" id="edn-step-hkdf">
++                  <div class="edn-step-icon">2</div>
++                  <div class="edn-step-content">
++                    <h4>HKDF-SHA256 Key Derivation</h4>
++                    <p>Expands raw shared secret into 256-bit symmetric key with context domain separation.</p>
++                    <div class="edn-step-data" id="edn-step-hkdf-data">Awaiting derivation...</div>
++                  </div>
++                </div>
++
++                <div class="edn-step" id="edn-step-aead">
++                  <div class="edn-step-icon">3</div>
++                  <div class="edn-step-content">
++                    <h4>AES-256-GCM Authenticated Encryption</h4>
++                    <p>Encrypts note with 96-bit random IV and binds Order ID in 128-bit authentication tag.</p>
++                    <div class="edn-step-data" id="edn-step-aead-data">Awaiting encryption...</div>
++                  </div>
++                </div>
++              </div>
++            </div>
++
++            <!-- Sealed Output Card -->
++            <div id="edn-sealed-card" class="edn-output-card" style="display: none;">
++              <div class="edn-output-header">
++                <h4>📦 Sealed Delivery Envelope</h4>
++                <div class="edn-action-group">
++                  <button id="edn-btn-copy" class="edn-btn-sm">📋 Copy JSON</button>
++                  <button id="edn-btn-send-courier" class="edn-btn-sm edn-btn-accent">🚚 Open in Courier Terminal &rarr;</button>
++                </div>
++              </div>
++              <pre id="edn-sealed-json" class="edn-json-box"></pre>
++              <div class="edn-seal-meta" id="edn-seal-meta"></div>
++            </div>
++          </div>
++        </div>
++      </div>
++
++      <!-- TAB 2: COURIER DECRYPTION TERMINAL -->
++      <div id="edn-panel-open" class="edn-panel">
++        <div class="edn-courier-wrapper">
++          <div class="edn-courier-banner">
++            <div class="edn-courier-badge">Courier Mobile Dispatch Simulator</div>
++            <h3>Delivery Driver Decryption & Authentication Terminal</h3>
++            <p>
++              In production, the courier's handheld device holds the private key matching the published roaster/courier public key. 
++              The driver decapsulates the KEM ciphertext to recover the shared secret and verifies the AEAD tag before revealing sensitive notes.
++            </p>
++          </div>
++
++          <div class="edn-grid">
++            <div class="edn-col">
++              <div class="edn-form-group">
++                <label for="edn-courier-input"><strong>Sealed Envelope JSON:</strong></label>
++                <textarea id="edn-courier-input" class="edn-textarea-mono" rows="8" placeholder="Paste or seal a note above to automatically load the encrypted delivery envelope..."></textarea>
++              </div>
++
++              <div class="edn-form-group">
++                <label><strong>Courier Private Key (matching recipient key):</strong></label>
++                <input type="password" id="edn-courier-sk" class="edn-input edn-mono" readonly>
++                <div class="edn-key-actions">
++                  <button type="button" id="edn-toggle-sk" class="edn-btn-link">👁️ Show Private Key</button>
++                  <span id="edn-courier-sk-fingerprint" class="edn-text-muted"></span>
++                </div>
++              </div>
++
++              <div class="edn-courier-buttons">
++                <button id="edn-btn-decrypt" class="btn btn-primary">
++                  🔓 Decapsulate & Decrypt Delivery Note
++                </button>
++                <button id="edn-btn-tamper" class="btn edn-btn-warning" title="Test AEAD integrity verification by modifying ciphertext or metadata">
++                  ⚠️ Simulate Tamper Attack
++                </button>
++              </div>
++            </div>
++
++            <div class="edn-col">
++              <div id="edn-decrypt-result" class="edn-result-box">
++                <div class="edn-placeholder-msg">
++                  <p>Awaiting envelope decryption...</p>
++                  <small>Seal a note in Tab 1 and click "Open in Courier Terminal" or paste an envelope here.</small>
++                </div>
++              </div>
++            </div>
++          </div>
++        </div>
++      </div>
++    </div>
++  `;
++
++  attachEventListeners();
++  updateAlgorithmView();
++}
++
++function updateAlgorithmView() {
++  const algoId = state.selectedAlgorithm;
++  const algo = KEM_ALGORITHMS[algoId];
++  if (!algo) return;
++
++  // Ensure keypair exists
++  if (!state.keyPairs[algoId]) {
++    state.keyPairs[algoId] = generateKeyPair(algoId);
++  }
++  const keyPair = state.keyPairs[algoId];
++
++  // Update public key UI
++  const pkEl = document.getElementById('edn-public-key');
++  const pkFingerprintEl = document.getElementById('edn-pk-fingerprint');
++  const pkLengthEl = document.getElementById('edn-pk-length');
++
++  if (pkEl) pkEl.value = keyPair.publicKeyBase64;
++  if (pkFingerprintEl) pkFingerprintEl.textContent = keyPair.fingerprint;
++  if (pkLengthEl) pkLengthEl.textContent = `${keyPair.publicKeyBytes.length} bytes`;
++
++  // Update courier private key in Tab 2
++  const courierSkEl = document.getElementById('edn-courier-sk');
++  const courierSkFpEl = document.getElementById('edn-courier-sk-fingerprint');
++  if (courierSkEl) courierSkEl.value = keyPair.secretKeyBase64;
++  if (courierSkFpEl) courierSkFpEl.textContent = `Algorithm: ${algo.id}`;
++
++  // Update info card
++  const infoEl = document.getElementById('edn-algo-info');
++  if (infoEl) {
++    infoEl.innerHTML = `
++      <div class="edn-badges-row">
++        ${algo.pqcProtected ? '<span class="edn-badge edn-badge-pqc">🛡️ Post-Quantum Protected</span>' : ''}
++        ${algo.classicalProtected ? '<span class="edn-badge edn-badge-ecc">⚡ Classical ECDH</span>' : ''}
++        <span class="edn-badge edn-badge-aead">🔒 AES-256-GCM AEAD</span>
++      </div>
++      <p class="edn-algo-desc">${algo.description}</p>
++      <div class="edn-algo-meta">
++        <span><strong>Type:</strong> ${algo.type}</span> | 
++        <span><strong>Strength:</strong> ${algo.securityLevel}</span>
++      </div>
++    `;
++  }
++}
++
++function attachEventListeners() {
++  // Tab switching
++  const tabSeal = document.getElementById('edn-tab-seal');
++  const tabOpen = document.getElementById('edn-tab-open');
++  const panelSeal = document.getElementById('edn-panel-seal');
++  const panelOpen = document.getElementById('edn-panel-open');
++
++  tabSeal?.addEventListener('click', () => {
++    tabSeal.classList.add('active');
++    tabOpen?.classList.remove('active');
++    panelSeal?.classList.add('active');
++    panelOpen?.classList.remove('active');
++  });
++
++  tabOpen?.addEventListener('click', () => {
++    tabOpen.classList.add('active');
++    tabSeal?.classList.remove('active');
++    panelOpen?.classList.add('active');
++    panelSeal?.classList.remove('active');
++  });
++
++  // Algorithm select change
++  const algoSelect = document.getElementById('edn-algo-select');
++  algoSelect?.addEventListener('change', (e) => {
++    state.selectedAlgorithm = e.target.value;
++    updateAlgorithmView();
++  });
++
++  // Regenerate keys
++  const regenBtn = document.getElementById('edn-regen-keys');
++  regenBtn?.addEventListener('click', () => {
++    state.keyPairs[state.selectedAlgorithm] = generateKeyPair(state.selectedAlgorithm);
++    updateAlgorithmView();
++    showNotification('Fresh recipient keypair generated for ' + state.selectedAlgorithm);
++  });
++
++  // Note character counter
++  const noteInput = document.getElementById('edn-note-input');
++  const charCount = document.getElementById('edn-char-count');
++  noteInput?.addEventListener('input', () => {
++    if (charCount) charCount.textContent = `${noteInput.value.length} characters`;
++  });
++
++  // Presets
++  const presetBtns = document.querySelectorAll('.edn-chip-btn');
++  presetBtns.forEach(btn => {
++    btn.addEventListener('click', () => {
++      const idx = parseInt(btn.getAttribute('data-preset'), 10);
++      if (PRESETS[idx] && noteInput) {
++        noteInput.value = PRESETS[idx].text;
++        noteInput.dispatchEvent(new Event('input'));
++      }
++    });
++  });
++
++  // Encrypt button
++  const encryptBtn = document.getElementById('edn-btn-encrypt');
++  encryptBtn?.addEventListener('click', handleEncryptNote);
++
++  // Copy button
++  const copyBtn = document.getElementById('edn-btn-copy');
++  copyBtn?.addEventListener('click', () => {
++    if (!state.lastSealedEnvelope) return;
++    navigator.clipboard?.writeText(JSON.stringify(state.lastSealedEnvelope, null, 2))
++      .then(() => showNotification('Envelope JSON copied to clipboard!'))
++      .catch(() => alert('Copied!'));
++  });
++
++  // Open in courier terminal button
++  const sendCourierBtn = document.getElementById('edn-btn-send-courier');
++  sendCourierBtn?.addEventListener('click', () => {
++    if (!state.lastSealedEnvelope) return;
++    const courierInput = document.getElementById('edn-courier-input');
++    if (courierInput) {
++      courierInput.value = JSON.stringify(state.lastSealedEnvelope, null, 2);
++    }
++    tabOpen?.click();
++    showNotification('Envelope dispatched to Courier Terminal. Click Decrypt to view!');
++  });
++
++  // Toggle courier private key visibility
++  const toggleSkBtn = document.getElementById('edn-toggle-sk');
++  const courierSkInput = document.getElementById('edn-courier-sk');
++  toggleSkBtn?.addEventListener('click', () => {
++    if (!courierSkInput) return;
++    if (courierSkInput.type === 'password') {
++      courierSkInput.type = 'text';
++      toggleSkBtn.textContent = '🙈 Hide Private Key';
++    } else {
++      courierSkInput.type = 'password';
++      toggleSkBtn.textContent = '👁️ Show Private Key';
++    }
++  });
++
++  // Courier Decrypt button
++  const decryptBtn = document.getElementById('edn-btn-decrypt');
++  decryptBtn?.addEventListener('click', handleDecryptNote);
++
++  // Tamper simulation button
++  const tamperBtn = document.getElementById('edn-btn-tamper');
++  tamperBtn?.addEventListener('click', handleTamperSimulation);
++}
++
++async function handleEncryptNote() {
++  const noteInput = document.getElementById('edn-note-input');
++  const orderIdInput = document.getElementById('edn-order-id');
++  const note = noteInput?.value?.trim();
++  const orderId = orderIdInput?.value?.trim() || state.orderId;
++
++  if (!note) {
++    alert('Please enter or select delivery instructions to encrypt.');
++    noteInput?.focus();
++    return;
++  }
++
++  const keyPair = state.keyPairs[state.selectedAlgorithm];
++  if (!keyPair) {
++    alert('No keypair available for this algorithm.');
++    return;
++  }
++
++  try {
++    const result = await sealDeliveryNote({
++      recipientPublicKeyBase64: keyPair.publicKeyBase64,
++      algorithmId: state.selectedAlgorithm,
++      note,
++      orderId,
++      metadata: {
++        app: 'The Daily Grind Artisanal Coffee',
++        deliveryMethod: 'Morning Express Roaster Drop'
++      }
++    });
++
++    state.lastSealedEnvelope = result.envelope;
++
++    // Update pipeline steps UI
++    const stepKemData = document.getElementById('edn-step-kem-data');
++    if (stepKemData) {
++      stepKemData.innerHTML = `
++        <span class="edn-tag-ok">Shared Secret Established (${result.sharedSecretFingerprint})</span>
++        <br><small>KEM Ciphertext: ${result.kemCiphertextBytes} bytes</small>
++      `;
++    }
++
++    const stepHkdfData = document.getElementById('edn-step-hkdf-data');
++    if (stepHkdfData) {
++      stepHkdfData.innerHTML = `
++        <span class="edn-tag-ok">AES Key Derived (${result.aesKeyFingerprint})</span>
++        <br><small>HKDF-SHA256 with domain context: TheDailyGrind:${result.envelope.algorithm}:AES-256-GCM</small>
++      `;
++    }
++
++    const stepAeadData = document.getElementById('edn-step-aead-data');
++    if (stepAeadData) {
++      stepAeadData.innerHTML = `
++        <span class="edn-tag-ok">AES-256-GCM Ciphertext & Tag Created</span>
++        <br><small>Ciphertext: ${result.ciphertextBytes} bytes, IV: 12 bytes, Tag: 128-bit</small>
++      `;
++    }
++
++    // Display sealed card
++    const sealedCard = document.getElementById('edn-sealed-card');
++    const sealedJson = document.getElementById('edn-sealed-json');
++    const sealMeta = document.getElementById('edn-seal-meta');
++
++    if (sealedJson) sealedJson.textContent = JSON.stringify(result.envelope, null, 2);
++    if (sealMeta) {
++      sealMeta.innerHTML = `
++        <span>Algorithm: <strong>${result.envelope.algorithm}</strong></span> &bull; 
++        <span>Order: <strong>${result.envelope.orderId}</strong></span> &bull; 
++        <span>Protected: <strong>${result.envelope.pqcProtected ? 'Post-Quantum + AEAD' : 'AEAD Authenticated'}</strong></span>
++      `;
++    }
++    if (sealedCard) sealedCard.style.display = 'block';
++
++    // Auto populate courier input
++    const courierInput = document.getElementById('edn-courier-input');
++    if (courierInput) {
++      courierInput.value = JSON.stringify(result.envelope, null, 2);
++    }
++
++    showNotification('Delivery note sealed with ' + result.envelope.algorithmName + '!');
++  } catch (err) {
++    console.error('Encryption failed:', err);
++    alert('Encryption error: ' + err.message);
++  }
++}
++
++async function handleDecryptNote() {
++  const courierInput = document.getElementById('edn-courier-input');
++  const resultBox = document.getElementById('edn-decrypt-result');
++  const rawInput = courierInput?.value?.trim();
++
++  if (!rawInput) {
++    alert('Please seal a note first or paste an envelope JSON.');
++    return;
++  }
++
++  let envelope;
++  try {
++    envelope = JSON.parse(rawInput);
++  } catch (err) {
++    if (resultBox) {
++      resultBox.innerHTML = `
++        <div class="edn-alert edn-alert-danger">
++          <h4>❌ JSON Parsing Error</h4>
++          <p>The input text is not a valid JSON envelope.</p>
++        </div>
++      `;
++    }
++    return;
++  }
++
++  const keyPair = state.keyPairs[envelope.algorithm];
++  if (!keyPair) {
++    if (resultBox) {
++      resultBox.innerHTML = `
++        <div class="edn-alert edn-alert-danger">
++          <h4>❌ Key Mismatch</h4>
++          <p>No courier private key found for algorithm: <strong>${envelope.algorithm}</strong></p>
++        </div>
++      `;
++    }
++    return;
++  }
++
++  try {
++    const openResult = await openDeliveryNote({
++      envelope,
++      recipientSecretKeyBase64: keyPair.secretKeyBase64
++    });
++
++    if (resultBox) {
++      resultBox.innerHTML = `
++        <div class="edn-alert edn-alert-success">
++          <div class="edn-alert-header">
++            <h4>✅ Authenticated & Decrypted Successfully</h4>
++            <span class="edn-badge-verified">AEAD Tag Verified</span>
++          </div>
++          <div class="edn-decrypted-content">
++            <label>Decrypted Sensitive Instructions:</label>
++            <div class="edn-note-text">${escapeHtml(openResult.plaintextNote)}</div>
++          </div>
++          <div class="edn-decrypted-audit">
++            <p><strong>Order ID:</strong> ${escapeHtml(openResult.orderId)}</p>
++            <p><strong>Key Agreement / KEM:</strong> ${escapeHtml(openResult.algorithmName)}</p>
++            <p><strong>Post-Quantum Safe:</strong> ${openResult.pqcProtected ? 'Yes (FIPS 203 Lattice KEM)' : 'Classical Only'}</p>
++            <p><strong>Shared Secret Fingerprint:</strong> ${openResult.sharedSecretFingerprint}</p>
++            <p><strong>Timestamp:</strong> ${new Date(openResult.timestamp).toLocaleString()}</p>
++          </div>
++        </div>
++      `;
++    }
++  } catch (err) {
++    console.error('Decryption failed:', err);
++    if (resultBox) {
++      resultBox.innerHTML = `
++        <div class="edn-alert edn-alert-danger">
++          <h4>🚨 Cryptographic Authentication Verification FAILED!</h4>
++          <p>${escapeHtml(err.message)}</p>
++          <hr>
++          <small>
++            Authenticated Encryption with Associated Data (AEAD AES-256-GCM) ensures that even a 1-bit alteration 
++            in ciphertext, nonce, or order metadata causes instant rejection, protecting against active man-in-the-middle attacks.
++          </small>
++        </div>
++      `;
++    }
++  }
++}
++
++async function handleTamperSimulation() {
++  const courierInput = document.getElementById('edn-courier-input');
++  const rawInput = courierInput?.value?.trim();
++
++  if (!rawInput) {
++    alert('Please seal a note first so there is an envelope to tamper with.');
++    return;
++  }
++
++  try {
++    const envelope = JSON.parse(rawInput);
++    
++    // Flip a bit in the ciphertext to simulate interception/tampering
++    const bytes = base64ToBytes(envelope.ciphertext);
++    bytes[0] ^= 0x01;
++    let binary = '';
++    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
++    envelope.ciphertext = btoa(binary);
++
++    courierInput.value = JSON.stringify(envelope, null, 2);
++    showNotification('⚠️ Tampered with 1 bit of AES-GCM ciphertext! Click Decrypt to test.');
++
++    // Automatically trigger decryption to demonstrate rejection
++    await handleDecryptNote();
++  } catch (err) {
++    alert('Failed to tamper envelope: ' + err.message);
++  }
++}
++
++function escapeHtml(str) {
++  if (!str) return '';
++  return str.replace(/[&<>'"]/g, tag => ({
++    '&': '&amp;',
++    '<': '&lt;',
++    '>': '&gt;',
++    "'": '&#39;',
++    '"': '&quot;'
++  }[tag] || tag));
++}
++
++function showNotification(msg) {
++  let toast = document.getElementById('edn-toast');
++  if (!toast) {
++    toast = document.createElement('div');
++    toast.id = 'edn-toast';
++    toast.className = 'edn-toast';
++    document.body.appendChild(toast);
++  }
++  toast.textContent = msg;
++  toast.classList.add('show');
++  setTimeout(() => toast.classList.remove('show'), 3500);
++}
++
++// Automatically initialize when DOM is loaded
++if (typeof document !== 'undefined') {
++  if (document.readyState === 'loading') {
++    document.addEventListener('DOMContentLoaded', initEncryptedNotes);
++  } else {
++    initEncryptedNotes();
++  }
++}
+diff --git a/test/crypto.test.js b/test/crypto.test.js
+new file mode 100644
+index 0000000..1a65fd6
+--- /dev/null
++++ b/test/crypto.test.js
+@@ -0,0 +1,117 @@
++import assert from 'node:assert/strict';
++import {
++  KEM_ALGORITHMS,
++  generateKeyPair,
++  sealDeliveryNote,
++  openDeliveryNote
++} from '../src/crypto.js';
++
++async function runTests() {
++  console.log('Running Encrypted Delivery Notes Cryptographic Tests...\n');
++
++  const algorithms = Object.keys(KEM_ALGORITHMS);
++  assert(algorithms.length >= 4, 'Should support at least 4 algorithms');
++  console.log(`Registered algorithms (${algorithms.length}):`, algorithms.join(', '));
++
++  for (const algoId of algorithms) {
++    console.log(`\nTesting algorithm: ${algoId} (${KEM_ALGORITHMS[algoId].name})...`);
++
++    // 1. Key generation
++    const keyPair = generateKeyPair(algoId);
++    assert.ok(keyPair.publicKeyBase64, 'Public key should exist');
++    assert.ok(keyPair.secretKeyBase64, 'Secret key should exist');
++    assert.ok(keyPair.fingerprint, 'Fingerprint should exist');
++    console.log(`  ✓ Keypair generated (Fingerprint: ${keyPair.fingerprint})`);
++
++    // 2. Encryption / Sealing
++    const noteText = `Gate Code: #4829. Watch out for Buster the Lab. Order: ${algoId}`;
++    const orderId = `TEST-${Date.now().toString(36).toUpperCase()}`;
++
++    const sealResult = await sealDeliveryNote({
++      recipientPublicKeyBase64: keyPair.publicKeyBase64,
++      algorithmId: algoId,
++      note: noteText,
++      orderId,
++      metadata: { customerId: 'cust_7721' }
++    });
++
++    assert.ok(sealResult.envelope, 'Envelope should be generated');
++    assert.equal(sealResult.envelope.algorithm, algoId);
++    assert.equal(sealResult.envelope.orderId, orderId);
++    assert.ok(sealResult.envelope.kemCiphertext, 'KEM ciphertext should exist');
++    assert.ok(sealResult.envelope.ciphertext, 'AES ciphertext should exist');
++    assert.ok(sealResult.envelope.iv, 'IV should exist');
++    console.log(`  ✓ Note sealed with AEAD AES-256-GCM (CT len: ${sealResult.ciphertextBytes} bytes, KEM CT len: ${sealResult.kemCiphertextBytes} bytes)`);
++
++    // 3. Decryption / Opening
++    const openResult = await openDeliveryNote({
++      envelope: sealResult.envelope,
++      recipientSecretKeyBase64: keyPair.secretKeyBase64
++    });
++
++    assert.equal(openResult.plaintextNote, noteText, 'Decrypted text must match original note');
++    assert.equal(openResult.orderId, orderId);
++    assert.equal(openResult.verified, true);
++    assert.equal(openResult.sharedSecretHex, sealResult.sharedSecretHex, 'Derived shared secrets must match');
++    console.log('  ✓ Note successfully decapsulated and decrypted with tag verification');
++
++    // 4. Tamper Test: modified ciphertext byte
++    const tamperedEnvelope1 = JSON.parse(JSON.stringify(sealResult.envelope));
++    const ctBytes = Buffer.from(tamperedEnvelope1.ciphertext, 'base64');
++    ctBytes[0] ^= 0x01; // flip 1 bit
++    tamperedEnvelope1.ciphertext = ctBytes.toString('base64');
++
++    await assert.rejects(
++      async () => {
++        await openDeliveryNote({
++          envelope: tamperedEnvelope1,
++          recipientSecretKeyBase64: keyPair.secretKeyBase64
++        });
++      },
++      /Authenticated decryption failed/,
++      'Tampered ciphertext should fail AEAD authentication tag check'
++    );
++    console.log('  ✓ Tampered ciphertext rejected by AEAD tag check');
++
++    // 5. Tamper Test: modified Additional Authenticated Data (AAD)
++    const tamperedEnvelope2 = JSON.parse(JSON.stringify(sealResult.envelope));
++    tamperedEnvelope2.aad = tamperedEnvelope2.aad.replace(orderId, 'ATTACKER_ORDER_999');
++
++    await assert.rejects(
++      async () => {
++        await openDeliveryNote({
++          envelope: tamperedEnvelope2,
++          recipientSecretKeyBase64: keyPair.secretKeyBase64
++        });
++      },
++      /Authenticated decryption failed/,
++      'Tampered AAD should fail AEAD authentication tag check'
++    );
++    console.log('  ✓ Tampered AAD rejected by AEAD tag check');
++
++    // 6. Tamper Test: modified KEM ciphertext (flip byte in coordinate)
++    const tamperedEnvelope3 = JSON.parse(JSON.stringify(sealResult.envelope));
++    const kemCtBytes = Buffer.from(tamperedEnvelope3.kemCiphertext, 'base64');
++    kemCtBytes[kemCtBytes.length > 2 ? 2 : 0] ^= 0x01; // flip 1 bit in coordinate
++    tamperedEnvelope3.kemCiphertext = kemCtBytes.toString('base64');
++
++    await assert.rejects(
++      async () => {
++        await openDeliveryNote({
++          envelope: tamperedEnvelope3,
++          recipientSecretKeyBase64: keyPair.secretKeyBase64
++        });
++      },
++      /(KEM decapsulation failed|Authenticated decryption failed)/,
++      'Tampered KEM ciphertext should fail decapsulation or AEAD decryption'
++    );
++    console.log('  ✓ Tampered KEM ciphertext rejected');
++  }
++
++  console.log('\n🎉 ALL CRYPTOGRAPHIC TESTS PASSED SUCCESSFULLY!');
++}
++
++runTests().catch(err => {
++  console.error('Test failed:', err);
++  process.exit(1);
++});

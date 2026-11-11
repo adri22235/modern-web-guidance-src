@@ -1,0 +1,301 @@
+diff --git a/index.html b/index.html
+index 66c9173..eeec153 100644
+--- a/index.html
++++ b/index.html
+@@ -152,6 +152,43 @@
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    .order-status {
++      display: none;
++      background: var(--accent);
++      color: var(--text);
++      text-align: center;
++      padding: 10px 20px;
++      font-weight: 600;
++    }
++
++    .order-status.visible {
++      display: block;
++    }
++
++    .rewards-widget {
++      margin-top: 40px;
++      text-align: center;
++    }
++
++    .rewards-widget iframe {
++      width: 100%;
++      max-width: 420px;
++      height: 170px;
++      border: 1px solid var(--secondary);
++      border-radius: 8px;
++      background: white;
++    }
++
++    .rewards-points {
++      margin-top: 10px;
++      font-weight: 600;
++    }
++
++    a[data-external]::after {
++      content: " \2197";
++      font-size: 0.75em;
++    }
+   </style>
+ </head>
+ 
+@@ -168,10 +205,12 @@
+     </ul>
+   </nav>
+ 
++  <div id="order-status" class="order-status" role="status" aria-live="polite"></div>
++
+   <header class="hero">
+     <h1>Wake Up Your Senses</h1>
+     <p>Ethically sourced, locally roasted, delivered to your cup.</p>
+-    <a href="/order-online" class="btn">Order Now</a>
++    <a href="https://order.thedailygrind.com/" class="btn" id="order-now">Order Now</a>
+   </header>
+ 
+   <main class="container">
+@@ -195,6 +234,12 @@
+         </div>
+       </div>
+     </section>
++
++    <section class="rewards-widget" aria-labelledby="rewards-heading">
++      <h2 id="rewards-heading">Daily Check-In</h2>
++      <iframe id="rewards-widget" title="Rewards check-in widget" sandbox="allow-scripts"></iframe>
++      <p class="rewards-points" id="rewards-points" aria-live="polite">Loading your rewards&hellip;</p>
++    </section>
+   </main>
+ 
+   <footer>
+@@ -204,9 +249,225 @@
+       <a href="/contact">Contact Us</a> |
+       <a href="/privacy-policy">Privacy</a>
+     </div>
++    <div class="footer-links">
++      <a href="https://www.instagram.com/">Instagram</a> |
++      <a href="https://www.fairtrade.net/">Fairtrade</a> |
++      <a href="https://shop.thedailygrind.com/">Shop Beans</a>
++    </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script>
++    (() => {
++      'use strict';
++
++      // ---- Configuration ---------------------------------------------------
++      // Exact origin of the ordering app (popup / embedded checkout).
++      const TRUSTED_ORDER_URL = 'https://order.thedailygrind.com';
++      // Registrable domain we control; only used by the same-site fallback for
++      // browsers without the Origin API (which can't consult the Public Suffix List).
++      const SITE_DOMAIN = 'thedailygrind.com';
++
++      const hasOriginApi = 'Origin' in globalThis &&
++        typeof Origin.from === 'function' &&
++        typeof Origin.prototype.isSameOrigin === 'function';
++
++      // ---- Origin helpers --------------------------------------------------
++      function extractOrigin(candidate) {
++        try {
++          return Origin.from(candidate);
++        } catch (err) {
++          // Synthetic MessageEvents (e.g. in tests) lack an internal origin.
++          if (candidate instanceof MessageEvent) return Origin.from(candidate.origin);
++          throw err;
++        }
++      }
++
++      // Resolve a string / URL / <a> into an absolute URL object (relative
++      // strings are resolved against the current document).
++      function toUrl(candidate) {
++        if (candidate instanceof URL) return candidate;
++        if (candidate instanceof HTMLAnchorElement || candidate instanceof HTMLAreaElement) {
++          return new URL(candidate.href);
++        }
++        if (typeof candidate === 'string') return new URL(candidate, document.baseURI);
++        throw new TypeError('Unsupported URL candidate');
++      }
++
++      function isTrustedOrderMessage(event) {
++        try {
++          if (hasOriginApi) {
++            return extractOrigin(event).isSameOrigin(Origin.from(TRUSTED_ORDER_URL));
++          }
++          if (typeof event.origin !== 'string' || event.origin === 'null') return false;
++          return new URL(event.origin).origin === new URL(TRUSTED_ORDER_URL).origin;
++        } catch {
++          return false;
++        }
++      }
++
++      // Schemeful same-site check against the current page. Rejects opaque
++      // targets (data:, javascript:, blob of opaque origin, etc.).
++      function isSameSiteUrl(candidate) {
++        try {
++          const url = toUrl(candidate);
++          if (hasOriginApi && typeof Origin.prototype.isSameSite === 'function') {
++            const origin = Origin.from(url);
++            return !origin.opaque && origin.isSameSite(Origin.from(self));
++          }
++          if (url.origin === 'null') return false;
++          if (url.origin === location.origin) return true;
++          // Fallback: exact or dot-prefixed match on a known private domain,
++          // never on split('.') heuristics.
++          const hostMatches = (host) =>
++            host === SITE_DOMAIN || host.endsWith('.' + SITE_DOMAIN);
++          return url.protocol === location.protocol &&
++            hostMatches(url.hostname) && hostMatches(location.hostname);
++        } catch {
++          return false;
++        }
++      }
++
++      // Returns a safe absolute href for same-site redirects, or null.
++      function safeRedirectTarget(candidate) {
++        if (!isSameSiteUrl(candidate)) return null;
++        const url = toUrl(candidate);
++        return (url.protocol === 'https:' || url.protocol === 'http:') ? url.href : null;
++      }
++
++      function redirectSameSite(candidate) {
++        const target = safeRedirectTarget(candidate);
++        if (target) {
++          location.assign(target);
++          return true;
++        }
++        console.warn('Blocked redirect to untrusted URL:', candidate);
++        return false;
++      }
++
++      // ---- External link classification -----------------------------------
++      function classifyLinks(root = document) {
++        for (const link of root.querySelectorAll('a[href]')) {
++          let url;
++          try { url = new URL(link.href); } catch { continue; }
++          if (url.protocol !== 'https:' && url.protocol !== 'http:') continue;
++          if (isSameSiteUrl(link)) {
++            link.removeAttribute('data-external');
++            continue;
++          }
++          link.dataset.external = '';
++          link.target = '_blank';
++          link.relList.add('noopener', 'noreferrer');
++        }
++      }
++
++      // ---- ?returnTo= handling ---------------------------------------------
++      const returnTo = new URLSearchParams(location.search).get('returnTo');
++      if (returnTo !== null) {
++        const cleaned = new URL(location.href);
++        cleaned.searchParams.delete('returnTo');
++        history.replaceState(null, '', cleaned);
++        redirectSameSite(returnTo);
++      }
++
++      // ---- Ordering window -------------------------------------------------
++      const statusEl = document.getElementById('order-status');
++      function showOrderStatus(text) {
++        statusEl.textContent = text;
++        statusEl.classList.add('visible');
++      }
++
++      document.getElementById('order-now').addEventListener('click', (e) => {
++        const popup = window.open(TRUSTED_ORDER_URL + '/', 'daily-grind-order', 'popup,width=480,height=720');
++        if (popup) e.preventDefault(); // otherwise fall back to normal navigation
++      });
++
++      function handleOrderMessage(data) {
++        if (!data || typeof data !== 'object') return;
++        switch (data.type) {
++          case 'order-status':
++            if (typeof data.message === 'string') showOrderStatus(data.message.slice(0, 200));
++            break;
++          case 'order-complete':
++            showOrderStatus('Your order is confirmed! We’ll have it ready soon.');
++            if (typeof data.returnTo === 'string') redirectSameSite(data.returnTo);
++            break;
++        }
++      }
++
++      // ---- Sandboxed rewards widget ----------------------------------------
++      const widgetFrame = document.getElementById('rewards-widget');
++      const pointsEl = document.getElementById('rewards-points');
++
++      // Deny-all sentinel until the widget initializes; pinned exactly once.
++      let pinnedWidgetOrigin = hasOriginApi ? new Origin() : null;
++      let widgetPinned = false;
++
++      function isPinnedWidgetMessage(event) {
++        try {
++          if (hasOriginApi) {
++            const sender = Origin.from(event);
++            if (!sender.opaque) return false;
++            if (!widgetPinned && event.source === widgetFrame.contentWindow &&
++                event.data?.type === 'init') {
++              pinnedWidgetOrigin = sender;
++              widgetPinned = true;
++            }
++            return sender.isSameOrigin(pinnedWidgetOrigin);
++          }
++          // Fallback: event.origin is always "null" for sandboxed frames, so pin
++          // on the widget's WindowProxy instead of comparing origin strings.
++          if (event.origin !== 'null' || event.source !== widgetFrame.contentWindow) return false;
++          if (!widgetPinned && event.data?.type === 'init') widgetPinned = true;
++          return widgetPinned;
++        } catch {
++          return false;
++        }
++      }
++
++      function handleWidgetMessage(data) {
++        if (!data || typeof data !== 'object') return;
++        if (data.type === 'init' || data.type === 'points') {
++          const points = Number(data.points);
++          if (Number.isSafeInteger(points) && points >= 0) {
++            pointsEl.textContent = `You have ${points} reward point${points === 1 ? '' : 's'}.`;
++          }
++        }
++      }
++
++      widgetFrame.srcdoc = `<!DOCTYPE html>
++<html lang="en"><head><meta charset="utf-8"><style>
++  body{font-family:'Segoe UI',sans-serif;margin:0;padding:20px;text-align:center;color:#3e2723}
++  button{background:#4e342e;color:#fff;border:0;border-radius:5px;padding:10px 20px;font-size:1rem;cursor:pointer}
++  button:disabled{opacity:.6;cursor:default}
++</style></head><body>
++  <p>Check in today to earn 10 points.</p>
++  <button id="checkin" type="button">Check In</button>
++  <script>
++    let points = 120;
++    parent.postMessage({ type: 'init', points }, '*');
++    document.getElementById('checkin').addEventListener('click', (e) => {
++      points += 10;
++      e.target.disabled = true;
++      e.target.textContent = 'Checked in ✓';
++      parent.postMessage({ type: 'points', points }, '*');
++    });
++  <\/script>
++</body></html>`;
++
++      // ---- Single message dispatcher ---------------------------------------
++      window.addEventListener('message', (event) => {
++        if (isTrustedOrderMessage(event)) {
++          handleOrderMessage(event.data);
++        } else if (isPinnedWidgetMessage(event)) {
++          handleWidgetMessage(event.data);
++        }
++        // Everything else (other origins, other sandboxed iframes) is ignored.
++      });
++
++      classifyLinks();
++    })();
++  </script>
+ </body>
+ 
+ </html>

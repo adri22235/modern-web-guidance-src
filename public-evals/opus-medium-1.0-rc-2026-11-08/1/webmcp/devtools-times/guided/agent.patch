@@ -1,0 +1,660 @@
+diff --git a/src/components/ArticleTools.tsx b/src/components/ArticleTools.tsx
+new file mode 100644
+index 0000000..6b38c21
+--- /dev/null
++++ b/src/components/ArticleTools.tsx
+@@ -0,0 +1,71 @@
++import { articleUrl } from '../utils/articleApi';
++import { useWebMCP } from '../utils/useWebMCP';
++
++interface Props {
++  slug: string;
++  title: string;
++  summary: string;
++  author: string;
++  category: string;
++  date: string;
++  readingTime?: number;
++}
++
++const WORDS_PER_MINUTE = 200;
++
++const articleBody = () => document.querySelector<HTMLElement>('[data-article-body]');
++
++const paragraphs = () =>
++  Array.from(articleBody()?.querySelectorAll<HTMLElement>('p, li, blockquote') ?? []);
++
++// WebMCP tools for the article currently open in the tab. Renders nothing.
++export default function ArticleTools({ slug, title, summary, author, category, date, readingTime }: Props) {
++  useWebMCP({
++    name: 'get-current-article',
++    description: 'Returns the article open in this tab: headline, byline, publish date and full text. Use to summarize, quote or answer questions about the story the user is reading.',
++    execute() {
++      const text = articleBody()?.innerText.trim() ?? '';
++      const wordCount = text ? text.split(/\s+/).length : 0;
++      return {
++        slug,
++        url: articleUrl(slug),
++        title,
++        summary,
++        author,
++        category,
++        publishedOn: date,
++        wordCount,
++        readingTimeMinutes: readingTime ?? Math.max(1, Math.round(wordCount / WORDS_PER_MINUTE)),
++        text,
++      };
++    },
++    annotations: { readOnlyHint: true },
++  });
++
++  useWebMCP<{ text?: unknown }>({
++    name: 'find-in-article',
++    description: 'Finds the passages of the open article that mention a word or phrase and scrolls the first one into view so the user can read it in context.',
++    inputSchema: {
++      type: 'object',
++      properties: {
++        text: { type: 'string', description: 'Word or phrase to look for, e.g. "Maillard reaction".' },
++      },
++      required: ['text'],
++    },
++    execute({ text }) {
++      if (typeof text !== 'string' || !text.trim()) {
++        return { error: 'Pass the word or phrase to find in the article.' };
++      }
++      const needle = text.trim().toLowerCase();
++      const matches = paragraphs().filter(element => element.innerText.toLowerCase().includes(needle));
++      if (matches.length === 0) {
++        return { error: `The article does not mention "${text}".` };
++      }
++      matches[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
++      return { matchCount: matches.length, passages: matches.map(element => element.innerText.trim()) };
++    },
++    annotations: { readOnlyHint: true },
++  });
++
++  return null;
++}
+diff --git a/src/components/BookmarkButton.tsx b/src/components/BookmarkButton.tsx
+index f089dc0..d8c5d4f 100644
+--- a/src/components/BookmarkButton.tsx
++++ b/src/components/BookmarkButton.tsx
+@@ -1,6 +1,7 @@
+-
+ import React, { useState, useEffect } from 'react';
+ import { BookmarkIcon } from '@heroicons/react/24/outline'
++import { errorMessage, fetchReadingList, toggleReadingList } from '../utils/articleApi';
++import { useWebMCP } from '../utils/useWebMCP';
+ 
+ interface Props {
+   slug: string;
+@@ -22,8 +23,37 @@ export default function BookmarkButton({ slug, initialIsBookmarked }: Props) {
+     setIsBookmarked(data.readingList.includes(slug));
+   };
+ 
++  useWebMCP<{ saved?: unknown }>({
++    name: 'save-current-article',
++    description: "Adds the article open in this tab to the user's reading list, or removes it.",
++    inputSchema: {
++      type: 'object',
++      properties: {
++        saved: { type: 'boolean', default: true, description: 'true to keep the article in the reading list, false to take it out.' },
++      },
++    },
++    async execute({ saved = true }, { signal }) {
++      if (typeof saved !== 'boolean') {
++        return { error: 'saved must be true or false.' };
++      }
++      try {
++        // The API toggles, so check the current state first to make this idempotent.
++        let readingList = await fetchReadingList(signal);
++        if (readingList.includes(slug) !== saved) {
++          readingList = await toggleReadingList(slug, signal);
++        }
++        const isSaved = readingList.includes(slug);
++        setIsBookmarked(isSaved);
++        return isSaved ? 'The article is in the reading list.' : 'The article is not in the reading list.';
++      } catch (error) {
++        if (signal.aborted) throw error;
++        return { error: errorMessage(error) };
++      }
++    },
++  });
++
+   return (
+-    <button onClick={handleClick} className="p-1">
++    <button onClick={handleClick} className="p-1" aria-label={isBookmarked ? 'Remove from reading list' : 'Save to reading list'} aria-pressed={isBookmarked}>
+       <BookmarkIcon className={`h-5 w-5 ${isBookmarked ? 'text-amber-400 fill-current' : 'text-gray-400'}`}></BookmarkIcon>
+     </button>
+   );
+diff --git a/src/components/ReadingListButton.tsx b/src/components/ReadingListButton.tsx
+index 29642be..de05ef8 100644
+--- a/src/components/ReadingListButton.tsx
++++ b/src/components/ReadingListButton.tsx
+@@ -1,6 +1,7 @@
+ 
+ import React, { useState, useEffect } from 'react';
+ import ReadingListFlyout from './ReadingListFlyout';
++import { useWebMCP } from '../utils/useWebMCP';
+ 
+ interface Article {
+   slug: string;
+@@ -22,9 +23,18 @@ export default function ReadingListButton() {
+     fetchArticles();
+   }, []);
+ 
++  useWebMCP({
++    name: 'open-reading-list-panel',
++    description: "Opens the panel showing the user's saved reading list, where articles can be reviewed or removed.",
++    execute() {
++      setIsOpen(true);
++      return 'The reading list panel is open.';
++    },
++  });
++
+   return (
+     <>
+-      <button onClick={() => setIsOpen(true)} className="p-1">
++      <button onClick={() => setIsOpen(true)} className="p-1" aria-label="Reading list">
+         <svg
+           xmlns="http://www.w3.org/2000/svg"
+           className="h-6 w-6 text-gray-600"
+diff --git a/src/components/ReadingListFlyout.tsx b/src/components/ReadingListFlyout.tsx
+index 10bfbad..78d954f 100644
+--- a/src/components/ReadingListFlyout.tsx
++++ b/src/components/ReadingListFlyout.tsx
+@@ -1,5 +1,6 @@
+ 
+ import React, { useState, useEffect } from 'react';
++import { errorMessage, fetchReadingList as loadReadingList, toggleReadingList, type AgentSubmitEvent } from '../utils/articleApi';
+ 
+ interface Article {
+   slug: string;
+@@ -50,6 +51,39 @@ export default function ReadingListFlyout({ articles, onClose }: Props) {
+ 
+   const readingListArticles = articles.filter(article => readingList.includes(article.slug));
+ 
++  const removeSelected = async (slugs: string[]) => {
++    // The API toggles, so only send slugs that are still saved.
++    const saved = await loadReadingList();
++    const toRemove = slugs.filter(slug => saved.includes(slug));
++    let remaining = saved;
++    for (const slug of toRemove) {
++      remaining = await toggleReadingList(slug);
++    }
++    setReadingList(remaining);
++    return { removed: toRemove, notSaved: slugs.filter(slug => !toRemove.includes(slug)), readingList: remaining };
++  };
++
++  const handleSubmit = (event: React.FormEvent<HTMLFormElement>) => {
++    event.preventDefault();
++    const form = event.currentTarget;
++    const slugs = new FormData(form).getAll('slug').map(String);
++    const nativeEvent = event.nativeEvent as AgentSubmitEvent;
++    const agentInvoked = Boolean(nativeEvent.agentInvoked && nativeEvent.respondWith);
++
++    if (slugs.length === 0) {
++      if (agentInvoked) {
++        nativeEvent.respondWith!(Promise.resolve('Validation failed: slug (select at least one saved article to remove)'));
++      }
++      return;
++    }
++
++    const result = removeSelected(slugs).then(
++      outcome => { form.reset(); return outcome; },
++      error => ({ error: errorMessage(error) }),
++    );
++    if (agentInvoked) nativeEvent.respondWith!(result);
++  };
++
+   return (
+     <div className="fixed inset-0 bg-white/30 backdrop-blur-sm z-[99999] flex justify-center items-start p-4 pt-[15vh]" onClick={onClose}>
+       <div className="bg-white shadow-xl w-full max-w-2xl relative" onClick={e => e.stopPropagation()}>
+@@ -65,21 +99,46 @@ export default function ReadingListFlyout({ articles, onClose }: Props) {
+           {readingListArticles.length === 0 && (
+             <p className="text-gray-500 text-center py-8">Your reading list is empty.</p>
+           )}
+-          <ul className="space-y-2">
+-            {readingListArticles.map(article => (
+-              <li key={article.slug} className="flex items-center">
+-                <a href={`${import.meta.env.BASE_URL}articles/${article.slug}`} className="block hover:bg-gray-100 p-4 rounded-md transition-colors flex-grow">
+-                  <h4 className="font-bold text-lg text-gray-800 group-hover:text-amber-400">{article.title}</h4>
+-                  <p className="text-sm text-gray-600">{article.summary}</p>
+-                </a>
+-                <button onClick={() => handleRemove(article.slug)} className="p-2 text-gray-500 hover:text-amber-400">
+-                    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+-                    </svg>
+-                </button>
+-              </li>
+-            ))}
+-          </ul>
++          {readingListArticles.length > 0 && (
++            <form
++              onSubmit={handleSubmit}
++              {...({
++                toolname: 'remove-from-reading-list',
++                tooldescription: "Remove one or more saved articles from the user's reading list.",
++                toolautosubmit: '',
++              } as any)}
++            >
++              <fieldset {...({ toolparamdescription: 'Saved articles to remove from the reading list.' } as any)}>
++                <legend className="sr-only">Saved articles</legend>
++                <ul className="space-y-2">
++                  {readingListArticles.map(article => (
++                    <li key={article.slug} className="flex items-center">
++                      <input
++                        type="checkbox"
++                        id={`reading-list-${article.slug}`}
++                        name="slug"
++                        value={article.slug}
++                        className="ml-2 h-4 w-4 accent-amber-400"
++                      />
++                      <label htmlFor={`reading-list-${article.slug}`} className="sr-only">{article.title}</label>
++                      <a href={`${import.meta.env.BASE_URL}articles/${article.slug}`} className="block hover:bg-gray-100 p-4 rounded-md transition-colors flex-grow">
++                        <h4 className="font-bold text-lg text-gray-800 group-hover:text-amber-400">{article.title}</h4>
++                        <p className="text-sm text-gray-600">{article.summary}</p>
++                      </a>
++                      <button type="button" onClick={() => handleRemove(article.slug)} className="p-2 text-gray-500 hover:text-amber-400" aria-label={`Remove ${article.title}`}>
++                          <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
++                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
++                          </svg>
++                      </button>
++                    </li>
++                  ))}
++                </ul>
++              </fieldset>
++              <button type="submit" className="mt-4 bg-gray-800 text-white text-xs font-semibold py-2 px-3 rounded hover:bg-gray-700">
++                Remove selected
++              </button>
++            </form>
++          )}
+         </div>
+       </div>
+     </div>
+diff --git a/src/components/SearchButton.tsx b/src/components/SearchButton.tsx
+index 3f57913..b688b54 100644
+--- a/src/components/SearchButton.tsx
++++ b/src/components/SearchButton.tsx
+@@ -1,6 +1,7 @@
+ 
+ import React, { useState } from 'react';
+ import SearchFlyout from './SearchFlyout';
++import { useWebMCP } from '../utils/useWebMCP';
+ 
+ interface Article {
+     slug: string;
+@@ -28,6 +29,15 @@ export default function SearchButton() {
+         setIsFlyoutOpen(false);
+     };
+ 
++    useWebMCP({
++        name: 'open-search-panel',
++        description: 'Opens the article search panel so the user can see search results and featured stories.',
++        execute() {
++            setIsFlyoutOpen(true);
++            return 'The search panel is open.';
++        },
++    });
++
+     return (
+         <>
+             <button
+diff --git a/src/components/SearchFlyout.tsx b/src/components/SearchFlyout.tsx
+index 9dabc6e..55c5512 100644
+--- a/src/components/SearchFlyout.tsx
++++ b/src/components/SearchFlyout.tsx
+@@ -1,5 +1,6 @@
+ 
+ import React, { useState, useMemo, useEffect } from 'react';
++import { articleUrl, errorMessage, fetchArticles, searchArticles, type AgentSubmitEvent } from '../utils/articleApi';
+ 
+ interface Article {
+     slug: string;
+@@ -58,6 +59,28 @@ export default function SearchFlyout({ articles, onClose }: Props) {
+         );
+     }, [articles, searchTerm]);
+ 
++    const handleSubmit = (event: React.FormEvent<HTMLFormElement>) => {
++        event.preventDefault();
++        const query = String(new FormData(event.currentTarget).get('q') ?? '');
++        setSearchTerm(query);
++
++        const nativeEvent = event.nativeEvent as AgentSubmitEvent;
++        if (!nativeEvent.agentInvoked || !nativeEvent.respondWith) return;
++
++        nativeEvent.respondWith((async () => {
++            if (!query.trim()) {
++                return 'Validation failed: q (enter at least one keyword to search for)';
++            }
++            try {
++                const results = searchArticles(await fetchArticles(), query);
++                if (results.length === 0) return `No articles match "${query}".`;
++                return results.map(({ slug, title, summary }) => ({ slug, title, summary, url: articleUrl(slug) }));
++            } catch (error) {
++                return { error: errorMessage(error) };
++            }
++        })());
++    };
++
+     return (
+         <div className="fixed inset-0 bg-white/30 backdrop-blur-sm z-[99999] flex justify-center items-start p-4 pt-[15vh]" onClick={onClose}>
+             <div className="bg-white shadow-xl w-full max-w-2xl relative" onClick={e => e.stopPropagation()}>
+@@ -85,15 +108,29 @@ export default function SearchFlyout({ articles, onClose }: Props) {
+                             </ul>
+                         </div>
+                     )}
+-                    <h3 className="text-sm font-semibold text-gray-500 mb-3">Search</h3>
+-                    <input
+-                        type="text"
+-                        placeholder="Search for articles..."
+-                        className="w-full p-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-amber-400 focus:border-transparent transition"
+-                        value={searchTerm}
+-                        onChange={e => setSearchTerm(e.target.value)}
+-                        autoFocus
+-                    />
++                    <form
++                        role="search"
++                        onSubmit={handleSubmit}
++                        {...({
++                            toolname: 'search-articles',
++                            tooldescription: 'Search The DevTools Times articles by keyword. Use when the user wants to find stories about a topic.',
++                            toolautosubmit: '',
++                        } as any)}
++                    >
++                        <label htmlFor="article-search" className="block text-sm font-semibold text-gray-500 mb-3">Search</label>
++                        <input
++                            id="article-search"
++                            type="search"
++                            name="q"
++                            required
++                            placeholder="Search for articles..."
++                            className="w-full p-2 border border-gray-300 rounded-md focus:ring-2 focus:ring-amber-400 focus:border-transparent transition"
++                            value={searchTerm}
++                            onChange={e => setSearchTerm(e.target.value)}
++                            autoFocus
++                            {...({ toolparamdescription: 'Words to look for in article titles and summaries, e.g. "cycling" or "housing".' } as any)}
++                        />
++                    </form>
+                 </div>
+                 <div className="p-4 max-h-[60vh] overflow-y-auto">
+                     {searchTerm && filteredArticles.length === 0 && (
+diff --git a/src/components/SiteTools.tsx b/src/components/SiteTools.tsx
+new file mode 100644
+index 0000000..1d3b9ee
+--- /dev/null
++++ b/src/components/SiteTools.tsx
+@@ -0,0 +1,66 @@
++import { navigate } from 'astro:transitions/client';
++import { articleUrl, errorMessage, fetchArticles, fetchReadingList } from '../utils/articleApi';
++import { useWebMCP } from '../utils/useWebMCP';
++
++// Site-wide WebMCP tools. Renders nothing; it only registers tools while mounted.
++export default function SiteTools() {
++  useWebMCP({
++    name: 'list-articles',
++    description: 'Lists every article published on The DevTools Times with its slug, headline and summary. Use to browse what is available or to look up an article slug.',
++    async execute(_input, { signal }) {
++      try {
++        const articles = await fetchArticles(signal);
++        return articles.map(({ slug, title, summary }) => ({ slug, title, summary, url: articleUrl(slug) }));
++      } catch (error) {
++        if (signal.aborted) throw error;
++        return { error: errorMessage(error) };
++      }
++    },
++    annotations: { readOnlyHint: true },
++  });
++
++  useWebMCP({
++    name: 'get-reading-list',
++    description: 'Returns the articles the user has saved to their reading list.',
++    async execute(_input, { signal }) {
++      try {
++        const [articles, readingList] = await Promise.all([fetchArticles(signal), fetchReadingList(signal)]);
++        return articles
++          .filter(article => readingList.includes(article.slug))
++          .map(({ slug, title, summary }) => ({ slug, title, summary, url: articleUrl(slug) }));
++      } catch (error) {
++        if (signal.aborted) throw error;
++        return { error: errorMessage(error) };
++      }
++    },
++    annotations: { readOnlyHint: true },
++  });
++
++  useWebMCP<{ slug?: unknown }>({
++    name: 'open-article',
++    description: 'Navigates the browser tab to an article so the user can read it.',
++    inputSchema: {
++      type: 'object',
++      properties: {
++        slug: { type: 'string', description: 'Article slug, as returned by list-articles or search-articles, e.g. "coffee-alchemy".' },
++      },
++      required: ['slug'],
++    },
++    async execute({ slug }, { signal }) {
++      try {
++        const articles = await fetchArticles(signal);
++        const article = articles.find(entry => entry.slug === slug);
++        if (!article) {
++          return { error: `No article has the slug "${String(slug)}".`, availableSlugs: articles.map(entry => entry.slug) };
++        }
++        await navigate(articleUrl(article.slug));
++        return `Opened "${article.title}".`;
++      } catch (error) {
++        if (signal.aborted) throw error;
++        return { error: errorMessage(error) };
++      }
++    },
++  });
++
++  return null;
++}
+diff --git a/src/layouts/Layout.astro b/src/layouts/Layout.astro
+index dcf9696..21031ac 100644
+--- a/src/layouts/Layout.astro
++++ b/src/layouts/Layout.astro
+@@ -2,6 +2,7 @@
+ import Header from "../components/Header.astro";
+ import Footer from "../components/Footer.astro";
+ import AdSlotFireplace from "../components/AdSlotFireplace.tsx";
++import SiteTools from "../components/SiteTools.tsx";
+ import "../styles/global.css";
+ 
+ import { ClientRouter } from "astro:transitions";
+@@ -51,5 +52,6 @@ const baseUrl = import.meta.env.BASE_URL;
+       </div>
+     </div>
+     <Footer />
++    <SiteTools client:load />
+   </body>
+ </html>
+diff --git a/src/pages/articles/[slug].astro b/src/pages/articles/[slug].astro
+index 24fea39..b32d12b 100644
+--- a/src/pages/articles/[slug].astro
++++ b/src/pages/articles/[slug].astro
+@@ -8,6 +8,7 @@ import { Image } from 'astro:assets';
+ import { getArticleImage } from '../../utils/images';
+ import BookmarkButton from '../../components/BookmarkButton.tsx';
+ import ArticleTeaser from '../../components/ArticleTeaser.astro';
++import ArticleTools from '../../components/ArticleTools.tsx';
+ 
+ export const getStaticPaths = (async () => {
+   const articles = await getCollection('articles');
+@@ -32,7 +33,7 @@ const relatedArticles = allArticles.filter(a => a.id !== article.id).slice(0, 3)
+ const articleImage = await getArticleImage(article);
+ const relatedArticleImages = await Promise.all(relatedArticles.map(getArticleImage));
+ const readingList = await Astro.session?.get('readingList') || [];
+-const isBookmarked = readingList.includes(article.slug);
++const isBookmarked = readingList.includes(article.id);
+ ---
+ 
+ <Layout title={article.data.title}>
+@@ -99,15 +100,25 @@ const isBookmarked = readingList.includes(article.slug);
+                 <a href="#" class="w-8 h-8 rounded-full bg-gray-600 text-white flex items-center justify-center">
+                     <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path d="M2.003 5.884L10 10.884l7.997-5V4H2.003v1.884zM18 6.116l-8 4.05-8-4.05V16h16V6.116zM2 4h16v-1c0-.552-.448-1-1-1H3c-.552 0-1 .448-1 1v1z"/></svg>
+                 </a>
+-                <BookmarkButton client:visible slug={article.slug} initialIsBookmarked={isBookmarked} />
++                <BookmarkButton client:load slug={article.id} initialIsBookmarked={isBookmarked} />
+             </div>
+ 
+         </div>
+ 
+         <!-- Article Body Content -->
+-        <div class="prose max-w-none">
++        <div class="prose max-w-none" data-article-body>
+             <Content />
+         </div>
++        <ArticleTools
++            client:load
++            slug={article.id}
++            title={article.data.title}
++            summary={article.data.summary}
++            author={article.data.author}
++            category={article.data.category}
++            date={article.data.date.toISOString().slice(0, 10)}
++            readingTime={article.data.readingTime}
++        />
+ 
+         <!-- ADVERTISEMENT -->
+         <section class="p-4 md:p-6 text-center">
+diff --git a/src/styles/global.css b/src/styles/global.css
+index e9a9abb..7276aed 100644
+--- a/src/styles/global.css
++++ b/src/styles/global.css
+@@ -4,4 +4,14 @@
+   font-family: "Grenze", serif;
+   font-weight: 500;
+   font-style: normal;
+-}
+\ No newline at end of file
++}
++/* Highlight WebMCP form tools while an AI agent is filling them in. */
++form:tool-form-active {
++  outline: 2px dashed var(--color-amber-400);
++  outline-offset: 4px;
++}
++
++button:tool-submit-active {
++  outline: 2px dashed var(--color-amber-400);
++  outline-offset: 2px;
++}
+diff --git a/src/utils/articleApi.ts b/src/utils/articleApi.ts
+new file mode 100644
+index 0000000..878e78d
+--- /dev/null
++++ b/src/utils/articleApi.ts
+@@ -0,0 +1,55 @@
++// Client-side helpers for the article and reading-list API routes.
++
++export interface ArticleSummary {
++  slug: string;
++  title: string;
++  summary: string;
++  image?: string;
++}
++
++const base = import.meta.env.BASE_URL;
++
++export const articleUrl = (slug: string) => `${base}articles/${slug}`;
++
++export async function fetchArticles(signal?: AbortSignal): Promise<ArticleSummary[]> {
++  const response = await fetch(`${base}api/articles.json`, { signal });
++  if (!response.ok) throw new Error(`Loading articles failed with status ${response.status}`);
++  return response.json();
++}
++
++export async function fetchReadingList(signal?: AbortSignal): Promise<string[]> {
++  const response = await fetch(`${base}api/reading-list.json`, { signal });
++  if (!response.ok) throw new Error(`Loading the reading list failed with status ${response.status}`);
++  const data = await response.json();
++  return data.readingList;
++}
++
++// The API toggles the slug: it is added if missing and removed if present.
++export async function toggleReadingList(slug: string, signal?: AbortSignal): Promise<string[]> {
++  const response = await fetch(`${base}api/reading-list.json`, {
++    method: 'POST',
++    headers: { 'Content-Type': 'application/json' },
++    body: JSON.stringify({ slug }),
++    signal,
++  });
++  if (!response.ok) throw new Error(`Updating the reading list failed with status ${response.status}`);
++  const data = await response.json();
++  return data.readingList;
++}
++
++export function searchArticles(articles: ArticleSummary[], term: string) {
++  const needle = term.trim().toLowerCase();
++  if (!needle) return [];
++  return articles.filter(article =>
++    article.title.toLowerCase().includes(needle) ||
++    article.summary.toLowerCase().includes(needle)
++  );
++}
++
++// Fields shared by declarative form submit events when WebMCP is available.
++export type AgentSubmitEvent = SubmitEvent & {
++  agentInvoked?: boolean;
++  respondWith?: (result: Promise<unknown>) => void;
++};
++
++export const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
+diff --git a/src/utils/useWebMCP.ts b/src/utils/useWebMCP.ts
+new file mode 100644
+index 0000000..6c5829c
+--- /dev/null
++++ b/src/utils/useWebMCP.ts
+@@ -0,0 +1,51 @@
++import { useEffect, useRef } from 'react';
++
++// Minimal stand-in for `useWebMCP` from the `use-webmcp-tool` package, which
++// couldn't be installed in this environment. It keeps the same tool shape, so
++// switching to the package later only means changing the import.
++
++export interface WebMCPTool<Input = any> {
++  name: string;
++  description: string;
++  inputSchema?: Record<string, unknown>;
++  execute: (input: Input, options: { signal: AbortSignal }) => unknown;
++  annotations?: {
++    readOnlyHint?: boolean;
++    consequentialHint?: boolean;
++    untrustedContentHint?: boolean;
++  };
++}
++
++interface ModelContext {
++  registerTool: (tool: WebMCPTool, options?: { signal?: AbortSignal }) => unknown;
++}
++
++export function useWebMCP<Input = any>(tool: WebMCPTool<Input> & { enabled?: boolean }) {
++  // Always call the latest `execute` so it sees current props/state without re-registering.
++  const toolRef = useRef(tool);
++  toolRef.current = tool;
++  const { name, enabled = true } = tool;
++
++  useEffect(() => {
++    const modelContext = (document as Document & { modelContext?: ModelContext }).modelContext;
++    if (!enabled || !modelContext) return;
++
++    const controller = new AbortController();
++    const { description, inputSchema = { type: 'object', properties: {} }, annotations } = toolRef.current;
++
++    Promise.resolve(
++      modelContext.registerTool(
++        {
++          name,
++          description,
++          inputSchema,
++          execute: (input, options) => toolRef.current.execute(input ?? {}, options),
++          annotations,
++        },
++        { signal: controller.signal },
++      ),
++    ).catch((error) => console.warn(`WebMCP: failed to register "${name}"`, error));
++
++    return () => controller.abort();
++  }, [name, enabled]);
++}

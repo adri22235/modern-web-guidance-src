@@ -1,0 +1,479 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -73,8 +73,10 @@
+     }
+ 
+     /* Hero Section */
+     .hero {
++      position: relative;
++      overflow: hidden;
+       height: 60vh;
+       background: linear-gradient(rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0.5)),
+         url('https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?auto=format&fit=crop&w=1350&q=80');
+       background-size: cover;
+@@ -87,13 +89,49 @@
+       text-align: center;
+       padding: 0 20px;
+     }
+ 
++    #hero-webgl-canvas {
++      position: absolute;
++      top: 0;
++      left: 0;
++      width: 100%;
++      height: 100%;
++      pointer-events: none;
++      z-index: 1;
++    }
++
++    .hero h1,
++    .hero p,
++    .hero .btn {
++      position: relative;
++      z-index: 2;
++    }
++
+     .hero h1 {
+       font-size: 3rem;
+       margin-bottom: 1rem;
+     }
+ 
++    /* When WebGL shader overlay is active, keep underlying HTML interactive & selectable while WebGL renders the visual ripple distortion */
++    .hero.webgl-ready .shader-target {
++      color: transparent !important;
++      background: transparent !important;
++      border-color: transparent !important;
++      box-shadow: none !important;
++      text-shadow: none !important;
++      cursor: pointer;
++    }
++
++    .hero.webgl-ready h1.shader-target {
++      cursor: text;
++    }
++
++    .hero.webgl-ready .shader-target::selection {
++      background: rgba(255, 171, 64, 0.35);
++      color: transparent;
++    }
++
+     /* Content Sections */
+     .container {
+       max-width: 1100px;
+       margin: 40px auto;
+@@ -167,12 +205,13 @@
+       <li><a href="/logout" class="logout-link">Logout</a></li>
+     </ul>
+   </nav>
+ 
+-  <header class="hero">
+-    <h1>Wake Up Your Senses</h1>
++  <header class="hero" id="hero-section">
++    <canvas id="hero-webgl-canvas" aria-hidden="true"></canvas>
++    <h1 class="shader-target" id="hero-title" data-shader-type="heading">Wake Up Your Senses</h1>
+     <p>Ethically sourced, locally roasted, delivered to your cup.</p>
+-    <a href="/order-online" class="btn">Order Now</a>
++    <a href="/order-online" class="btn shader-target" id="hero-cta" data-shader-type="button">Order Now</a>
+   </header>
+ 
+   <main class="container">
+     <section>
+@@ -206,7 +245,397 @@
+     </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script>
++    (function initHeroWebGLRipple() {
++      const hero = document.getElementById('hero-section');
++      const canvas = document.getElementById('hero-webgl-canvas');
++      const titleEl = document.getElementById('hero-title');
++      const ctaEl = document.getElementById('hero-cta');
++
++      if (!hero || !canvas || !titleEl || !ctaEl) return;
++
++      const gl = canvas.getContext('webgl', {
++        alpha: true,
++        antialias: true,
++        premultipliedAlpha: false
++      }) || canvas.getContext('experimental-webgl', {
++        alpha: true,
++        antialias: true,
++        premultipliedAlpha: false
++      });
++
++      if (!gl) return;
++
++      const vertexShaderSource = `
++        attribute vec2 a_position;
++        attribute vec2 a_texCoord;
++        uniform vec2 u_resolution;
++        uniform vec4 u_bounds; // x, y, width, height in CSS pixels relative to hero
++        varying vec2 v_texCoord;
++        varying vec2 v_localPos;
++
++        void main() {
++          vec2 pixelPos = u_bounds.xy + a_position * u_bounds.zw;
++          vec2 zeroToOne = pixelPos / u_resolution;
++          vec2 clipSpace = zeroToOne * 2.0 - 1.0;
++          gl_Position = vec4(clipSpace.x, -clipSpace.y, 0.0, 1.0);
++          v_texCoord = a_texCoord;
++          v_localPos = a_position;
++        }
++      `;
++
++      const fragmentShaderSource = `
++        precision highp float;
++        varying vec2 v_texCoord;
++        varying vec2 v_localPos;
++
++        uniform sampler2D u_texture;
++        uniform float u_time;
++        uniform vec2 u_mouse;         // normalized to quad [0..1]
++        uniform float u_hover;        // smooth [0..1] hover intensity
++        uniform vec3 u_clickRipple;   // xy = normalized click pos, z = elapsed time since click
++        uniform vec2 u_quadSize;      // width, height in px
++
++        void main() {
++          vec2 uv = v_texCoord;
++          float aspect = u_quadSize.x / max(u_quadSize.y, 1.0);
++
++          // Subtle continuous liquid wave distortion
++          float ambientWaveX = sin(uv.y * 10.0 + u_time * 2.2) * 0.0045
++                             + cos(uv.x * 6.0 - u_time * 1.6) * 0.003;
++          float ambientWaveY = cos(uv.x * 8.0 + u_time * 1.9) * 0.008;
++
++          // Interactive cursor-driven ripple wave
++          vec2 delta = uv - u_mouse;
++          delta.x *= aspect;
++          float dist = length(delta);
++
++          float hoverRadius = 0.65;
++          float hoverFalloff = smoothstep(hoverRadius, 0.0, dist);
++          float rippleWave = sin(dist * 28.0 - u_time * 7.5) * hoverFalloff * (0.022 * (0.35 + 0.65 * u_hover));
++
++          vec2 dir = dist > 0.0001 ? normalize(delta) : vec2(0.0, 0.0);
++          vec2 interactiveOffset = dir * rippleWave;
++
++          // Click/focus shockwave ripple
++          vec2 clickOffset = vec2(0.0);
++          if (u_clickRipple.z > 0.0 && u_clickRipple.z < 2.0) {
++            vec2 cDelta = uv - u_clickRipple.xy;
++            cDelta.x *= aspect;
++            float cDist = length(cDelta);
++            float waveRadius = u_clickRipple.z * 1.15;
++            float ring = exp(-pow((cDist - waveRadius) * 10.0, 2.0));
++            float decay = 1.0 - (u_clickRipple.z / 2.0);
++            vec2 cDir = cDist > 0.0001 ? normalize(cDelta) : vec2(0.0);
++            clickOffset = cDir * sin((cDist - waveRadius) * 40.0) * ring * decay * 0.035;
++          }
++
++          vec2 totalOffset = vec2(ambientWaveX, ambientWaveY) + interactiveOffset + clickOffset;
++          float aberration = length(interactiveOffset + clickOffset) * 0.45;
++
++          vec4 texR = texture2D(u_texture, clamp(uv + totalOffset * (1.0 + aberration), 0.0, 1.0));
++          vec4 texG = texture2D(u_texture, clamp(uv + totalOffset, 0.0, 1.0));
++          vec4 texB = texture2D(u_texture, clamp(uv + totalOffset * (1.0 - aberration), 0.0, 1.0));
++
++          float alpha = max(max(texR.a, texG.a), texB.a);
++          vec3 color = vec3(texR.r, texG.g, texB.b);
++
++          // Subtle specular highlight along the ripple crest
++          float crest = max(0.0, rippleWave * 18.0);
++          color += vec3(1.0, 0.85, 0.65) * crest * texG.a * 0.25;
++
++          gl_FragColor = vec4(color, alpha);
++        }
++      `;
++
++      function compileShader(type, source) {
++        const shader = gl.createShader(type);
++        gl.shaderSource(shader, source);
++        gl.compileShader(shader);
++        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
++          gl.deleteShader(shader);
++          return null;
++        }
++        return shader;
++      }
++
++      const vs = compileShader(gl.VERTEX_SHADER, vertexShaderSource);
++      const fs = compileShader(gl.FRAGMENT_SHADER, fragmentShaderSource);
++      if (!vs || !fs) return;
++
++      const program = gl.createProgram();
++      gl.attachShader(program, vs);
++      gl.attachShader(program, fs);
++      gl.linkProgram(program);
++      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) return;
++
++      gl.useProgram(program);
++
++      // Geometry: unit quad [0..1] with denser grid for smooth vertex + fragment coordinates
++      const posBuffer = gl.createBuffer();
++      gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
++      const quadVerts = new Float32Array([
++        0, 0,  1, 0,  0, 1,
++        0, 1,  1, 0,  1, 1
++      ]);
++      gl.bufferData(gl.ARRAY_BUFFER, quadVerts, gl.STATIC_DRAW);
++
++      const aPosition = gl.getAttribLocation(program, 'a_position');
++      const aTexCoord = gl.getAttribLocation(program, 'a_texCoord');
++      const uResolution = gl.getUniformLocation(program, 'u_resolution');
++      const uBounds = gl.getUniformLocation(program, 'u_bounds');
++      const uTexture = gl.getUniformLocation(program, 'u_texture');
++      const uTime = gl.getUniformLocation(program, 'u_time');
++      const uMouse = gl.getUniformLocation(program, 'u_mouse');
++      const uHover = gl.getUniformLocation(program, 'u_hover');
++      const uClickRipple = gl.getUniformLocation(program, 'u_clickRipple');
++      const uQuadSize = gl.getUniformLocation(program, 'u_quadSize');
++
++      const PADDING = 28; // Extra bleed in CSS px around each element so ripples never clip
++
++      function createTargetItem(el, type) {
++        const tex = gl.createTexture();
++        gl.bindTexture(gl.TEXTURE_2D, tex);
++        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
++        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
++        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
++        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
++
++        return {
++          el,
++          type,
++          texture: tex,
++          offscreen: document.createElement('canvas'),
++          bounds: { x: 0, y: 0, w: 1, h: 1 },
++          mouse: { x: 0.5, y: 0.5, targetX: 0.5, targetY: 0.5 },
++          hover: 0,
++          targetHover: 0,
++          isButtonHovered: false,
++          clickPos: { x: 0.5, y: 0.5 },
++          clickStartTime: -10
++        };
++      }
++
++      const items = [
++        createTargetItem(titleEl, 'heading'),
++        createTargetItem(ctaEl, 'button')
++      ];
++
++      function roundRectPath(ctx, x, y, w, h, r) {
++        const radius = Math.min(r, w / 2, h / 2);
++        ctx.beginPath();
++        ctx.moveTo(x + radius, y);
++        ctx.arcTo(x + w, y, x + w, y + h, radius);
++        ctx.arcTo(x + w, y + h, x, y + h, radius);
++        ctx.arcTo(x, y + h, x, y, radius);
++        ctx.arcTo(x, y, x + w, y, radius);
++        ctx.closePath();
++      }
++
++      function rasterizeItemTexture(item) {
++        const dpr = Math.min(window.devicePixelRatio || 1, 2);
++        const heroRect = hero.getBoundingClientRect();
++        const rect = item.el.getBoundingClientRect();
++
++        const x = (rect.left - heroRect.left) - PADDING;
++        const y = (rect.top - heroRect.top) - PADDING;
++        const w = Math.max(1, rect.width + PADDING * 2);
++        const h = Math.max(1, rect.height + PADDING * 2);
++
++        item.bounds = { x, y, w, h };
++
++        const cvs = item.offscreen;
++        cvs.width = Math.max(1, Math.round(w * dpr));
++        cvs.height = Math.max(1, Math.round(h * dpr));
++
++        const ctx = cvs.getContext('2d');
++        ctx.save();
++        ctx.scale(dpr, dpr);
++        ctx.clearRect(0, 0, w, h);
++
++        const style = window.getComputedStyle(item.el);
++        const fontWeight = style.fontWeight || (item.type === 'heading' ? '700' : '400');
++        const fontSize = style.fontSize || (item.type === 'heading' ? '48px' : '16px');
++        const fontFamily = style.fontFamily || "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif";
++        const text = (item.el.textContent || '').trim();
++
++        if (item.type === 'button') {
++          const btnW = rect.width;
++          const btnH = rect.height;
++          const radius = parseFloat(style.borderRadius) || 5;
++
++          // Button background (reflect hover color transition naturally)
++          ctx.fillStyle = item.isButtonHovered ? '#3e2723' : '#4e342e';
++          ctx.shadowColor = 'rgba(0, 0, 0, 0.28)';
++          ctx.shadowBlur = 10;
++          ctx.shadowOffsetY = 3;
++          roundRectPath(ctx, PADDING, PADDING, btnW, btnH, radius);
++          ctx.fill();
++
++          // Subtle warm border highlight on hover
++          if (item.isButtonHovered) {
++            ctx.strokeStyle = 'rgba(255, 171, 64, 0.65)';
++            ctx.lineWidth = 1.5;
++            ctx.stroke();
++          }
++
++          ctx.shadowColor = 'transparent';
++          ctx.font = `${fontWeight} ${fontSize} ${fontFamily}`;
++          ctx.fillStyle = '#ffffff';
++          ctx.textAlign = 'center';
++          ctx.textBaseline = 'middle';
++          ctx.fillText(text, PADDING + btnW / 2, PADDING + btnH / 2 + 1);
++        } else {
++          // Heading text ('Wake Up Your Senses')
++          ctx.font = `${fontWeight} ${fontSize} ${fontFamily}`;
++          ctx.fillStyle = '#ffffff';
++          ctx.textAlign = 'center';
++          ctx.textBaseline = 'middle';
++          ctx.shadowColor = 'rgba(0, 0, 0, 0.35)';
++          ctx.shadowBlur = 8;
++          ctx.shadowOffsetY = 2;
++          ctx.fillText(text, PADDING + rect.width / 2, PADDING + rect.height / 2);
++        }
++
++        ctx.restore();
++
++        gl.bindTexture(gl.TEXTURE_2D, item.texture);
++        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cvs);
++      }
++
++      function updateLayoutAndTextures() {
++        const dpr = Math.min(window.devicePixelRatio || 1, 2);
++        const heroRect = hero.getBoundingClientRect();
++        const width = Math.max(1, heroRect.width);
++        const height = Math.max(1, heroRect.height);
++
++        canvas.width = Math.round(width * dpr);
++        canvas.height = Math.round(height * dpr);
++        gl.viewport(0, 0, canvas.width, canvas.height);
++
++        items.forEach(rasterizeItemTexture);
++      }
++
++      // Pointer tracking across hero & targets while keeping HTML text selectable and buttons clickable
++      hero.addEventListener('pointermove', (e) => {
++        const heroRect = hero.getBoundingClientRect();
++        const localX = e.clientX - heroRect.left;
++        const localY = e.clientY - heroRect.top;
++
++        items.forEach((item) => {
++          const { x, y, w, h } = item.bounds;
++          const nx = (localX - x) / Math.max(w, 1);
++          const ny = (localY - y) / Math.max(h, 1);
++          item.mouse.targetX = Math.max(-0.2, Math.min(1.2, nx));
++          item.mouse.targetY = Math.max(-0.2, Math.min(1.2, ny));
++
++          const inside = nx >= 0 && nx <= 1 && ny >= 0 && ny <= 1;
++          item.targetHover = inside ? 1.0 : 0.35;
++        });
++      });
++
++      hero.addEventListener('pointerleave', () => {
++        items.forEach((item) => {
++          item.targetHover = 0.0;
++        });
++      });
++
++      hero.addEventListener('pointerdown', (e) => {
++        const heroRect = hero.getBoundingClientRect();
++        const localX = e.clientX - heroRect.left;
++        const localY = e.clientY - heroRect.top;
++        const nowSec = performance.now() * 0.001;
++
++        items.forEach((item) => {
++          const { x, y, w, h } = item.bounds;
++          const nx = (localX - x) / Math.max(w, 1);
++          const ny = (localY - y) / Math.max(h, 1);
++          if (nx >= -0.15 && nx <= 1.15 && ny >= -0.15 && ny <= 1.15) {
++            item.clickPos.x = Math.max(0, Math.min(1, nx));
++            item.clickPos.y = Math.max(0, Math.min(1, ny));
++            item.clickStartTime = nowSec;
++          }
++        });
++      });
++
++      // Keep button hover visual synced with native anchor hover/focus
++      ctaEl.addEventListener('mouseenter', () => {
++        items[1].isButtonHovered = true;
++        items[1].targetHover = 1.0;
++        rasterizeItemTexture(items[1]);
++      });
++      ctaEl.addEventListener('mouseleave', () => {
++        items[1].isButtonHovered = false;
++        rasterizeItemTexture(items[1]);
++      });
++      ctaEl.addEventListener('focus', () => {
++        items[1].isButtonHovered = true;
++        items[1].targetHover = 1.0;
++        items[1].clickPos = { x: 0.5, y: 0.5 };
++        items[1].clickStartTime = performance.now() * 0.001;
++        rasterizeItemTexture(items[1]);
++      });
++      ctaEl.addEventListener('blur', () => {
++        items[1].isButtonHovered = false;
++        rasterizeItemTexture(items[1]);
++      });
++
++      window.addEventListener('resize', updateLayoutAndTextures);
++      if (document.fonts && document.fonts.ready) {
++        document.fonts.ready.then(updateLayoutAndTextures);
++      }
++
++      updateLayoutAndTextures();
++      hero.classList.add('webgl-ready');
++
++      gl.enable(gl.BLEND);
++      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
++
++      function render(nowMs) {
++        const timeSec = nowMs * 0.001;
++        const heroRect = hero.getBoundingClientRect();
++
++        gl.clearColor(0, 0, 0, 0);
++        gl.clear(gl.COLOR_BUFFER_BIT);
++
++        gl.useProgram(program);
++        gl.uniform2f(uResolution, Math.max(1, heroRect.width), Math.max(1, heroRect.height));
++
++        gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
++        gl.enableVertexAttribArray(aPosition);
++        gl.vertexAttribPointer(aPosition, 2, gl.FLOAT, false, 0, 0);
++        gl.enableVertexAttribArray(aTexCoord);
++        gl.vertexAttribPointer(aTexCoord, 2, gl.FLOAT, false, 0, 0);
++
++        for (let i = 0; i < items.length; i++) {
++          const item = items[i];
++          item.mouse.x += (item.mouse.targetX - item.mouse.x) * 0.12;
++          item.mouse.y += (item.mouse.targetY - item.mouse.y) * 0.12;
++          item.hover += (item.targetHover - item.hover) * 0.08;
++
++          const clickElapsed = Math.max(0, timeSec - item.clickStartTime);
++
++          gl.activeTexture(gl.TEXTURE0);
++          gl.bindTexture(gl.TEXTURE_2D, item.texture);
++          gl.uniform1i(uTexture, 0);
++
++          gl.uniform4f(uBounds, item.bounds.x, item.bounds.y, item.bounds.w, item.bounds.h);
++          gl.uniform2f(uQuadSize, item.bounds.w, item.bounds.h);
++          gl.uniform1f(uTime, timeSec);
++          gl.uniform2f(uMouse, item.mouse.x, item.mouse.y);
++          gl.uniform1f(uHover, item.hover);
++          gl.uniform3f(uClickRipple, item.clickPos.x, item.clickPos.y, clickElapsed);
++
++          gl.drawArrays(gl.TRIANGLES, 0, 6);
++        }
++
++        requestAnimationFrame(render);
++      }
++
++      requestAnimationFrame(render);
++    })();
++  </script>
+ </body>
+ 
+ </html>

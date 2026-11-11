@@ -1,0 +1,644 @@
+diff --git a/package.json b/package.json
+index 2bd4d77..57ee1c4 100644
+--- a/package.json
++++ b/package.json
+@@ -6,5 +6,10 @@
+   },
+   "pnpm": {
+     "onlyBuiltDependencies": []
++  },
++  "dependencies": {
++    "cookie-parser": "^1.4.7",
++    "express": "^5.3.0",
++    "jose": "^6.2.14"
+   }
+ }
+diff --git a/server.js b/server.js
+new file mode 100644
+index 0000000..67c16a6
+--- /dev/null
++++ b/server.js
+@@ -0,0 +1,623 @@
++import { randomBytes, createHash } from 'node:crypto';
++import dns from 'node:dns';
++import fs from 'node:fs';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++import express from 'express';
++import cookieParser from 'cookie-parser';
++import {
++  decodeProtectedHeader,
++  decodeJwt,
++  jwtVerify,
++  importJWK,
++  createLocalJWKSet,
++} from 'jose';
++
++const __filename = fileURLToPath(import.meta.url);
++const __dirname = path.dirname(__filename);
++
++const app = express();
++app.use(cookieParser());
++app.use(express.json());
++app.use(express.urlencoded({ extended: true }));
++
++// Store server-generated nonces for replay protection (15-minute TTL)
++const NONCE_TTL_MS = 15 * 60 * 1000;
++const issuedNonces = new Map();
++
++// In-memory store of registered Daily Grind Rewards accounts
++const rewardsAccounts = new Map();
++
++// Default static fallback nonce present in raw index.html template
++const TEMPLATE_NONCE_PLACEHOLDER = 'dg-evp-initial-nonce-placeholder';
++
++function cleanupExpiredNonces() {
++  const now = Date.now();
++  for (const [nonce, meta] of issuedNonces.entries()) {
++    if (now - meta.createdAt > NONCE_TTL_MS) {
++      issuedNonces.delete(nonce);
++    }
++  }
++}
++
++export function generateNonce(sessionId = null) {
++  cleanupExpiredNonces();
++  const nonce = randomBytes(32).toString('base64url');
++  issuedNonces.set(nonce, {
++    createdAt: Date.now(),
++    used: false,
++    sessionId,
++  });
++  return nonce;
++}
++
++function normalizeIssuerHost(issuerStr) {
++  return String(issuerStr || '')
++    .trim()
++    .replace(/^https?:\/\//i, '')
++    .replace(/\/+$/, '')
++    .toLowerCase();
++}
++
++function getIssuerWellKnownUrl(issuerStr) {
++  const trimmed = String(issuerStr || '').trim().replace(/\/+$/, '');
++  if (/^https?:\/\//i.test(trimmed)) {
++    return `${trimmed}/.well-known/email-verification`;
++  }
++  if (
++    trimmed.startsWith('localhost') ||
++    trimmed.startsWith('127.0.0.1') ||
++    trimmed.startsWith('[::1]')
++  ) {
++    return `http://${trimmed}/.well-known/email-verification`;
++  }
++  return `https://${trimmed}/.well-known/email-verification`;
++}
++
++async function lookupEmailVerificationTxt(domain) {
++  const recordName = `_email-verification.${domain}`;
++  if (dns.promises && typeof dns.promises.resolveTxt === 'function') {
++    return dns.promises.resolveTxt(recordName);
++  }
++  return new Promise((resolve, reject) => {
++    dns.resolveTxt(recordName, (err, records) => {
++      if (err) reject(err);
++      else resolve(records);
++    });
++  });
++}
++
++/**
++ * Verifies a browser-assisted Email Verification Token (SD-JWT+KB: <EVT>~<KB-JWT>)
++ * according to the WICG Email Verification API & IETF Email Verification Protocol.
++ */
++export async function verifyEmailVerificationToken({
++  token,
++  submittedEmail,
++  expectedNonce,
++  expectedOrigins,
++}) {
++  if (!token || typeof token !== 'string') {
++    const err = new Error(
++      'Missing email verification token (autocomplete="email-verification-token").'
++    );
++    err.status = 400;
++    err.code = 'MISSING_TOKEN';
++    throw err;
++  }
++
++  if (!submittedEmail || typeof submittedEmail !== 'string' || !submittedEmail.includes('@')) {
++    const err = new Error('A valid email address is required.');
++    err.status = 400;
++    err.code = 'INVALID_EMAIL';
++    throw err;
++  }
++
++  // ---------------------------------------------------------------------------
++  // Step 1: Parse the token (<EVT>~<KB-JWT>)
++  // ---------------------------------------------------------------------------
++  const parts = token.split('~');
++  if (parts.length < 2) {
++    const err = new Error('Invalid token structure: expected <EVT>~<KB-JWT> SD-JWT+KB format.');
++    err.status = 400;
++    err.code = 'MALFORMED_TOKEN';
++    throw err;
++  }
++
++  const evtJwt = parts[0];
++  const kbJwt = parts[parts.length - 1];
++  if (!evtJwt || !kbJwt) {
++    const err = new Error('Invalid token structure: missing EVT or KB-JWT segment.');
++    err.status = 400;
++    err.code = 'MALFORMED_TOKEN';
++    throw err;
++  }
++
++  let evtHeader;
++  let evtPayload;
++  let kbHeader;
++  let kbPayload;
++
++  try {
++    evtHeader = decodeProtectedHeader(evtJwt);
++    evtPayload = decodeJwt(evtJwt);
++    kbHeader = decodeProtectedHeader(kbJwt);
++    kbPayload = decodeJwt(kbJwt);
++  } catch (decodeErr) {
++    const err = new Error(`Failed to decode JWT headers or payload: ${decodeErr.message}`);
++    err.status = 400;
++    err.code = 'DECODE_ERROR';
++    throw err;
++  }
++
++  if (!evtHeader.alg || evtHeader.alg.toLowerCase() === 'none') {
++    const err = new Error('Invalid EVT header: missing or disallowed "alg" parameter.');
++    err.status = 400;
++    err.code = 'INVALID_EVT_HEADER';
++    throw err;
++  }
++
++  if (
++    evtHeader.typ &&
++    !['evt+jwt', 'evp+sd-jwt', 'sd+jwt', 'jwt'].includes(String(evtHeader.typ).toLowerCase())
++  ) {
++    const err = new Error(`Invalid EVT "typ" header: "${evtHeader.typ}". Expected "evt+jwt".`);
++    err.status = 400;
++    err.code = 'INVALID_EVT_TYP';
++    throw err;
++  }
++
++  if (!kbHeader.alg || kbHeader.alg.toLowerCase() === 'none') {
++    const err = new Error('Invalid KB-JWT header: missing or disallowed "alg" parameter.');
++    err.status = 400;
++    err.code = 'INVALID_KB_HEADER';
++    throw err;
++  }
++
++  if (kbHeader.typ && String(kbHeader.typ).toLowerCase() !== 'kb+jwt') {
++    const err = new Error(`Invalid KB-JWT "typ" header: "${kbHeader.typ}". Expected "kb+jwt".`);
++    err.status = 400;
++    err.code = 'INVALID_KB_TYP';
++    throw err;
++  }
++
++  // ---------------------------------------------------------------------------
++  // Step 2: Validate expected claims & session constraints
++  // ---------------------------------------------------------------------------
++  if (evtPayload.email_verified !== true) {
++    const err = new Error('Email is not verified by the issuer (email_verified must be true).');
++    err.status = 401;
++    err.code = 'EMAIL_NOT_VERIFIED';
++    throw err;
++  }
++
++  if (
++    typeof evtPayload.email !== 'string' ||
++    evtPayload.email.trim().toLowerCase() !== submittedEmail.trim().toLowerCase()
++  ) {
++    const err = new Error('Email address in EVT does not match the submitted email address.');
++    err.status = 401;
++    err.code = 'EMAIL_MISMATCH';
++    throw err;
++  }
++
++  if (!evtPayload.iss || typeof evtPayload.iss !== 'string') {
++    const err = new Error('EVT payload is missing required "iss" (issuer) claim.');
++    err.status = 401;
++    err.code = 'MISSING_ISSUER';
++    throw err;
++  }
++
++  // Validate nonce in KB-JWT
++  const tokenNonce = kbPayload.nonce;
++  if (!tokenNonce || typeof tokenNonce !== 'string') {
++    const err = new Error('KB-JWT payload is missing required "nonce" claim.');
++    err.status = 401;
++    err.code = 'MISSING_NONCE';
++    throw err;
++  }
++
++  cleanupExpiredNonces();
++  const storedNonceMeta = issuedNonces.get(tokenNonce);
++  if (storedNonceMeta && storedNonceMeta.used) {
++    const err = new Error('Nonce has already been used (replay attack detected).');
++    err.status = 401;
++    err.code = 'NONCE_REPLAYED';
++    throw err;
++  }
++
++  const nonceMatchesSession = expectedNonce && tokenNonce === expectedNonce;
++  const nonceInActiveStore = Boolean(storedNonceMeta && !storedNonceMeta.used);
++
++  if (!nonceMatchesSession && !nonceInActiveStore) {
++    const err = new Error('Nonce mismatch or expired session nonce.');
++    err.status = 401;
++    err.code = 'INVALID_NONCE';
++    throw err;
++  }
++
++  // Validate audience (aud) in KB-JWT
++  if (!kbPayload.aud || typeof kbPayload.aud !== 'string') {
++    const err = new Error('KB-JWT payload is missing required "aud" (audience) claim.');
++    err.status = 401;
++    err.code = 'MISSING_AUDIENCE';
++    throw err;
++  }
++
++  const normalizedAud = kbPayload.aud.replace(/\/+$/, '').toLowerCase();
++  const validOrigins = (expectedOrigins || [])
++    .filter(Boolean)
++    .map((o) => o.replace(/\/+$/, '').toLowerCase());
++
++  if (validOrigins.length > 0 && !validOrigins.includes(normalizedAud)) {
++    const err = new Error(
++      `KB-JWT audience "${kbPayload.aud}" does not match verifier origin.`
++    );
++    err.status = 401;
++    err.code = 'AUDIENCE_MISMATCH';
++    throw err;
++  }
++
++  // Validate timestamps (iat / exp)
++  const nowSec = Math.floor(Date.now() / 1000);
++  if (typeof evtPayload.iat !== 'number' || typeof kbPayload.iat !== 'number') {
++    const err = new Error('EVT and KB-JWT must include numeric "iat" timestamps.');
++    err.status = 401;
++    err.code = 'MISSING_IAT';
++    throw err;
++  }
++
++  if (evtPayload.exp !== undefined && Number(evtPayload.exp) < nowSec) {
++    const err = new Error('EVT token has expired.');
++    err.status = 401;
++    err.code = 'EVT_EXPIRED';
++    throw err;
++  }
++
++  if (kbPayload.exp !== undefined && Number(kbPayload.exp) < nowSec) {
++    const err = new Error('KB-JWT token has expired.');
++    err.status = 401;
++    err.code = 'KB_EXPIRED';
++    throw err;
++  }
++
++  // ---------------------------------------------------------------------------
++  // Step 3: Validate Key Binding (cnf.jwk signature & sd_hash)
++  // ---------------------------------------------------------------------------
++  const browserJwk = evtPayload.cnf?.jwk;
++  if (!browserJwk || typeof browserJwk !== 'object') {
++    const err = new Error('EVT is missing required "cnf.jwk" confirmation public key.');
++    err.status = 401;
++    err.code = 'MISSING_CNF_JWK';
++    throw err;
++  }
++
++  if (!kbPayload.sd_hash || typeof kbPayload.sd_hash !== 'string') {
++    const err = new Error('KB-JWT is missing required "sd_hash" claim.');
++    err.status = 401;
++    err.code = 'MISSING_SD_HASH';
++    throw err;
++  }
++
++  const sdJwtWithTilde = token.slice(0, token.lastIndexOf('~') + 1);
++  const calculatedHashWithTilde = createHash('sha256')
++    .update(sdJwtWithTilde)
++    .digest('base64url');
++  const calculatedHashWithoutTilde = createHash('sha256')
++    .update(evtJwt)
++    .digest('base64url');
++
++  if (
++    kbPayload.sd_hash !== calculatedHashWithTilde &&
++    kbPayload.sd_hash !== calculatedHashWithoutTilde
++  ) {
++    const err = new Error('Key binding failed: "sd_hash" does not match the EVT digest.');
++    err.status = 401;
++    err.code = 'SD_HASH_MISMATCH';
++    throw err;
++  }
++
++  try {
++    const browserPublicKey = await importJWK(browserJwk, kbHeader.alg);
++    await jwtVerify(kbJwt, browserPublicKey);
++  } catch (kbVerifyErr) {
++    const err = new Error(
++      `KB-JWT key-binding signature verification failed: ${kbVerifyErr.message}`
++    );
++    err.status = 401;
++    err.code = 'KB_SIGNATURE_INVALID';
++    throw err;
++  }
++
++  // ---------------------------------------------------------------------------
++  // Step 4: Validate DNS delegation record (_email-verification.<email-domain>)
++  // ---------------------------------------------------------------------------
++  const emailDomain = submittedEmail.trim().split('@').pop().toLowerCase();
++  let txtRecords;
++  try {
++    txtRecords = await lookupEmailVerificationTxt(emailDomain);
++  } catch (dnsErr) {
++    const err = new Error(
++      `DNS lookup failed for _email-verification.${emailDomain}: ${dnsErr.message}`
++    );
++    err.status = 401;
++    err.code = 'DNS_LOOKUP_FAILED';
++    throw err;
++  }
++
++  const flattenedRecords = (txtRecords || [])
++    .map((chunks) => (Array.isArray(chunks) ? chunks.join('') : String(chunks)).trim())
++    .filter((entry) => entry.startsWith('iss='));
++
++  if (flattenedRecords.length !== 1) {
++    const err = new Error(
++      `Expected exactly one _email-verification.${emailDomain} TXT record starting with "iss=", found ${flattenedRecords.length}.`
++    );
++    err.status = 401;
++    err.code = 'INVALID_DNS_DELEGATION';
++    throw err;
++  }
++
++  const delegatedIssuer = flattenedRecords[0].slice(4).trim();
++  if (
++    !delegatedIssuer ||
++    normalizeIssuerHost(delegatedIssuer) !== normalizeIssuerHost(evtPayload.iss)
++  ) {
++    const err = new Error(
++      `DNS delegated issuer "${delegatedIssuer}" does not match EVT issuer "${evtPayload.iss}".`
++    );
++    err.status = 401;
++    err.code = 'ISSUER_DELEGATION_MISMATCH';
++    throw err;
++  }
++
++  // ---------------------------------------------------------------------------
++  // Step 5: Discover the issuer (/.well-known/email-verification) & verify EVT
++  // ---------------------------------------------------------------------------
++  const wellKnownUrl = getIssuerWellKnownUrl(
++    /^https?:\/\//i.test(evtPayload.iss) ? evtPayload.iss : delegatedIssuer
++  );
++
++  let issuerMetadata;
++  try {
++    const metaRes = await fetch(wellKnownUrl, {
++      headers: { Accept: 'application/json' },
++    });
++    if (!metaRes.ok) {
++      throw new Error(`HTTP ${metaRes.status} from ${wellKnownUrl}`);
++    }
++    issuerMetadata = await metaRes.json();
++  } catch (metaErr) {
++    const err = new Error(
++      `Failed to fetch issuer metadata from ${wellKnownUrl}: ${metaErr.message}`
++    );
++    err.status = 401;
++    err.code = 'ISSUER_DISCOVERY_FAILED';
++    throw err;
++  }
++
++  if (!issuerMetadata || typeof issuerMetadata.jwks_uri !== 'string' || !issuerMetadata.jwks_uri) {
++    const err = new Error('Issuer metadata is missing a valid "jwks_uri" property.');
++    err.status = 401;
++    err.code = 'INVALID_ISSUER_METADATA';
++    throw err;
++  }
++
++  if (Array.isArray(issuerMetadata.signing_alg_values_supported)) {
++    if (
++      issuerMetadata.signing_alg_values_supported.includes('none') ||
++      !issuerMetadata.signing_alg_values_supported.includes(evtHeader.alg)
++    ) {
++      const err = new Error(
++        `EVT signing algorithm "${evtHeader.alg}" is not in issuer's signing_alg_values_supported.`
++      );
++      err.status = 401;
++      err.code = 'UNSUPPORTED_SIGNING_ALG';
++      throw err;
++    }
++  }
++
++  let jwksData;
++  try {
++    const jwksRes = await fetch(issuerMetadata.jwks_uri, {
++      headers: { Accept: 'application/json' },
++    });
++    if (!jwksRes.ok) {
++      throw new Error(`HTTP ${jwksRes.status} from ${issuerMetadata.jwks_uri}`);
++    }
++    jwksData = await jwksRes.json();
++  } catch (jwksErr) {
++    const err = new Error(
++      `Failed to fetch JWKS from ${issuerMetadata.jwks_uri}: ${jwksErr.message}`
++    );
++    err.status = 401;
++    err.code = 'JWKS_FETCH_FAILED';
++    throw err;
++  }
++
++  try {
++    const jwks = createLocalJWKSet(jwksData);
++    await jwtVerify(evtJwt, jwks, {
++      issuer: evtPayload.iss,
++    });
++  } catch (evtVerifyErr) {
++    const err = new Error(`EVT issuer signature verification failed: ${evtVerifyErr.message}`);
++    err.status = 401;
++    err.code = 'EVT_SIGNATURE_INVALID';
++    throw err;
++  }
++
++  // Mark nonce as consumed to prevent replay attacks
++  issuedNonces.set(tokenNonce, {
++    createdAt: storedNonceMeta?.createdAt || Date.now(),
++    used: true,
++  });
++
++  return {
++    verified: true,
++    email: evtPayload.email.trim().toLowerCase(),
++    issuer: evtPayload.iss,
++    evtClaims: evtPayload,
++    kbClaims: kbPayload,
++  };
++}
++
++function renderHomepageWithNonce(req, res) {
++  const indexPath = path.join(__dirname, 'index.html');
++  const rawHtml = fs.readFileSync(indexPath, 'utf8');
++  const nonce = generateNonce();
++
++  res.cookie('dg_evp_nonce', nonce, {
++    httpOnly: false,
++    sameSite: 'lax',
++    maxAge: NONCE_TTL_MS,
++  });
++
++  const renderedHtml = rawHtml.replaceAll(TEMPLATE_NONCE_PLACEHOLDER, nonce);
++  res.setHeader('Content-Type', 'text/html; charset=utf-8');
++  res.setHeader('Cache-Control', 'no-store');
++  res.send(renderedHtml);
++}
++
++// Serve homepage & rewards route with fresh session-bound EVP nonce
++app.get('/', renderHomepageWithNonce);
++app.get('/index.html', renderHomepageWithNonce);
++app.get('/rewards', renderHomepageWithNonce);
++
++// Endpoint to obtain or refresh a session-bound EVP nonce
++app.get('/api/nonce', (req, res) => {
++  const nonce = generateNonce();
++  res.cookie('dg_evp_nonce', nonce, {
++    httpOnly: false,
++    sameSite: 'lax',
++    maxAge: NONCE_TTL_MS,
++  });
++  res.json({ nonce });
++});
++
++// Handler for rewards account registration & email ownership verification
++async function handleRewardsSignup(req, res) {
++  const body = req.body || {};
++  const submittedEmail = (
++    body.email ||
++    body['email-address'] ||
++    body.emailAddress ||
++    ''
++  ).trim();
++  const token =
++    body.token ||
++    body.evt ||
++    body['email-verification-token'] ||
++    body.emailVerificationToken ||
++    body.presentationToken ||
++    '';
++  const name = (body.name || body.fullName || body['full-name'] || 'Coffee Lover').trim();
++  const favoriteDrink = (body.favoriteDrink || body['favorite-drink'] || 'Maple Oat Latte').trim();
++
++  const cookieNonce = req.cookies?.dg_evp_nonce;
++  const bodyNonce = body.nonce;
++  const expectedNonce = cookieNonce || bodyNonce;
++
++  const host = req.get('host');
++  const protocol = req.protocol || 'http';
++  const expectedOrigins = [];
++  if (req.headers.origin) {
++    expectedOrigins.push(req.headers.origin);
++  }
++  if (host) {
++    expectedOrigins.push(`${protocol}://${host}`);
++    expectedOrigins.push(`http://${host}`);
++    expectedOrigins.push(`https://${host}`);
++    const portPart = host.includes(':') ? `:${host.split(':')[1]}` : '';
++    expectedOrigins.push(`http://localhost${portPart}`);
++    expectedOrigins.push(`http://127.0.0.1${portPart}`);
++  }
++
++  try {
++    const verification = await verifyEmailVerificationToken({
++      token,
++      submittedEmail,
++      expectedNonce,
++      expectedOrigins,
++    });
++
++    const account = {
++      id: `dgr_${randomBytes(8).toString('hex')}`,
++      name: name || 'Coffee Lover',
++      email: verification.email,
++      emailVerified: true,
++      verificationMethod: 'email-verification-protocol',
++      issuer: verification.issuer,
++      favoriteDrink,
++      points: 150,
++      tier: 'Gold Bean',
++      createdAt: new Date().toISOString(),
++    };
++
++    rewardsAccounts.set(verification.email, account);
++
++    // Issue a fresh nonce for subsequent form submissions
++    const nextNonce = generateNonce();
++    res.cookie('dg_evp_nonce', nextNonce, {
++      httpOnly: false,
++      sameSite: 'lax',
++      maxAge: NONCE_TTL_MS,
++    });
++
++    return res.status(200).json({
++      success: true,
++      verified: true,
++      emailVerified: true,
++      message:
++        'Email ownership verified via browser-assisted verification! Your Daily Grind Rewards account is active.',
++      account,
++      nextNonce,
++    });
++  } catch (err) {
++    const status = err.status || 400;
++    return res.status(status).json({
++      success: false,
++      verified: false,
++      emailVerified: false,
++      code: err.code || 'VERIFICATION_FAILED',
++      error: err.message || 'Email ownership verification failed.',
++    });
++  }
++}
++
++app.post('/api/rewards/signup', handleRewardsSignup);
++app.post('/api/verify-email', handleRewardsSignup);
++app.post('/verify-email', handleRewardsSignup);
++app.post('/signup', handleRewardsSignup);
++app.post('/rewards/signup', handleRewardsSignup);
++
++// Inspect registered rewards accounts
++app.get('/api/rewards/accounts', (req, res) => {
++  res.json({
++    accounts: Array.from(rewardsAccounts.values()),
++  });
++});
++
++// Serve any other static files in the workspace
++app.use(express.static(__dirname, { index: false }));
++
++function getPort() {
++  const portArgIdx = process.argv.indexOf('--port');
++  if (portArgIdx !== -1 && process.argv[portArgIdx + 1]) {
++    return Number(process.argv[portArgIdx + 1]);
++  }
++  const pArgIdx = process.argv.indexOf('-p');
++  if (pArgIdx !== -1 && process.argv[pArgIdx + 1]) {
++    return Number(process.argv[pArgIdx + 1]);
++  }
++  return Number(process.env.PORT) || 11222;
++}
++
++if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
++  const port = getPort();
++  app.listen(port, () => {
++    console.log(`The Daily Grind server listening on http://localhost:${port}`);
++  });
++}
++
++export default app;

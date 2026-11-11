@@ -1,0 +1,3163 @@
+diff --git a/.gitignore b/.gitignore
+index c2b8e14..e97b5fd 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -23,4 +23,6 @@ pnpm-debug.log*
+ # jetbrains setting folder
+ .idea/
+ 
+-db.file
+\ No newline at end of file
++db.file
++# Local account database
++/data/
+diff --git a/README.md b/README.md
+index 4479b53..f6ff5b3 100644
+--- a/README.md
++++ b/README.md
+@@ -15,3 +15,38 @@ The application will now be running on `http://localhost:11224`.
+ - **[React](https://react.dev/)**: Used for UI components.
+ - **[Tailwind CSS](https://tailwindcss.com/)**: For styling the application.
+ - **[Astro DB](https://docs.astro.build/en/guides/database/)**: Powers the comments feature, using a libSQL-compatible database.
++
++## Accounts and passkeys
++
++Sign-in and registration offer passkeys and a password alternative. Account settings
++at `/devtools-times/account/settings` allow readers to add, rename, and remove
++passkeys, confirm their identity, and sign out. Removing the last passkey on a
++passwordless account is blocked to prevent lockout. Sensitive changes require an
++identity confirmation within the last five minutes.
++
++The WebAuthn implementation uses SimpleWebAuthn with discoverable credentials,
++required user verification, single-use five-minute challenges, and origin/RP
++verification. Authentication sessions use opaque, HTTP-only, SameSite cookies.
++New accounts, public credentials, password hashes, and sessions are stored in
++SQLite; biometric data and private keys are never sent to the app. Existing
++password-service users can sign in with their original credentials; a successful
++login provisions their local account for passkey enrollment. New accounts are
++managed by the local account service.
++
++Use Node.js 24 or later (the account store uses `node:sqlite`). Set these environment
++variables when deploying:
++
++- `AUTH_ORIGIN`: the exact public origin, such as `https://news.example.com`,
++  without a path or trailing slash. This must match the browser origin and be
++  configured when running behind a reverse proxy. It defaults to the request
++  origin for local use.
++- `AUTH_DB_PATH`: a persistent SQLite file, defaulting to `./data/auth.sqlite`.
++  Mount persistent storage and back it up. This store is intended for a single
++  application instance; a deployment with multiple replicas needs shared account
++  and session storage before enabling accounts.
++
++Passkeys require HTTPS, except on localhost. Browser support and cancellation
++failures are explained in the UI, with password fallback where available.
++
++Run `pnpm test` for account-store security checks, and `pnpm build` for the
++production build. No server is needed for these checks.
+diff --git a/package.json b/package.json
+index bfffcf0..a7d87e1 100644
+--- a/package.json
++++ b/package.json
+@@ -7,12 +7,15 @@
+     "start": "HOST=0.0.0.0 PORT=${PORT:-11224} node ./dist/server/entry.mjs",
+     "build": "astro build",
+     "preview": "astro preview",
+-    "astro": "astro"
++    "astro": "astro",
++    "test": "node --test tests/*.test.ts"
+   },
+   "dependencies": {
+     "@astrojs/node": "^11.1.9",
+     "@astrojs/react": "^5.0.7",
+     "@heroicons/react": "^2.2.0",
++    "@simplewebauthn/browser": "^14.0.0",
++    "@simplewebauthn/server": "^14.1.0",
+     "@tailwindcss/vite": "^4.3.3",
+     "@types/react": "^19.3.0",
+     "@types/react-dom": "^19.3.0",
+@@ -23,12 +26,17 @@
+     "tailwindcss": "^4.3.3"
+   },
+   "devDependencies": {
+-    "@tailwindcss/typography": "^0.5.20"
++    "@tailwindcss/typography": "^0.5.20",
++    "@types/node": "^26.6.6",
++    "typescript": "^7.0.2"
+   },
+   "pnpm": {
+     "onlyBuiltDependencies": [
+       "esbuild",
+       "sharp"
+     ]
++  },
++  "engines": {
++    "node": ">=24"
+   }
+ }
+diff --git a/src/components/AccountNav.tsx b/src/components/AccountNav.tsx
+new file mode 100644
+index 0000000..2a377f4
+--- /dev/null
++++ b/src/components/AccountNav.tsx
+@@ -0,0 +1,44 @@
++import React, { useEffect, useState } from "react";
++import { UserCircleIcon } from "@heroicons/react/24/outline";
++import { api, base } from "../lib/auth-client";
++export default function AccountNav() {
++  const [signedIn, setSignedIn] = useState(false);
++  useEffect(() => {
++    let active = true;
++    api("account")
++      .then(() => {
++        if (active) setSignedIn(true);
++      })
++      .catch(() => {});
++    return () => {
++      active = false;
++    };
++  }, []);
++  return signedIn ? (
++    <a
++      href={`${base}account/settings`}
++      className="header-account-link"
++      data-skip-tracking="true"
++    >
++      <UserCircleIcon width={17} />
++      My account
++    </a>
++  ) : (
++    <>
++      <a
++        href={`${base}signup`}
++        data-skip-tracking="true"
++        className="header-signup-link"
++      >
++        Sign up
++      </a>
++      <a
++        href={`${base}signin`}
++        data-skip-tracking="true"
++        className="header-signin-link"
++      >
++        Sign in <span aria-hidden="true">↗</span>
++      </a>
++    </>
++  );
++}
+diff --git a/src/components/AccountSettings.tsx b/src/components/AccountSettings.tsx
+new file mode 100644
+index 0000000..3f52374
+--- /dev/null
++++ b/src/components/AccountSettings.tsx
+@@ -0,0 +1,523 @@
++import React, { useEffect, useRef, useState } from "react";
++import {
++  ArrowRightIcon,
++  ArrowLeftOnRectangleIcon,
++  ComputerDesktopIcon,
++  ShieldCheckIcon,
++  UserCircleIcon,
++  XMarkIcon,
++  PlusIcon,
++  PencilSquareIcon,
++  TrashIcon,
++  LockClosedIcon,
++  CheckCircleIcon,
++} from "@heroicons/react/24/outline";
++import { PasskeyIcon } from "./AuthIcons";
++import {
++  api,
++  AuthError,
++  authenticatePasskey,
++  base,
++  errorMessage,
++  registerPasskey,
++  supportsPasskeys,
++} from "../lib/auth-client";
++type Key = {
++  id: string;
++  name: string;
++  createdAt: string;
++  lastUsed: string | null;
++  backedUp: boolean;
++};
++type Account = { username: string; hasPassword: boolean; passkeys: Key[] };
++type Dialog = { type: "add" | "rename" | "remove" | "reauth"; key?: Key };
++const date = (value: string) =>
++  new Date(value).toLocaleDateString(undefined, {
++    month: "short",
++    day: "numeric",
++    year: "numeric",
++  });
++export default function AccountSettings() {
++  const [account, setAccount] = useState<Account | null>(null);
++  const [loading, setLoading] = useState(true);
++  const [signedOut, setSignedOut] = useState(false);
++  const [supported, setSupported] = useState(false);
++  const [error, setError] = useState("");
++  const [notice, setNotice] = useState("");
++  const [dialog, setDialog] = useState<Dialog | null>(null);
++  const [name, setName] = useState("");
++  const [password, setPassword] = useState("");
++  const [busy, setBusy] = useState(false);
++  const [usePassword, setUsePassword] = useState(false);
++  const [dialogError, setDialogError] = useState("");
++  const retry = useRef<null | (() => Promise<void>)>(null);
++  const modal = useRef<HTMLDialogElement>(null);
++  const trigger = useRef<HTMLElement | null>(null);
++  async function refresh() {
++    setAccount(await api("account"));
++  }
++  useEffect(() => {
++    setSupported(supportsPasskeys());
++    refresh()
++      .catch((err) => {
++        setSignedOut(true);
++        setError(errorMessage(err));
++      })
++      .finally(() => setLoading(false));
++    if (new URLSearchParams(window.location.search).has("welcome"))
++      setNotice("Welcome to The DevTools Times. Your account is ready.");
++  }, []);
++  useEffect(() => {
++    if (dialog) modal.current?.showModal();
++    else {
++      modal.current?.close();
++      trigger.current?.focus();
++    }
++  }, [dialog]);
++  function open(value: Dialog) {
++    trigger.current = document.activeElement as HTMLElement;
++    setDialogError("");
++    setPassword("");
++    setUsePassword(!supported || !account?.passkeys.length);
++    setDialog(value);
++    setName(value.key?.name || "");
++  }
++  function close() {
++    if (!busy) {
++      setDialog(null);
++      setDialogError("");
++      retry.current = null;
++    }
++  }
++  async function run(action: () => Promise<void>) {
++    setBusy(true);
++    setDialogError("");
++    setError("");
++    try {
++      await action();
++      setDialog(null);
++      await refresh();
++    } catch (err) {
++      if (err instanceof AuthError && err.reauth) {
++        retry.current = action;
++        setPassword("");
++        setUsePassword(!supported || !account?.passkeys.length);
++        setDialog({ type: "reauth" });
++      } else setDialogError(errorMessage(err));
++    } finally {
++      setBusy(false);
++    }
++  }
++  async function submit(e: React.FormEvent) {
++    e.preventDefault();
++    if (!dialog) return;
++    if (dialog.type === "reauth") {
++      setBusy(true);
++      setDialogError("");
++      try {
++        if (usePassword) await api("password-reauth", { password });
++        else await authenticatePasskey(true);
++        const next = retry.current;
++        retry.current = null;
++        if (next) await next();
++        else
++          setNotice(
++            "Identity confirmed. You can securely manage your passkeys.",
++          );
++        setDialog(null);
++        await refresh();
++      } catch (err) {
++        setDialogError(errorMessage(err));
++      } finally {
++        setBusy(false);
++      }
++      return;
++    }
++    const current = dialog;
++    const nextName = name.trim();
++    await run(async () => {
++      if (current.type === "add") {
++        await registerPasskey(account!.username, nextName || "My passkey");
++        setNotice("Your new passkey is ready to use.");
++      }
++      if (current.type === "rename") {
++        await api("rename", { id: current.key!.id, name: nextName });
++        setNotice("Passkey name updated.");
++      }
++      if (current.type === "remove") {
++        await api("remove", { id: current.key!.id });
++        setNotice("Passkey removed from your account.");
++      }
++    });
++  }
++  async function logout() {
++    setBusy(true);
++    try {
++      await api("logout", {});
++      window.location.assign(`${base}signin`);
++    } catch (err) {
++      setError(errorMessage(err));
++      setBusy(false);
++    }
++  }
++  if (loading)
++    return (
++      <div className="settings-loading" role="status">
++        Loading your account…
++      </div>
++    );
++  if (signedOut || !account)
++    return (
++      <div className="signed-out">
++        <span className="small-key-icon">
++          <UserCircleIcon width={30} />
++        </span>
++        <h1>Your account, at a glance.</h1>
++        <p>{error || "Sign in to manage your security and passkeys."}</p>
++        <a className="primary-button" href={`${base}signin`}>
++          Sign in to your account <ArrowRightIcon width={18} />
++        </a>
++      </div>
++    );
++  return (
++    <div className="settings-grid">
++      <aside className="settings-sidebar">
++        <span className="eyebrow">YOUR ACCOUNT</span>
++        <div className="account-avatar">
++          {account.username.charAt(0).toUpperCase()}
++        </div>
++        <h2>{account.username}</h2>
++        <p>DevTools Times reader</p>
++        <nav aria-label="Account settings">
++          <a href="#security" className="settings-nav-active">
++            <ShieldCheckIcon width={20} />
++            Sign-in & security
++            <ArrowRightIcon width={15} />
++          </a>
++          <a href={`${base}`}>
++            <ComputerDesktopIcon width={20} />
++            Back to the news
++          </a>
++        </nav>
++        <button className="signout-button" onClick={logout} disabled={busy}>
++          <ArrowLeftOnRectangleIcon width={19} />
++          Sign out
++        </button>
++      </aside>
++      <section className="settings-main" id="security">
++        <span className="eyebrow">A LITTLE PEACE OF MIND</span>
++        <h1>Sign-in & security</h1>
++        <p className="settings-intro">
++          A safer account. More time for the stories that matter.
++        </p>
++        {notice && (
++          <div className="success-notice" role="status">
++            <CheckCircleIcon width={20} />
++            <span>{notice}</span>
++            <button
++              aria-label="Dismiss notification"
++              onClick={() => setNotice("")}
++            >
++              <XMarkIcon width={18} />
++            </button>
++          </div>
++        )}
++        {error && (
++          <div className="form-error" role="alert">
++            {error}
++          </div>
++        )}
++        <div className="security-banner">
++          <span className="security-banner-icon">
++            <ShieldCheckIcon width={28} />
++          </span>
++          <div>
++            <h2>
++              {account.passkeys.length
++                ? "A stronger way to protect your account"
++                : "Your next security upgrade: passkeys"}
++            </h2>
++            <p>
++              {account.passkeys.length
++                ? "Your passkeys keep sign-in simple and your account secure."
++                : "Skip the password. Sign in with your face, fingerprint, or device PIN."}
++            </p>
++          </div>
++          <span className="security-badge">
++            {account.passkeys.length ? "PROTECTED" : "RECOMMENDED"}
++          </span>
++        </div>
++        <div className="settings-section-head">
++          <div>
++            <h2>
++              <PasskeyIcon size={23} />
++              Your passkeys{" "}
++              <span className="count-badge">{account.passkeys.length}</span>
++            </h2>
++            <p>Secure sign-in, with a familiar touch.</p>
++          </div>
++          <button
++            className="primary-button compact"
++            onClick={() => open({ type: "add" })}
++            disabled={busy || !supported}
++          >
++            <PlusIcon width={17} />
++            Add a passkey
++          </button>
++        </div>
++        {!supported && (
++          <div className="notice">
++            This browser or connection doesn’t support passkeys. Use a supported
++            browser on HTTPS to add or use one.
++          </div>
++        )}
++        <div className="passkey-list">
++          {account.passkeys.length ? (
++            account.passkeys.map((key) => (
++              <article className="passkey-row" key={key.id}>
++                <span className="key-device">
++                  <PasskeyIcon size={26} />
++                </span>
++                <div className="key-detail">
++                  <h3>{key.name}</h3>
++                  <p>
++                    Added {date(key.createdAt)}
++                    <span>·</span>
++                    {key.lastUsed
++                      ? `Last used ${date(key.lastUsed)}`
++                      : "Not used yet"}
++                  </p>
++                  <span className="key-sync">
++                    {key.backedUp ? "Synced passkey" : "Device-bound passkey"}
++                  </span>
++                </div>
++                <div className="key-actions">
++                  <button
++                    aria-label={`Rename ${key.name}`}
++                    title="Rename passkey"
++                    onClick={() => open({ type: "rename", key })}
++                  >
++                    <PencilSquareIcon width={19} />
++                  </button>
++                  <button
++                    aria-label={`Remove ${key.name}`}
++                    title="Remove passkey"
++                    disabled={
++                      !account.hasPassword && account.passkeys.length === 1
++                    }
++                    onClick={() => open({ type: "remove", key })}
++                  >
++                    <TrashIcon width={19} />
++                  </button>
++                </div>
++              </article>
++            ))
++          ) : (
++            <div className="passkey-empty">
++              <PasskeyIcon size={35} />
++              <h3>Your first passkey starts here.</h3>
++              <p>Add a passkey to sign in securely without a password.</p>
++              <button
++                className="text-button"
++                disabled={!supported}
++                onClick={() => open({ type: "add" })}
++              >
++                Create your first passkey <ArrowRightIcon width={16} />
++              </button>
++            </div>
++          )}
++        </div>
++        <p className="settings-footnote">
++          <LockClosedIcon width={14} />
++          {!account.hasPassword && account.passkeys.length === 1
++            ? "Keep at least one passkey so you can always access your account."
++            : "Only you can use your passkeys. Your biometric data stays on your device."}
++        </p>
++        <div className="settings-info-grid">
++          <div>
++            <h3>New device? No problem.</h3>
++            <p>
++              Passkeys can sync through your password manager. You can also use
++              a nearby phone or a physical security key.
++            </p>
++          </div>
++          <div>
++            <h3>Stay in control.</h3>
++            <p>
++              Give each passkey a memorable name. Remove a passkey here if you
++              no longer want it to access your account.
++            </p>
++          </div>
++        </div>
++        <div className="reauth-card">
++          <LockClosedIcon width={23} />
++          <div>
++            <h3>Extra care for important changes</h3>
++            <p>
++              We’ll ask you to confirm it’s you before updating your security.
++            </p>
++          </div>
++          <button
++            className="text-button"
++            onClick={() => {
++              retry.current = null;
++              open({ type: "reauth" });
++            }}
++          >
++            Verify identity <ArrowRightIcon width={15} />
++          </button>
++        </div>
++        <p className="settings-legal">
++          Your security matters. Read our{" "}
++          <a href={`${base}legal/privacy`}>Privacy Policy ↗</a>
++        </p>
++      </section>
++      <dialog
++        className="account-dialog"
++        aria-labelledby="account-dialog-title"
++        aria-describedby="account-dialog-description"
++        ref={modal}
++        onCancel={(e) => {
++          e.preventDefault();
++          close();
++        }}
++        onClick={(e) => {
++          if (e.target === e.currentTarget) close();
++        }}
++      >
++        <div className="dialog-inner">
++          <button
++            className="dialog-close"
++            aria-label="Close dialog"
++            disabled={busy}
++            onClick={close}
++          >
++            <XMarkIcon width={22} />
++          </button>
++          <span className="small-key-icon">
++            {dialog?.type === "reauth" ? (
++              <ShieldCheckIcon width={30} />
++            ) : (
++              <PasskeyIcon size={30} />
++            )}
++          </span>
++          <h2 id="account-dialog-title">
++            {dialog?.type === "add"
++              ? "Add a passkey"
++              : dialog?.type === "rename"
++                ? "Make it memorable."
++                : dialog?.type === "remove"
++                  ? "Remove this passkey?"
++                  : "Let’s make sure it’s you."}
++          </h2>
++          <p id="account-dialog-description">
++            {dialog?.type === "add"
++              ? "Give your passkey a name. Your device will take care of the rest."
++              : dialog?.type === "rename"
++                ? "Choose a name that helps you recognize this passkey."
++                : dialog?.type === "remove"
++                  ? `“${dialog.key?.name}” will no longer be able to sign in to your account. This won’t delete it from your password manager.`
++                  : "Confirm your identity to securely manage your account."}
++          </p>
++          <form onSubmit={submit} aria-busy={busy}>
++            {(dialog?.type === "add" || dialog?.type === "rename") && (
++              <>
++                <label className="field-label" htmlFor="passkey-name">
++                  Passkey name
++                </label>
++                <input
++                  className="auth-input"
++                  autoFocus
++                  id="passkey-name"
++                  placeholder="e.g. Personal MacBook"
++                  value={name}
++                  onChange={(e) => setName(e.target.value)}
++                  required
++                  maxLength={60}
++                  disabled={busy}
++                />
++              </>
++            )}
++            {dialog?.type === "reauth" &&
++              usePassword &&
++              account.hasPassword && (
++                <>
++                  <label className="field-label" htmlFor="confirm-password">
++                    Your password
++                  </label>
++                  <input
++                    className="auth-input"
++                    autoFocus
++                    type="password"
++                    autoComplete="current-password"
++                    id="confirm-password"
++                    value={password}
++                    onChange={(e) => setPassword(e.target.value)}
++                    required
++                    maxLength={256}
++                    disabled={busy}
++                  />
++                </>
++              )}
++            {dialogError && (
++              <div className="form-error" role="alert">
++                {dialogError}
++              </div>
++            )}
++            {dialog?.type === "reauth" && !supported && !account.hasPassword ? (
++              <p className="form-error">
++                Open this account in a browser that supports passkeys to confirm
++                your identity.
++              </p>
++            ) : (
++              <button
++                className={`primary-button ${dialog?.type === "remove" ? "danger-button" : ""}`}
++                disabled={busy}
++                type="submit"
++              >
++                {busy
++                  ? "Please follow your device’s prompt…"
++                  : dialog?.type === "add"
++                    ? "Create passkey"
++                    : dialog?.type === "rename"
++                      ? "Save name"
++                      : dialog?.type === "remove"
++                        ? "Remove passkey"
++                        : usePassword
++                          ? "Confirm with password"
++                          : "Confirm with passkey"}
++                {!busy && <ArrowRightIcon width={18} />}
++              </button>
++            )}
++            {dialog?.type === "reauth" &&
++              account.hasPassword &&
++              account.passkeys.length > 0 &&
++              supported && (
++                <button
++                  className="text-button reauth-alternative"
++                  type="button"
++                  disabled={busy}
++                  onClick={() => {
++                    setUsePassword(!usePassword);
++                    setDialogError("");
++                  }}
++                >
++                  {usePassword
++                    ? "Use a passkey instead"
++                    : "Use your password instead"}
++                </button>
++              )}
++            <button
++              className="dialog-cancel"
++              type="button"
++              disabled={busy}
++              onClick={close}
++            >
++              Cancel
++            </button>
++          </form>
++        </div>
++      </dialog>
++    </div>
++  );
++}
+diff --git a/src/components/AuthForm.tsx b/src/components/AuthForm.tsx
+new file mode 100644
+index 0000000..425d38a
+--- /dev/null
++++ b/src/components/AuthForm.tsx
+@@ -0,0 +1,249 @@
++import React, { useEffect, useState } from "react";
++import {
++  ArrowRightIcon,
++  EyeIcon,
++  EyeSlashIcon,
++  LockClosedIcon,
++} from "@heroicons/react/24/outline";
++import { PasskeyIcon } from "./AuthIcons";
++import {
++  api,
++  authenticatePasskey,
++  base,
++  errorMessage,
++  registerPasskey,
++  supportsPasskeys,
++} from "../lib/auth-client";
++
++export default function AuthForm({ signup = false }: { signup?: boolean }) {
++  const [method, setMethod] = useState<"passkey" | "password">("passkey");
++  const [username, setUsername] = useState("");
++  const [password, setPassword] = useState("");
++  const [showPassword, setShowPassword] = useState(false);
++  const [supported, setSupported] = useState<boolean | null>(null);
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState("");
++  useEffect(() => {
++    const value = supportsPasskeys();
++    setSupported(value);
++    if (!value) setMethod("password");
++  }, []);
++  async function submit(e: React.FormEvent) {
++    e.preventDefault();
++    setError("");
++    setBusy(true);
++    try {
++      if (method === "passkey") {
++        if (signup) await registerPasskey(username, "My first passkey", true);
++        else await authenticatePasskey();
++      } else
++        await api(signup ? "password-signup" : "password-signin", {
++          username,
++          password,
++        });
++      window.location.assign(
++        `${base}account/settings${signup ? "?welcome=1" : ""}`,
++      );
++    } catch (err) {
++      setError(errorMessage(err));
++      setBusy(false);
++    }
++  }
++  return (
++    <div className="auth-form-wrap">
++      <div className="eyebrow">
++        <span className="eyebrow-line" />
++        {signup ? "JOIN THE DEVTOOLS TIMES" : "YOUR DAILY PERSPECTIVE"}
++      </div>
++      <h1>{signup ? "Good journalism.\nGreat company." : "Welcome back."}</h1>
++      <p className="auth-intro">
++        {signup
++          ? "Create your free account. Stay curious, stay informed."
++          : "Independent thinking starts with a simple sign-in."}
++      </p>
++      <div
++        className="auth-tabs"
++        role="tablist"
++        aria-label={signup ? "Create account with" : "Sign-in method"}
++      >
++        <button
++          type="button"
++          role="tab"
++          id="passkey-tab"
++          aria-selected={method === "passkey"}
++          aria-controls="auth-panel"
++          disabled={busy || supported === false}
++          onClick={() => {
++            setMethod("passkey");
++            setError("");
++          }}
++        >
++          <PasskeyIcon size={19} />
++          Passkey<span className="recommended">RECOMMENDED</span>
++        </button>
++        <button
++          type="button"
++          role="tab"
++          id="password-tab"
++          aria-selected={method === "password"}
++          aria-controls="auth-panel"
++          disabled={busy}
++          onClick={() => {
++            setMethod("password");
++            setError("");
++          }}
++        >
++          <LockClosedIcon width={17} />
++          Password
++        </button>
++      </div>
++      {supported === false && (
++        <p className="notice">
++          Passkeys aren’t available in this browser or connection. You can
++          continue with a password.
++        </p>
++      )}
++      <form
++        onSubmit={submit}
++        id="auth-panel"
++        role="tabpanel"
++        aria-labelledby={`${method}-tab`}
++        aria-busy={busy}
++      >
++        {method === "passkey" && !signup ? (
++          <div className="passkey-prompt">
++            <span className="small-key-icon">
++              <PasskeyIcon size={29} />
++            </span>
++            <h2>A familiar touch. A safer sign-in.</h2>
++            <p>
++              Use your fingerprint, face, or screen lock.
++              <br />
++              No password to remember.
++            </p>
++          </div>
++        ) : (
++          <>
++            <label className="field-label" htmlFor="username">
++              Username
++            </label>
++            <input
++              className="auth-input"
++              id="username"
++              name="username"
++              autoComplete="username"
++              autoCapitalize="none"
++              spellCheck={false}
++              placeholder={signup ? "Choose your username" : "Enter your username"}
++              value={username}
++              onChange={(e) => setUsername(e.target.value)}
++              required
++              minLength={3}
++              maxLength={100}
++              disabled={busy}
++            />
++            {method === "password" && (
++              <>
++                <label
++                  className="field-label password-label"
++                  htmlFor="password"
++                >
++                  Password
++                </label>
++                <div className="password-field">
++                  <input
++                    className="auth-input"
++                    id="password"
++                    name="password"
++                    type={showPassword ? "text" : "password"}
++                    autoComplete={signup ? "new-password" : "current-password"}
++                    placeholder={
++                      signup
++                        ? "Create a strong password"
++                        : "Enter your password"
++                    }
++                    value={password}
++                    onChange={(e) => setPassword(e.target.value)}
++                    required
++                    minLength={signup ? 8 : undefined}
++                    maxLength={256}
++                    disabled={busy}
++                  />
++                  <button
++                    type="button"
++                    aria-label={
++                      showPassword ? "Hide password" : "Show password"
++                    }
++                    onClick={() => setShowPassword(!showPassword)}
++                  >
++                    {showPassword ? (
++                      <EyeSlashIcon width={19} />
++                    ) : (
++                      <EyeIcon width={19} />
++                    )}
++                  </button>
++                </div>
++                {signup && (
++                  <p className="input-help">
++                    At least 8 characters, including a number.
++                  </p>
++                )}
++              </>
++            )}
++            {method === "passkey" && (
++              <p className="input-help signup-help">
++                Next, your device will help you create a secure passkey.
++              </p>
++            )}
++          </>
++        )}
++        {error && (
++          <div className="form-error" role="alert">
++            {error}
++          </div>
++        )}
++        <button
++          className="primary-button"
++          disabled={busy || supported === null}
++          type="submit"
++          data-skip-tracking="true"
++        >
++          {method === "passkey" && <PasskeyIcon size={21} />}
++          <span>
++            {busy
++              ? method === "passkey"
++                ? "Waiting for your device…"
++                : "Please wait…"
++              : method === "passkey"
++                ? signup
++                  ? "Create account with a passkey"
++                  : "Sign in with a passkey"
++                : signup
++                  ? "Create your account"
++                  : "Sign in with password"}
++          </span>
++          {!busy && <ArrowRightIcon width={18} />}
++        </button>
++        {method === "passkey" && (
++          <p className="device-note">
++            <LockClosedIcon width={12} /> Your device keeps your biometric data
++            private.
++          </p>
++        )}
++      </form>
++      <div className="auth-switch">
++        {signup ? "Already part of the story?" : "New to The DevTools Times?"}{" "}
++        <a href={`${base}${signup ? "signin" : "signup"}`}>
++          {signup ? "Sign in" : "Create an account"}{" "}
++          <span aria-hidden="true">↗</span>
++        </a>
++      </div>
++      <p className="auth-terms">
++        By continuing, you agree to our{" "}
++        <a href={`${base}legal/terms`}>Terms of Service</a>
++        <br className="hidden sm:block" /> and acknowledge our{" "}
++        <a href={`${base}legal/privacy`}>Privacy Policy</a>.
++      </p>
++    </div>
++  );
++}
+diff --git a/src/components/AuthIcons.tsx b/src/components/AuthIcons.tsx
+new file mode 100644
+index 0000000..47998a0
+--- /dev/null
++++ b/src/components/AuthIcons.tsx
+@@ -0,0 +1,39 @@
++import React from "react";
++export function PasskeyIcon({
++  size = 24,
++  ...props
++}: React.SVGProps<SVGSVGElement> & { size?: number }) {
++  return (
++    <svg
++      width={size}
++      height={size}
++      viewBox="0 0 24 24"
++      fill="none"
++      stroke="currentColor"
++      strokeWidth="1.5"
++      strokeLinecap="round"
++      strokeLinejoin="round"
++      aria-hidden="true"
++      {...props}
++    >
++      <circle cx="8" cy="8" r="3" />
++      <path d="M2 20v-2a6 6 0 0 1 10-4.5M18 15v7m0-3h3m-3-4a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" />
++    </svg>
++  );
++}
++export function Fingerprint({ size = 96 }: { size?: number }) {
++  return (
++    <svg
++      width={size}
++      height={size}
++      viewBox="0 0 100 100"
++      fill="none"
++      stroke="currentColor"
++      strokeWidth="3"
++      strokeLinecap="round"
++      aria-hidden="true"
++    >
++      <path d="M22 38a30 30 0 0 1 56 0M15 50v5c0 14-3 20-5 24M85 50v6c0 16 1 22 5 29M30 45a21 21 0 0 1 40 0c2 7 0 24 6 39M22 50c0 17-2 28-8 37M39 48a12 12 0 0 1 23 0c1 15-1 28 8 43M31 55c0 16-3 29-8 38M50 51c0 21-3 34-10 45M60 76c-2 8-1 15 2 22M41 56c0 17-4 30-9 40" />
++    </svg>
++  );
++}
+diff --git a/src/components/Footer.astro b/src/components/Footer.astro
+index 5f2d281..e5a58e0 100644
+--- a/src/components/Footer.astro
++++ b/src/components/Footer.astro
+@@ -69,7 +69,7 @@ const baseUrl = import.meta.env.BASE_URL;
+                     </a>
+                 </li>
+                 <li>
+-                    <a href="#" class="flex items-center text-sm font-semibold hover:underline">
++                    <a href={`${baseUrl}account/settings`} class="flex items-center text-sm font-semibold hover:underline">
+                         <svg class="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                         Manage My Account
+                     </a>
+diff --git a/src/components/Header.astro b/src/components/Header.astro
+index 980b279..eb1e850 100644
+--- a/src/components/Header.astro
++++ b/src/components/Header.astro
+@@ -1,4 +1,5 @@
+ ---
++import AccountNav from "./AccountNav";
+ import ReadingListButton from "./ReadingListButton.tsx";
+ import SearchButton from "./SearchButton.tsx";
+ import { getCollection } from "astro:content";
+@@ -25,20 +26,7 @@ const todaysDate = new Date().toLocaleDateString('en-US', { weekday: 'long', yea
+ 
+       <!-- Right: Buttons -->
+       <div class="flex items-center space-x-3">
+-        <a
+-          href={`${baseUrl}signup`}
+-          data-skip-tracking="true"
+-          class="bg-gray-800 text-white text-xs font-semibold py-2 px-3 rounded whitespace-nowrap hover:bg-gray-700"
+-        >
+-          Sign up
+-        </a>
+-        <a
+-          href={`${baseUrl}signin`}
+-          data-skip-tracking="true"
+-          class="bg-gray-500 text-white text-xs font-semibold py-2 px-3 rounded hover:bg-gray-400"
+-        >
+-          Sign in
+-        </a>
++        <AccountNav client:load />
+       </div>
+     </div>
+   </div>
+diff --git a/src/components/PasskeyStory.astro b/src/components/PasskeyStory.astro
+new file mode 100644
+index 0000000..7087987
+--- /dev/null
++++ b/src/components/PasskeyStory.astro
+@@ -0,0 +1,19 @@
++---
++import { Fingerprint } from './AuthIcons';
++---
++<aside class="passkey-story">
++  <div class="story-top"><span class="story-dot"></span> A SMARTER WAY TO SIGN IN <span class="story-edition">01 / SECURITY</span></div>
++  <div class="fingerprint-scene">
++    <div class="fingerprint-orbit orbit-one"></div><div class="fingerprint-orbit orbit-two"></div>
++    <div class="fingerprint-tile"><Fingerprint size={100}/><span class="fingerprint-check">✓</span></div>
++    <div class="scene-label"><span>✓</span> Just you. Simply secure.</div>
++    <span class="scene-spark spark-one">+</span><span class="scene-spark spark-two">+</span>
++  </div>
++  <div class="story-copy"><span class="eyebrow">LESS FRICTION. MORE READING.</span><h2>Your news.<br/>Now without passwords.</h2><p>Meet passkeys. A simpler, safer way to get back to the stories that matter to you.</p></div>
++  <div class="story-features">
++    <div><span class="feature-check">✓</span><div><h3>Secure by design</h3><p>Built to protect you from phishing.</p></div></div>
++    <div><span class="feature-check">✓</span><div><h3>Effortless, on every device</h3><p>Use your face, fingerprint, or device PIN.</p></div></div>
++    <div><span class="feature-check">✓</span><div><h3>Yours, and yours alone</h3><p>Your biometric data never leaves your device.</p></div></div>
++  </div>
++  <div class="story-bottom"><span class="tiny-shield">◇</span> A little peace of mind. A lot more perspective.</div>
++</aside>
+diff --git a/src/components/SignInForm.tsx b/src/components/SignInForm.tsx
+index a7c52b6..427d0cf 100644
+--- a/src/components/SignInForm.tsx
++++ b/src/components/SignInForm.tsx
+@@ -1,99 +1,4 @@
+-import React, { useState } from 'react';
+-
++import AuthForm from "./AuthForm";
+ export default function SignInForm() {
+-  const [username, setUsername] = useState('');
+-  const [password, setPassword] = useState('');
+-  const [error, setError] = useState<string | null>(null);
+-  const [success, setSuccess] = useState<string | null>(null);
+-  const [loading, setLoading] = useState(false);
+-
+-  const handleSubmit = async (e: React.FormEvent) => {
+-    e.preventDefault();
+-    setError(null);
+-    setSuccess(null);
+-    setLoading(true);
+-
+-    try {
+-      const response = await fetch('https://us-central1-web-devrel-apps.cloudfunctions.net/times_cdn/api/login', {
+-        method: 'POST',
+-        headers: {
+-          'Content-Type': 'application/json',
+-        },
+-        body: JSON.stringify({ username, password }),
+-      });
+-
+-      const data = await response.json();
+-
+-      if (!response.ok) {
+-        // TODO: Handle specific error codes (APP_ERR_2001, APP_ERR_2002) properly.
+-        // For now, we display a generic error message including the code.
+-        setError(`Login failed: ${data.error || 'Unknown error'}`);
+-      } else {
+-        setSuccess('Login successful!');
+-        // You might store the token here if needed, e.g., localStorage.setItem('token', data.token);
+-      }
+-    } catch (err) {
+-      setError('An unexpected error occurred. Please try again later.');
+-    } finally {
+-      setLoading(false);
+-    }
+-  };
+-
+-  return (
+-    <div className="max-w-md mx-auto mt-10 p-6 bg-white border border-gray-200 rounded-lg shadow-sm">
+-      <h2 className="text-2xl font-bold mb-6 text-center text-gray-800">Sign In</h2>
+-      
+-      {error && (
+-        <div className="mb-4 p-3 text-sm text-red-700 bg-red-100 rounded-lg" role="alert">
+-          {error}
+-        </div>
+-      )}
+-      
+-      {success && (
+-        <div className="mb-4 p-3 text-sm text-green-700 bg-green-100 rounded-lg" role="alert">
+-          {success}
+-        </div>
+-      )}
+-
+-      <form onSubmit={handleSubmit} className="space-y-4">
+-        <div>
+-          <label htmlFor="username" className="block text-sm font-medium text-gray-700 mb-1">
+-            Username
+-          </label>
+-          <input
+-            type="text"
+-            id="username"
+-            value={username}
+-            onChange={(e) => setUsername(e.target.value)}
+-            required
+-            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+-          />
+-        </div>
+-        
+-        <div>
+-          <label htmlFor="password" className="block text-sm font-medium text-gray-700 mb-1">
+-            Password
+-          </label>
+-          <input
+-            type="password"
+-            id="password"
+-            value={password}
+-            onChange={(e) => setPassword(e.target.value)}
+-            required
+-            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+-          />
+-        </div>
+-
+-        <button
+-          type="submit"
+-          disabled={loading}
+-          className={`w-full py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-gray-900 hover:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-900 ${
+-            loading ? 'opacity-75 cursor-not-allowed' : ''
+-          }`}
+-        >
+-          {loading ? 'Signing in...' : 'Sign In'}
+-        </button>
+-      </form>
+-    </div>
+-  );
++  return <AuthForm />;
+ }
+diff --git a/src/components/SignUpForm.tsx b/src/components/SignUpForm.tsx
+index 589fe62..07a5449 100644
+--- a/src/components/SignUpForm.tsx
++++ b/src/components/SignUpForm.tsx
+@@ -1,104 +1,4 @@
+-import React, { useState } from 'react';
+-
++import AuthForm from "./AuthForm";
+ export default function SignUpForm() {
+-  const [username, setUsername] = useState('');
+-  const [password, setPassword] = useState('');
+-  const [error, setError] = useState<string | null>(null);
+-  const [success, setSuccess] = useState<string | null>(null);
+-  const [loading, setLoading] = useState(false);
+-
+-  const handleSubmit = async (e: React.FormEvent) => {
+-    e.preventDefault();
+-    setError(null);
+-    setSuccess(null);
+-    setLoading(true);
+-
+-    try {
+-      const response = await fetch('https://us-central1-web-devrel-apps.cloudfunctions.net/times_cdn/api/register', {
+-        method: 'POST',
+-        headers: {
+-          'Content-Type': 'application/json',
+-        },
+-        body: JSON.stringify({ username, password }),
+-      });
+-
+-      const data = await response.json();
+-
+-      if (!response.ok) {
+-        // TODO: Handle specific error codes (APP_ERR_1001, APP_ERR_1002, etc.) properly.
+-        // For now, we display a generic error message including the code.
+-        setError(`Registration failed: ${data.error || 'Unknown error'}`);
+-      } else {
+-        setSuccess('User registered successfully! You can now sign in.');
+-        setUsername('');
+-        setPassword('');
+-      }
+-    } catch (err) {
+-      setError('An unexpected error occurred. Please try again later.');
+-    } finally {
+-      setLoading(false);
+-    }
+-  };
+-
+-  return (
+-    <div className="max-w-md mx-auto mt-10 p-6 bg-white border border-gray-200 rounded-lg shadow-sm">
+-      <h2 className="text-2xl font-bold mb-6 text-center text-gray-800">Sign Up</h2>
+-      
+-      {error && (
+-        <div className="mb-4 p-3 text-sm text-red-700 bg-red-100 rounded-lg" role="alert">
+-          {error}
+-        </div>
+-      )}
+-      
+-      {success && (
+-        <div className="mb-4 p-3 text-sm text-green-700 bg-green-100 rounded-lg" role="alert">
+-          {success}
+-        </div>
+-      )}
+-
+-      <form onSubmit={handleSubmit} className="space-y-4">
+-        <div>
+-          <label htmlFor="username" className="block text-sm font-medium text-gray-700 mb-1">
+-            Username
+-          </label>
+-          <input
+-            type="text"
+-            id="username"
+-            value={username}
+-            onChange={(e) => setUsername(e.target.value)}
+-            required
+-            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+-          />
+-        </div>
+-        
+-        <div>
+-          <label htmlFor="password" className="block text-sm font-medium text-gray-700 mb-1">
+-            Password
+-          </label>
+-          <input
+-            type="password"
+-            id="password"
+-            value={password}
+-            onChange={(e) => setPassword(e.target.value)}
+-            required
+-            className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+-          />
+-          <p className="text-xs text-gray-500 mt-1">
+-             Must be at least 8 characters and contain a number.
+-          </p>
+-        </div>
+-
+-        <button
+-          type="submit"
+-          disabled={loading}
+-          data-skip-tracking="true"
+-          className={`w-full py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-gray-900 hover:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-900 ${
+-            loading ? 'opacity-75 cursor-not-allowed' : ''
+-          }`}
+-        >
+-          {loading ? 'Signing up...' : 'Sign Up'}
+-        </button>
+-      </form>
+-    </div>
+-  );
++  return <AuthForm signup />;
+ }
+diff --git a/src/layouts/AuthLayout.astro b/src/layouts/AuthLayout.astro
+new file mode 100644
+index 0000000..dbb2732
+--- /dev/null
++++ b/src/layouts/AuthLayout.astro
+@@ -0,0 +1,11 @@
++---
++import Layout from './Layout.astro';
++import PasskeyStory from '../components/PasskeyStory.astro';
++const { title, page } = Astro.props;
++const base = import.meta.env.BASE_URL;
++---
++<Layout title={title}>
++  <div class="account-breadcrumb"><a href={base}>Home</a><span>/</span><span>{page}</span><span class="secure-connection"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V6a4 4 0 0 1 8 0v4"/></svg> SECURE ACCOUNT ACCESS</span></div>
++  <div class="auth-grid"><section class="auth-main"><slot /></section><PasskeyStory /></div>
++  <div class="auth-page-bottom"><span>Independent journalism. An informed world.</span><span>THE DEVTOOLS TIMES <span class="bottom-diamond">◆</span> EST. 2025</span></div>
++</Layout>
+diff --git a/src/lib/auth-client.ts b/src/lib/auth-client.ts
+new file mode 100644
+index 0000000..ee38b5b
+--- /dev/null
++++ b/src/lib/auth-client.ts
+@@ -0,0 +1,60 @@
++import {
++  startRegistration,
++  startAuthentication,
++  browserSupportsWebAuthn,
++} from "@simplewebauthn/browser";
++export class AuthError extends Error {
++  reauth: boolean;
++  constructor(message: string, reauth = false) {
++    super(message);
++    this.reauth = reauth;
++  }
++}
++export const base = import.meta.env.BASE_URL;
++export async function api(action: string, body?: unknown) {
++  const response = await fetch(`${base}api/auth/${action}`, {
++    method: body === undefined ? "GET" : "POST",
++    credentials: "same-origin",
++    headers: body === undefined ? {} : { "Content-Type": "application/json" },
++    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
++  });
++  const data = await response.json();
++  if (!response.ok)
++    throw new AuthError(
++      data.error || "Something went wrong. Please try again.",
++      data.reauth,
++    );
++  return data;
++}
++export const supportsPasskeys = () =>
++  window.isSecureContext && browserSupportsWebAuthn();
++export async function registerPasskey(
++  username: string,
++  name: string,
++  signup = false,
++) {
++  const optionsJSON = await api("registration-options", {
++    username,
++    name,
++    signup,
++  });
++  const credential = await startRegistration({ optionsJSON });
++  return api("registration-verify", { credential });
++}
++export async function authenticatePasskey(reauth = false) {
++  const optionsJSON = await api("authentication-options", { reauth });
++  const credential = await startAuthentication({ optionsJSON });
++  return api("authentication-verify", { credential });
++}
++export function errorMessage(error: unknown) {
++  if (error instanceof Error) {
++    if (error.name === "NotAllowedError")
++      return "The passkey request was cancelled or timed out. You can try again or use your password.";
++    if (error.name === "InvalidStateError")
++      return "This device already has a passkey for this account. Try another device or security key.";
++    if (error.name === "SecurityError")
++      return "Passkeys require a secure connection and a matching site address.";
++    return error.message;
++  }
++  return "Something went wrong. Please try again.";
++}
+diff --git a/src/lib/auth-store.ts b/src/lib/auth-store.ts
+new file mode 100644
+index 0000000..7b81792
+--- /dev/null
++++ b/src/lib/auth-store.ts
+@@ -0,0 +1,167 @@
++import { DatabaseSync } from "node:sqlite";
++import { mkdirSync } from "node:fs";
++import { dirname } from "node:path";
++import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
++
++const file = process.env.AUTH_DB_PATH || "./data/auth.sqlite";
++mkdirSync(dirname(file), { recursive: true });
++const db = new DatabaseSync(file);
++db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
++CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password TEXT);
++CREATE TABLE IF NOT EXISTS passkeys (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), name TEXT NOT NULL, public_key TEXT NOT NULL, counter INTEGER NOT NULL, transports TEXT NOT NULL, created_at TEXT NOT NULL, last_used TEXT, backed_up INTEGER NOT NULL);
++CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, user_id TEXT, verified_at INTEGER NOT NULL DEFAULT 0, challenge TEXT, expires INTEGER NOT NULL);
++CREATE TABLE IF NOT EXISTS attempts (key TEXT PRIMARY KEY, count INTEGER NOT NULL, expires INTEGER NOT NULL);`);
++export type User = { id: string; username: string; password: string | null };
++export type Key = {
++  id: string;
++  user_id: string;
++  name: string;
++  public_key: string;
++  counter: number;
++  transports: string;
++  created_at: string;
++  last_used: string | null;
++  backed_up: number;
++};
++export type Challenge = {
++  value: string;
++  purpose: "signup" | "add" | "signin" | "reauth";
++  expires: number;
++  username?: string;
++  userId?: string;
++  name?: string;
++};
++export type Session = {
++  id: string;
++  user_id: string | null;
++  verified_at: number;
++  challenge: string | null;
++  expires: number;
++};
++export const token = () => randomBytes(32).toString("base64url");
++export const userByName = (name: string) =>
++  db.prepare("SELECT * FROM users WHERE username = ?").get(name) as
++    User | undefined;
++export const userById = (id: string) =>
++  db.prepare("SELECT * FROM users WHERE id = ?").get(id) as User | undefined;
++export const keysFor = (id: string) =>
++  db
++    .prepare(
++      "SELECT * FROM passkeys WHERE user_id = ? ORDER BY created_at DESC",
++    )
++    .all(id) as Key[];
++export const keyById = (id: string) =>
++  db.prepare("SELECT * FROM passkeys WHERE id = ?").get(id) as Key | undefined;
++export function createUser(
++  username: string,
++  password?: string,
++  id = token(),
++): User {
++  const user = { id, username, password: password ? hash(password) : null };
++  db.prepare("INSERT INTO users VALUES (?, ?, ?)").run(
++    user.id,
++    user.username,
++    user.password,
++  );
++  return user;
++}
++function hash(password: string) {
++  const salt = token();
++  return `${salt}:${scryptSync(password, salt, 64).toString("hex")}`;
++}
++export function checkPassword(user: User, password: string) {
++  if (!user.password) return false;
++  const [salt, value] = user.password.split(":");
++  return timingSafeEqual(
++    scryptSync(password, salt, 64),
++    Buffer.from(value, "hex"),
++  );
++}
++export function sessionById(id: string) {
++  return db
++    .prepare("SELECT * FROM sessions WHERE id = ? AND expires > ?")
++    .get(id, Date.now()) as Session | undefined;
++}
++export function newSession(userId: string | null = null) {
++  db.prepare("DELETE FROM sessions WHERE expires < ?").run(Date.now());
++  const session = {
++    id: token(),
++    user_id: userId,
++    verified_at: userId ? Date.now() : 0,
++    challenge: null,
++    expires: Date.now() + 86400000,
++  };
++  db.prepare("INSERT INTO sessions VALUES (?, ?, ?, ?, ?)").run(
++    session.id,
++    session.user_id,
++    session.verified_at,
++    null,
++    session.expires,
++  );
++  return session;
++}
++export function saveChallenge(id: string, challenge: Challenge | null) {
++  db.prepare("UPDATE sessions SET challenge = ? WHERE id = ?").run(
++    challenge ? JSON.stringify(challenge) : null,
++    id,
++  );
++}
++export function takeChallenge(session: Session): Challenge | undefined {
++  // Read and consume synchronously so concurrent requests cannot reuse a challenge.
++  db.exec("BEGIN IMMEDIATE");
++  try {
++    const current = db
++      .prepare("SELECT challenge FROM sessions WHERE id = ? AND expires > ?")
++      .get(session.id, Date.now());
++    saveChallenge(session.id, null);
++    db.exec("COMMIT");
++    return current?.challenge
++      ? JSON.parse(current.challenge as string)
++      : undefined;
++  } catch (error) {
++    db.exec("ROLLBACK");
++    throw error;
++  }
++}
++export function verifySession(id: string) {
++  db.prepare("UPDATE sessions SET verified_at = ? WHERE id = ?").run(
++    Date.now(),
++    id,
++  );
++}
++export function deleteSession(id: string) {
++  db.prepare("DELETE FROM sessions WHERE id = ?").run(id);
++}
++export function addKey(key: Key) {
++  db.prepare("INSERT INTO passkeys VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
++    key.id,
++    key.user_id,
++    key.name,
++    key.public_key,
++    key.counter,
++    key.transports,
++    key.created_at,
++    key.last_used,
++    key.backed_up,
++  );
++}
++export function updateKey(id: string, counter: number, backedUp: boolean) {
++  db.prepare(
++    "UPDATE passkeys SET counter = ?, last_used = ?, backed_up = ? WHERE id = ?",
++  ).run(counter, new Date().toISOString(), Number(backedUp), id);
++}
++export function renameKey(id: string, name: string) {
++  db.prepare("UPDATE passkeys SET name = ? WHERE id = ?").run(name, id);
++}
++export function removeKey(id: string) {
++  db.prepare("DELETE FROM passkeys WHERE id = ?").run(id);
++}
++export function rateLimit(key: string) {
++  db.prepare("DELETE FROM attempts WHERE expires < ?").run(Date.now());
++  const row = db
++    .prepare(
++      "INSERT INTO attempts VALUES (?, 1, ?) ON CONFLICT(key) DO UPDATE SET count = count + 1 RETURNING count",
++    )
++    .get(key, Date.now() + 60000) as { count: number };
++  return row.count <= 20;
++}
+diff --git a/src/pages/account/index.astro b/src/pages/account/index.astro
+new file mode 100644
+index 0000000..2b1ff90
+--- /dev/null
++++ b/src/pages/account/index.astro
+@@ -0,0 +1,3 @@
++---
++return Astro.redirect(`${import.meta.env.BASE_URL}account/settings`);
++---
+diff --git a/src/pages/account/settings.astro b/src/pages/account/settings.astro
+new file mode 100644
+index 0000000..72b90d6
+--- /dev/null
++++ b/src/pages/account/settings.astro
+@@ -0,0 +1,6 @@
++---
++import Layout from '../../layouts/Layout.astro';
++import AccountSettings from '../../components/AccountSettings';
++const base = import.meta.env.BASE_URL;
++---
++<Layout title="Account settings | The DevTools Times"><div class="account-breadcrumb"><a href={base}>Home</a><span>/</span><span>Account settings</span><span class="secure-connection">SECURE ACCOUNT ACCESS</span></div><AccountSettings client:load /></Layout>
+diff --git a/src/pages/api/auth/[action].ts b/src/pages/api/auth/[action].ts
+new file mode 100644
+index 0000000..955a7a0
+--- /dev/null
++++ b/src/pages/api/auth/[action].ts
+@@ -0,0 +1,365 @@
++import type { APIRoute } from "astro";
++import {
++  generateRegistrationOptions,
++  generateAuthenticationOptions,
++  verifyRegistrationResponse,
++  verifyAuthenticationResponse,
++} from "@simplewebauthn/server";
++import * as store from "../../../lib/auth-store";
++
++export const ALL: APIRoute = async ({ request, cookies, params, url }) => {
++  const json = (body: unknown, status = 200) =>
++    Response.json(body, { status, headers: { "Cache-Control": "no-store" } });
++  const action = params.action;
++  const origin = process.env.AUTH_ORIGIN || url.origin;
++  const rpID = new URL(origin).hostname;
++  const cookieOptions = {
++    httpOnly: true,
++    secure: new URL(origin).protocol === "https:",
++    sameSite: "lax" as const,
++    path: import.meta.env.BASE_URL,
++    maxAge: 86400,
++  };
++  let session = store.sessionById(cookies.get("times_session")?.value || "");
++  let user = session?.user_id ? store.userById(session.user_id) : undefined;
++  const establish = (id: string) => {
++    if (session) store.deleteSession(session.id);
++    session = store.newSession(id);
++    cookies.set("times_session", session.id, cookieOptions);
++  };
++  if (request.method === "GET" && action === "account") {
++    if (!user)
++      return json({ error: "Please sign in to manage your account." }, 401);
++    return json({
++      username: user.username,
++      hasPassword: !!user.password,
++      passkeys: store
++        .keysFor(user.id)
++        .map(({ id, name, created_at, last_used, backed_up }) => ({
++          id,
++          name,
++          createdAt: created_at,
++          lastUsed: last_used,
++          backedUp: !!backed_up,
++        })),
++    });
++  }
++  if (request.method !== "POST")
++    return json({ error: "Method not allowed." }, 405);
++  if (request.headers.get("origin") !== origin)
++    return json(
++      {
++        error:
++          "This request could not be verified. Reload the page and try again.",
++      },
++      403,
++    );
++  if (
++    !store.rateLimit(
++      `${request.headers.get("x-forwarded-for")?.split(",")[0] || "local"}:${action}`,
++    )
++  )
++    return json(
++      { error: "Too many attempts. Please wait a minute and try again." },
++      429,
++    );
++  try {
++    const body = await request.json();
++    const username =
++      typeof body.username === "string"
++        ? body.username.trim().toLowerCase()
++        : "";
++    const password = typeof body.password === "string" ? body.password : "";
++    const name =
++      typeof body.name === "string"
++        ? body.name.trim().slice(0, 60)
++        : "My passkey";
++    if (action === "logout") {
++      if (session) store.deleteSession(session.id);
++      cookies.delete("times_session", { path: import.meta.env.BASE_URL });
++      return json({ ok: true });
++    }
++    if (action === "password-signup" || action === "password-signin") {
++      if (!/^[a-z0-9_.@+-]{3,100}$/.test(username))
++        return json(
++          {
++            error:
++              "Enter a username of 3–100 letters, numbers, or email characters.",
++          },
++          400,
++        );
++      const existing = store.userByName(username);
++      if (action === "password-signup") {
++        if (existing)
++          return json(
++            { error: "This username is already in use. Try signing in." },
++            409,
++          );
++        if (
++          password.length < 8 ||
++          !/\d/.test(password) ||
++          password.length > 256
++        )
++          return json(
++            {
++              error:
++                "Use at least 8 characters, including a number (maximum 256).",
++            },
++            400,
++          );
++        user = store.createUser(username, password);
++      } else {
++        if (!password || password.length > 256)
++          return json({ error: "Enter your password to continue." }, 400);
++        if (existing) {
++          if (!store.checkPassword(existing, password))
++            return json(
++              {
++                error:
++                  "The username or password is incorrect. If you registered with a passkey, use that to sign in.",
++              },
++              401,
++            );
++          user = existing;
++        } else {
++          // Preserve sign-in for accounts created with the original password service.
++          const legacy = await fetch(
++            "https://us-central1-web-devrel-apps.cloudfunctions.net/times_cdn/api/login",
++            {
++              method: "POST",
++              headers: { "Content-Type": "application/json" },
++              body: JSON.stringify({ username, password }),
++              signal: AbortSignal.timeout(10000),
++            },
++          );
++          if (!legacy.ok)
++            return json(
++              { error: "The username or password is incorrect." },
++              401,
++            );
++          // A verified password login provisions an account for passkey enrollment.
++          user = store.createUser(username, password);
++        }
++      }
++      establish(user.id);
++      return json({ ok: true });
++    }
++    if (action === "password-reauth") {
++      if (!user || !session)
++        return json({ error: "Please sign in again." }, 401);
++      if (password.length > 256 || !store.checkPassword(user, password))
++        return json(
++          { error: "That password is incorrect. Please try again." },
++          401,
++        );
++      store.verifySession(session.id);
++      return json({ ok: true });
++    }
++    if (action === "registration-options") {
++      const signup = body.signup === true;
++      if (!signup && (!user || !session))
++        return json({ error: "Please sign in again." }, 401);
++      if (!signup && session!.verified_at < Date.now() - 300000)
++        return json(
++          { error: "Confirm your identity to add a passkey.", reauth: true },
++          403,
++        );
++      if (
++        signup &&
++        (!/^[a-z0-9_.@+-]{3,100}$/.test(username) || store.userByName(username))
++      )
++        return json(
++          { error: "Choose an available username of 3–100 characters." },
++          400,
++        );
++      if (!session) {
++        session = store.newSession();
++        cookies.set("times_session", session.id, cookieOptions);
++      }
++      const userId = signup ? store.token() : user!.id;
++      const options = await generateRegistrationOptions({
++        rpName: "The DevTools Times",
++        rpID,
++        userName: signup ? username : user!.username,
++        userID: new TextEncoder().encode(userId),
++        attestationType: "none",
++        excludeCredentials: signup
++          ? []
++          : store.keysFor(user!.id).map((key) => ({ id: key.id })),
++        authenticatorSelection: {
++          residentKey: "required",
++          userVerification: "required",
++        },
++      });
++      store.saveChallenge(session.id, {
++        value: options.challenge,
++        purpose: signup ? "signup" : "add",
++        userId,
++        username: signup ? username : user!.username,
++        name: name || "My passkey",
++        expires: Date.now() + 300000,
++      });
++      return json(options);
++    }
++    if (action === "authentication-options") {
++      const reauth = body.reauth === true;
++      if (reauth && !user) return json({ error: "Please sign in again." }, 401);
++      if (!session) {
++        session = store.newSession();
++        cookies.set("times_session", session.id, cookieOptions);
++      }
++      const keys = reauth ? store.keysFor(user!.id) : [];
++      if (reauth && !keys.length)
++        return json(
++          { error: "Use your password to confirm your identity." },
++          400,
++        );
++      const options = await generateAuthenticationOptions({
++        rpID,
++        userVerification: "required",
++        ...(reauth
++          ? { allowCredentials: keys.map((key) => ({ id: key.id })) }
++          : {}),
++      });
++      store.saveChallenge(session.id, {
++        value: options.challenge,
++        purpose: reauth ? "reauth" : "signin",
++        userId: reauth ? user!.id : undefined,
++        expires: Date.now() + 300000,
++      });
++      return json(options);
++    }
++    if (
++      action === "registration-verify" ||
++      action === "authentication-verify"
++    ) {
++      if (!session)
++        return json({ error: "Your request expired. Please try again." }, 400);
++      const challenge = store.takeChallenge(session);
++      if (!challenge || challenge.expires < Date.now())
++        return json({ error: "Your request expired. Please try again." }, 400);
++      if (action === "registration-verify") {
++        if (
++          !["signup", "add"].includes(challenge.purpose) ||
++          (challenge.purpose === "add" && user?.id !== challenge.userId)
++        )
++          return json({ error: "Invalid registration request." }, 400);
++        const result = await verifyRegistrationResponse({
++          response: body.credential,
++          expectedChallenge: challenge.value,
++          expectedOrigin: origin,
++          expectedRPID: rpID,
++          requireUserVerification: true,
++        });
++        if (!result.verified || !result.registrationInfo)
++          throw new Error("Verification failed");
++        if (challenge.purpose === "signup") {
++          if (store.userByName(challenge.username!))
++            return json(
++              { error: "This username is now in use. Please choose another." },
++              409,
++            );
++          user = store.createUser(
++            challenge.username!,
++            undefined,
++            challenge.userId!,
++          );
++        }
++        const { credential, credentialBackedUp } = result.registrationInfo;
++        store.addKey({
++          id: credential.id,
++          user_id: user!.id,
++          name: challenge.name!,
++          public_key: Buffer.from(credential.publicKey).toString("base64url"),
++          counter: credential.counter,
++          transports: JSON.stringify(credential.transports || []),
++          created_at: new Date().toISOString(),
++          last_used: null,
++          backed_up: Number(credentialBackedUp),
++        });
++        if (challenge.purpose === "signup") establish(user!.id);
++      } else {
++        if (!["signin", "reauth"].includes(challenge.purpose))
++          return json({ error: "Invalid authentication request." }, 400);
++        const key = store.keyById(body.credential.id);
++        if (
++          !key ||
++          (challenge.purpose === "reauth" &&
++            (key.user_id !== user?.id || key.user_id !== challenge.userId))
++        )
++          return json(
++            { error: "This passkey does not belong to this account." },
++            401,
++          );
++        if (
++          body.credential.response.userHandle &&
++          Buffer.from(
++            body.credential.response.userHandle,
++            "base64url",
++          ).toString("utf8") !== key.user_id
++        )
++          return json({ error: "This passkey could not be verified." }, 401);
++        const result = await verifyAuthenticationResponse({
++          response: body.credential,
++          expectedChallenge: challenge.value,
++          expectedOrigin: origin,
++          expectedRPID: rpID,
++          credential: {
++            id: key.id,
++            publicKey: new Uint8Array(Buffer.from(key.public_key, "base64url")),
++            counter: key.counter,
++            transports: JSON.parse(key.transports),
++          },
++          requireUserVerification: true,
++        });
++        if (!result.verified) throw new Error("Verification failed");
++        store.updateKey(
++          key.id,
++          result.authenticationInfo.newCounter,
++          result.authenticationInfo.credentialBackedUp,
++        );
++        if (challenge.purpose === "reauth") store.verifySession(session.id);
++        else establish(key.user_id);
++      }
++      return json({ ok: true });
++    }
++    if (action === "rename" || action === "remove") {
++      if (!user || !session)
++        return json({ error: "Please sign in again." }, 401);
++      if (session.verified_at < Date.now() - 300000)
++        return json(
++          { error: "Confirm your identity to continue.", reauth: true },
++          403,
++        );
++      const key = store.keyById(body.id);
++      if (!key || key.user_id !== user.id)
++        return json({ error: "Passkey not found." }, 404);
++      if (action === "rename") {
++        if (!name)
++          return json({ error: "Enter a name for this passkey." }, 400);
++        store.renameKey(key.id, name);
++      } else {
++        if (!user.password && store.keysFor(user.id).length <= 1)
++          return json(
++            {
++              error:
++                "Add another passkey before removing your only sign-in method.",
++            },
++            400,
++          );
++        store.removeKey(key.id);
++      }
++      return json({ ok: true });
++    }
++    return json({ error: "Not found." }, 404);
++  } catch (error) {
++    console.error(
++      "Authentication request failed:",
++      error instanceof Error ? error.message : "Unknown error",
++    );
++    return json(
++      { error: "We couldn’t verify this request. Please try again." },
++      400,
++    );
++  }
++};
+diff --git a/src/pages/signin.astro b/src/pages/signin.astro
+index 6844450..9957b1a 100644
+--- a/src/pages/signin.astro
++++ b/src/pages/signin.astro
+@@ -1,10 +1,5 @@
+ ---
+-import Layout from '../layouts/Layout.astro';
++import AuthLayout from '../layouts/AuthLayout.astro';
+ import SignInForm from '../components/SignInForm';
+ ---
+-
+-<Layout title="Sign In | The DevTools Times">
+-  <div class="py-12 px-4 sm:px-6 lg:px-8">
+-    <SignInForm client:load />
+-  </div>
+-</Layout>
++<AuthLayout title="Sign In | The DevTools Times" page="Sign in"><SignInForm client:load /></AuthLayout>
+diff --git a/src/pages/signup.astro b/src/pages/signup.astro
+index dc93e5d..ffbe1b6 100644
+--- a/src/pages/signup.astro
++++ b/src/pages/signup.astro
+@@ -1,10 +1,5 @@
+ ---
+-import Layout from '../layouts/Layout.astro';
++import AuthLayout from '../layouts/AuthLayout.astro';
+ import SignUpForm from '../components/SignUpForm';
+ ---
+-
+-<Layout title="Sign Up | The DevTools Times">
+-  <div class="py-12 px-4 sm:px-6 lg:px-8">
+-    <SignUpForm client:load />
+-  </div>
+-</Layout>
++<AuthLayout title="Create an account | The DevTools Times" page="Create an account"><SignUpForm client:load /></AuthLayout>
+diff --git a/src/styles/global.css b/src/styles/global.css
+index e9a9abb..7715ec5 100644
+--- a/src/styles/global.css
++++ b/src/styles/global.css
+@@ -4,4 +4,1132 @@
+   font-family: "Grenze", serif;
+   font-weight: 500;
+   font-style: normal;
+-}
+\ No newline at end of file
++}
++/* Account experiences share the quiet, editorial character of the newspaper. */
++:root {
++  --account-ink: #202a27;
++  --account-green: #164f40;
++  --account-muted: #727873;
++  --account-line: #e3e7e3;
++}
++.account-breadcrumb {
++  margin: 0 48px;
++  padding: 23px 0;
++  display: flex;
++  align-items: center;
++  gap: 13px;
++  border-bottom: 1px solid var(--account-line);
++  color: #8b918b;
++  font:
++    11px Arial,
++    sans-serif;
++}
++.account-breadcrumb a {
++  color: #5c655f;
++}
++.account-breadcrumb > span:nth-child(3) {
++  color: #343f38;
++}
++.secure-connection {
++  margin-left: auto;
++  display: flex;
++  align-items: center;
++  gap: 7px;
++  font-size: 9px;
++  letter-spacing: 1.25px;
++}
++.auth-grid {
++  display: grid;
++  grid-template-columns: 1fr 1fr;
++  padding: 44px 48px 48px;
++  gap: 54px;
++  font-family: Arial, sans-serif;
++  color: var(--account-ink);
++}
++.auth-main {
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  padding: 16px 0;
++}
++.auth-form-wrap {
++  width: 100%;
++  max-width: 392px;
++}
++.eyebrow {
++  font:
++    9px Arial,
++    sans-serif;
++  letter-spacing: 1.7px;
++  font-weight: 600;
++  display: flex;
++  align-items: center;
++  gap: 9px;
++  color: var(--account-green);
++}
++.eyebrow-line {
++  height: 1px;
++  width: 23px;
++  background: var(--account-green);
++}
++.auth-form-wrap h1 {
++  font:
++    44px/1.13 Georgia,
++    serif;
++  letter-spacing: -1.7px;
++  margin: 19px 0 13px;
++  white-space: pre-line;
++}
++.auth-intro {
++  font-size: 12px;
++  line-height: 1.8;
++  color: var(--account-muted);
++  margin-bottom: 31px;
++}
++.auth-tabs {
++  display: flex;
++  border-bottom: 1px solid var(--account-line);
++  margin-bottom: 25px;
++  gap: 22px;
++}
++.auth-tabs button {
++  display: flex;
++  align-items: center;
++  gap: 7px;
++  padding: 12px 0 15px;
++  color: #858b85;
++  font-size: 12px;
++  border-bottom: 2px solid transparent;
++  margin-bottom: -1px;
++  cursor: pointer;
++}
++.auth-tabs button[aria-selected="true"] {
++  color: var(--account-green);
++  border-color: var(--account-green);
++  font-weight: 600;
++}
++.recommended {
++  font-size: 7px;
++  font-weight: 600;
++  letter-spacing: 0.5px;
++  padding: 4px 5px;
++  color: var(--account-green);
++  background: #eaf1eb;
++  border-radius: 3px;
++}
++.passkey-prompt {
++  text-align: center;
++  padding: 6px 0 25px;
++}
++.small-key-icon {
++  width: 56px;
++  height: 56px;
++  background: #eff4ef;
++  color: var(--account-green);
++  border: 1px solid #e2e9e2;
++  border-radius: 13px;
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++}
++.passkey-prompt h2 {
++  font:
++    20px Georgia,
++    serif;
++  letter-spacing: -0.4px;
++  margin: 18px 0 9px;
++}
++.passkey-prompt p {
++  font-size: 12px;
++  line-height: 1.8;
++  color: var(--account-muted);
++}
++.primary-button {
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  gap: 10px;
++  width: 100%;
++  border: 1px solid var(--account-green);
++  border-radius: 5px;
++  background: var(--account-green);
++  color: white;
++  padding: 14px 15px;
++  font:
++    600 12px/1.4 Arial,
++    sans-serif;
++  cursor: pointer;
++  transition:
++    background 0.15s,
++    transform 0.15s;
++  min-height: 47px;
++}
++.primary-button > span {
++  flex: 1;
++}
++.primary-button:hover {
++  background: #0c3c2f;
++}
++button:disabled {
++  opacity: 0.5;
++  cursor: not-allowed;
++}
++.primary-button:focus-visible,
++.auth-tabs button:focus-visible,
++.text-button:focus-visible,
++.key-actions button:focus-visible {
++  outline: 2px solid #3a8a6c;
++  outline-offset: 4px;
++}
++.device-note {
++  display: flex;
++  gap: 5px;
++  align-items: center;
++  justify-content: center;
++  margin-top: 12px;
++  font-size: 9px;
++  color: #7b847b;
++}
++.auth-switch {
++  margin-top: 29px;
++  padding-top: 25px;
++  border-top: 1px solid var(--account-line);
++  text-align: center;
++  font-size: 11px;
++  color: #727873;
++}
++.auth-switch a {
++  font-weight: 600;
++  color: var(--account-green);
++  margin-left: 4px;
++}
++.auth-switch a:hover,
++.auth-terms a:hover {
++  text-decoration: underline;
++}
++.auth-terms {
++  text-align: center;
++  font-size: 9px;
++  line-height: 1.9;
++  color: #8c928c;
++  margin-top: 22px;
++}
++.auth-terms a {
++  text-decoration: underline;
++  text-underline-offset: 2px;
++}
++.field-label {
++  display: block;
++  font:
++    600 11px Arial,
++    sans-serif;
++  color: #39483f;
++  margin-bottom: 9px;
++}
++.auth-input {
++  width: 100%;
++  min-height: 45px;
++  border: 1px solid #d9dfd9;
++  border-radius: 5px;
++  padding: 12px 13px;
++  font:
++    12px Arial,
++    sans-serif;
++  color: #29392f;
++  background: #fff;
++}
++.auth-input::placeholder {
++  color: #a0a59f;
++}
++.auth-input:focus {
++  outline: 2px solid #9cbba9;
++  outline-offset: 1px;
++}
++.password-label {
++  margin-top: 20px;
++}
++.password-field {
++  position: relative;
++}
++.password-field .auth-input {
++  padding-right: 44px;
++}
++.password-field button {
++  position: absolute;
++  right: 12px;
++  top: 13px;
++  color: #8c958d;
++  cursor: pointer;
++}
++.input-help {
++  margin: 9px 0 20px;
++  font-size: 10px;
++  color: #858e85;
++  line-height: 1.7;
++}
++.signup-help {
++  margin-bottom: 25px;
++}
++.auth-input + .primary-button,
++.password-field + .primary-button {
++  margin-top: 25px;
++}
++.form-error {
++  background: #fff2ef;
++  border: 1px solid #f0d3cc;
++  border-radius: 5px;
++  color: #963d30;
++  padding: 12px;
++  font:
++    12px/1.6 Arial,
++    sans-serif;
++  margin: 14px 0;
++}
++.notice {
++  background: #f7f4e9;
++  color: #7a6b32;
++  padding: 11px;
++  font:
++    11px/1.7 Arial,
++    sans-serif;
++  border-radius: 4px;
++  margin: 12px 0;
++}
++.passkey-story {
++  background: #f0f4ee;
++  border: 1px solid #e5eae1;
++  border-radius: 9px;
++  padding: 25px 29px 21px;
++  position: relative;
++  overflow: hidden;
++}
++.story-top {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  color: #52715e;
++  font-size: 7px;
++  letter-spacing: 1.1px;
++}
++.story-dot {
++  width: 5px;
++  height: 5px;
++  background: #527b60;
++  border-radius: 100%;
++}
++.story-edition {
++  margin-left: auto;
++  color: #8e9b8d;
++  font-size: 6px;
++}
++.fingerprint-scene {
++  position: relative;
++  height: 213px;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++}
++.fingerprint-orbit {
++  position: absolute;
++  border: 1px solid #dce5d8;
++  width: 186px;
++  height: 186px;
++  border-radius: 50%;
++}
++.orbit-two {
++  width: 246px;
++  height: 246px;
++  opacity: 0.55;
++}
++.fingerprint-tile {
++  transform: rotate(-9deg);
++  width: 126px;
++  height: 137px;
++  background: linear-gradient(145deg, #fff 25%, #f6f9f2);
++  box-shadow:
++    0 12px 25px #264b3020,
++    inset 0 0 0 5px #ffffff80;
++  border: 1px solid white;
++  border-radius: 23px;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  color: #3d6950;
++  position: relative;
++}
++.fingerprint-check {
++  position: absolute;
++  right: -10px;
++  bottom: -7px;
++  width: 33px;
++  height: 33px;
++  display: flex;
++  justify-content: center;
++  align-items: center;
++  color: white;
++  background: #386449;
++  border: 4px solid #f0f4ee;
++  border-radius: 50%;
++  font-size: 14px;
++}
++.scene-label {
++  position: absolute;
++  bottom: 4px;
++  background: white;
++  border: 1px solid #e5eae1;
++  border-radius: 30px;
++  padding: 8px 13px;
++  font-size: 8px;
++  color: #627260;
++  box-shadow: 0 4px 10px #284b2310;
++}
++.scene-label span {
++  color: #588267;
++  margin-right: 4px;
++}
++.scene-spark {
++  position: absolute;
++  font-size: 20px;
++  font-weight: 300;
++  color: #a9bda6;
++}
++.spark-one {
++  left: 45px;
++  top: 55px;
++}
++.spark-two {
++  right: 36px;
++  bottom: 55px;
++  font-size: 15px;
++}
++.story-copy {
++  margin-top: 26px;
++}
++.story-copy .eyebrow {
++  font-size: 7px;
++  letter-spacing: 1.55px;
++  color: #6b7d66;
++}
++.story-copy h2 {
++  font:
++    32px/1.15 Georgia,
++    serif;
++  letter-spacing: -1px;
++  color: #263e2d;
++  margin: 12px 0;
++}
++.story-copy > p {
++  font-size: 11px;
++  line-height: 1.8;
++  max-width: 290px;
++  color: #74816e;
++}
++.story-features {
++  display: grid;
++  gap: 17px;
++  margin: 25px 0;
++}
++.story-features > div {
++  display: flex;
++  gap: 11px;
++  align-items: flex-start;
++}
++.feature-check {
++  margin-top: 1px;
++  width: 18px;
++  height: 18px;
++  border-radius: 50%;
++  background: #e3ebdf;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  color: #52724f;
++  font-size: 10px;
++}
++.story-features h3 {
++  font-size: 10px;
++  font-weight: 600;
++  color: #3f5440;
++  margin-bottom: 4px;
++}
++.story-features p {
++  font-size: 9px;
++  color: #7c8775;
++  line-height: 1.6;
++}
++.story-bottom {
++  border-top: 1px solid #dce4d6;
++  padding-top: 16px;
++  color: #83917c;
++  font-size: 8px;
++  display: flex;
++  gap: 8px;
++  align-items: center;
++}
++.tiny-shield {
++  font-size: 16px;
++}
++.auth-page-bottom {
++  border-top: 1px solid var(--account-line);
++  margin: 0 48px;
++  padding: 20px 0 27px;
++  display: flex;
++  justify-content: space-between;
++  font:
++    9px Georgia,
++    serif;
++  color: #90958c;
++}
++.auth-page-bottom > span:last-child {
++  font:
++    7px Arial,
++    sans-serif;
++  letter-spacing: 1.2px;
++}
++.bottom-diamond {
++  margin: 0 9px;
++  color: #51705b;
++}
++.settings-grid {
++  display: grid;
++  grid-template-columns: 205px 1fr;
++  gap: 45px;
++  margin: 38px 48px 0;
++  padding-bottom: 55px;
++  font-family: Arial, sans-serif;
++  color: var(--account-ink);
++}
++.settings-sidebar {
++  border-right: 1px solid var(--account-line);
++  padding: 10px 24px 0 0;
++}
++.settings-sidebar .eyebrow {
++  font-size: 8px;
++}
++.account-avatar {
++  width: 44px;
++  height: 44px;
++  background: #ebf1e8;
++  color: #436443;
++  border-radius: 50%;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  font:
++    23px Georgia,
++    serif;
++  margin-top: 27px;
++}
++.settings-sidebar h2 {
++  font-size: 13px;
++  font-weight: 600;
++  margin: 13px 0 5px;
++  overflow-wrap: anywhere;
++}
++.settings-sidebar > p {
++  font-size: 10px;
++  color: #8a9287;
++}
++.settings-sidebar nav {
++  margin-top: 28px;
++  display: grid;
++  gap: 7px;
++}
++.settings-sidebar nav a {
++  display: flex;
++  gap: 9px;
++  align-items: center;
++  font-size: 10px;
++  padding: 11px 9px;
++  margin-left: -9px;
++  border-radius: 4px;
++  color: #7d857a;
++}
++.settings-sidebar nav .settings-nav-active {
++  background: #edf3e9;
++  color: #376043;
++  font-weight: 600;
++}
++.settings-nav-active svg:last-child {
++  margin-left: auto;
++}
++.signout-button {
++  margin-top: 35px;
++  display: flex;
++  gap: 10px;
++  align-items: center;
++  color: #7a8279;
++  font-size: 11px;
++  cursor: pointer;
++}
++.settings-main {
++  min-width: 0;
++}
++.settings-main > .eyebrow {
++  font-size: 8px;
++}
++.settings-main h1 {
++  font:
++    35px Georgia,
++    serif;
++  letter-spacing: -1px;
++  margin: 12px 0;
++}
++.settings-intro {
++  font-size: 11px;
++  color: #7e867b;
++  line-height: 1.7;
++}
++.security-banner {
++  margin: 27px 0 33px;
++  display: flex;
++  align-items: center;
++  gap: 13px;
++  padding: 20px 16px;
++  background: #f0f5ed;
++  border: 1px solid #e2e9dc;
++  border-radius: 6px;
++}
++.security-banner-icon {
++  color: #50724c;
++}
++.security-banner h2 {
++  font:
++    15px Georgia,
++    serif;
++  color: #385634;
++  margin-bottom: 6px;
++}
++.security-banner p {
++  font-size: 9px;
++  line-height: 1.7;
++  color: #7b8a73;
++}
++.security-badge {
++  margin-left: auto;
++  color: #5e7d55;
++  background: #e1eadb;
++  font-size: 6px;
++  padding: 5px 6px;
++  letter-spacing: 0.6px;
++  border-radius: 3px;
++}
++.settings-section-head {
++  display: flex;
++  justify-content: space-between;
++  gap: 10px;
++  align-items: center;
++  margin-bottom: 20px;
++}
++.settings-section-head h2 {
++  font:
++    22px Georgia,
++    serif;
++  display: flex;
++  align-items: center;
++  gap: 9px;
++}
++.count-badge {
++  font:
++    10px Arial,
++    sans-serif;
++  background: #f0f2ed;
++  color: #7c8775;
++  padding: 3px 6px;
++  border-radius: 4px;
++}
++.settings-section-head p {
++  font-size: 10px;
++  color: #8b9185;
++  margin-top: 8px;
++}
++.primary-button.compact {
++  width: auto;
++  min-height: 36px;
++  padding: 9px 11px;
++  font-size: 10px;
++  gap: 5px;
++}
++.passkey-list {
++  border: 1px solid var(--account-line);
++  border-radius: 6px;
++}
++.passkey-row {
++  display: flex;
++  align-items: center;
++  gap: 13px;
++  padding: 20px 16px;
++}
++.passkey-row + .passkey-row {
++  border-top: 1px solid var(--account-line);
++}
++.key-device {
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  width: 43px;
++  height: 43px;
++  flex-shrink: 0;
++  border-radius: 8px;
++  background: #f5f7f2;
++  color: #6f8167;
++}
++.key-detail {
++  min-width: 0;
++}
++.key-detail h3 {
++  font-size: 11px;
++  font-weight: 600;
++  overflow-wrap: anywhere;
++}
++.key-detail p {
++  font-size: 8px;
++  color: #8b9386;
++  margin-top: 6px;
++  line-height: 1.7;
++}
++.key-detail p span {
++  margin: 0 6px;
++}
++.key-sync {
++  display: inline-block;
++  color: #6c8265;
++  font-size: 7px;
++  margin-top: 7px;
++}
++.key-actions {
++  display: flex;
++  gap: 13px;
++  margin-left: auto;
++  color: #86917f;
++}
++.key-actions button {
++  cursor: pointer;
++}
++.key-actions button:hover {
++  color: #25472e;
++}
++.settings-footnote {
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  color: #8c9587;
++  font-size: 8px;
++  line-height: 1.6;
++  margin: 13px 0 25px;
++}
++.settings-footnote svg {
++  flex-shrink: 0;
++}
++.passkey-empty {
++  text-align: center;
++  padding: 30px 15px;
++  color: #70856b;
++}
++.passkey-empty > svg {
++  margin: auto;
++}
++.passkey-empty h3 {
++  font:
++    18px Georgia,
++    serif;
++  color: #374d34;
++  margin: 13px 0 8px;
++}
++.passkey-empty p {
++  font-size: 10px;
++  color: #8b9486;
++}
++.text-button {
++  display: inline-flex;
++  gap: 7px;
++  align-items: center;
++  color: var(--account-green);
++  font:
++    600 10px Arial,
++    sans-serif;
++  cursor: pointer;
++}
++.passkey-empty .text-button {
++  margin-top: 19px;
++}
++.settings-info-grid {
++  display: grid;
++  grid-template-columns: 1fr 1fr;
++  gap: 25px;
++  padding: 22px 0;
++  border-top: 1px solid var(--account-line);
++}
++.settings-info-grid h3 {
++  font:
++    15px Georgia,
++    serif;
++  margin-bottom: 8px;
++}
++.settings-info-grid p {
++  font-size: 10px;
++  color: #87907f;
++  line-height: 1.8;
++}
++.reauth-card {
++  display: flex;
++  gap: 12px;
++  align-items: center;
++  padding: 18px 0;
++  border-top: 1px solid var(--account-line);
++  border-bottom: 1px solid var(--account-line);
++  color: #7f8d78;
++}
++.reauth-card h3 {
++  font-size: 10px;
++  font-weight: 600;
++  color: #4e5e48;
++}
++.reauth-card p {
++  font-size: 9px;
++  line-height: 1.6;
++  margin-top: 5px;
++}
++.reauth-card .text-button {
++  margin-left: auto;
++  white-space: nowrap;
++}
++.settings-legal {
++  font-size: 9px;
++  color: #949b8d;
++  margin-top: 21px;
++}
++.settings-legal a {
++  color: #56734d;
++  text-decoration: underline;
++  text-underline-offset: 2px;
++}
++.success-notice {
++  display: flex;
++  align-items: center;
++  gap: 9px;
++  background: #edf5e9;
++  color: #42633b;
++  font-size: 11px;
++  padding: 13px;
++  margin-top: 20px;
++  border: 1px solid #dce8d5;
++  border-radius: 5px;
++}
++.success-notice button {
++  margin-left: auto;
++  cursor: pointer;
++}
++.success-notice svg {
++  flex-shrink: 0;
++}
++.settings-loading,
++.signed-out {
++  padding: 70px 30px;
++  text-align: center;
++  color: #6c7c65;
++  font:
++    13px Arial,
++    sans-serif;
++}
++.signed-out h1 {
++  font:
++    32px Georgia,
++    serif;
++  margin-top: 20px;
++  color: #283d28;
++}
++.signed-out p {
++  margin: 20px 0;
++}
++.signed-out .primary-button {
++  max-width: 290px;
++  margin: 0 auto;
++}
++.account-dialog {
++  position: fixed;
++  inset: 0;
++  margin: auto;
++  width: min(440px, calc(100vw - 32px));
++  max-height: calc(100vh - 32px);
++  overflow-y: auto;
++  border: 1px solid #dfe6db;
++  border-radius: 12px;
++  padding: 0;
++  color: var(--account-ink);
++  box-shadow: 0 24px 100px #152b2630;
++  font-family: Arial, sans-serif;
++}
++.account-dialog::backdrop {
++  background: #18271e75;
++  backdrop-filter: blur(3px);
++}
++.dialog-inner {
++  padding: 35px;
++  position: relative;
++}
++.dialog-close {
++  position: absolute;
++  right: 16px;
++  top: 16px;
++  color: #8a9583;
++  cursor: pointer;
++}
++.dialog-inner h2 {
++  font:
++    27px/1.2 Georgia,
++    serif;
++  margin: 23px 0 13px;
++  letter-spacing: -0.7px;
++}
++.dialog-inner > p {
++  font-size: 12px;
++  line-height: 1.8;
++  color: #7b8774;
++  margin-bottom: 24px;
++}
++.dialog-inner form > .primary-button {
++  margin-top: 23px;
++}
++.dialog-cancel {
++  display: block;
++  margin: 17px auto 0;
++  font-size: 11px;
++  color: #7e8c75;
++  cursor: pointer;
++}
++.danger-button {
++  background: #963e30;
++  border-color: #963e30;
++}
++.danger-button:hover {
++  background: #7e3025;
++}
++.reauth-alternative {
++  display: flex;
++  margin: 18px auto 0;
++}
++@media (min-width: 1100px) {
++  .auth-grid {
++    gap: 70px;
++    padding-left: 65px;
++    padding-right: 48px;
++  }
++  .passkey-story {
++    padding-left: 35px;
++    padding-right: 35px;
++  }
++}
++@media (max-width: 800px) {
++  .auth-grid {
++    padding: 35px 26px;
++    gap: 30px;
++  }
++  .account-breadcrumb {
++    margin: 0 26px;
++  }
++  .auth-form-wrap h1 {
++    font-size: 36px;
++  }
++  .passkey-story {
++    padding: 22px;
++  }
++  .story-copy h2 {
++    font-size: 29px;
++  }
++  .story-edition {
++    display: none;
++  }
++  .auth-tabs {
++    gap: 16px;
++  }
++  .recommended {
++    font-size: 6px;
++  }
++  .auth-tabs button {
++    gap: 5px;
++    font-size: 11px;
++  }
++  .settings-grid {
++    margin: 30px 26px 0;
++    grid-template-columns: 160px 1fr;
++    gap: 25px;
++  }
++  .settings-sidebar {
++    padding-right: 16px;
++  }
++  .security-badge {
++    display: none;
++  }
++  .key-actions {
++    gap: 8px;
++  }
++  .reauth-card {
++    flex-wrap: wrap;
++  }
++  .reauth-card .text-button {
++    margin-left: 35px;
++  }
++  .auth-page-bottom {
++    margin: 0 26px;
++  }
++}
++@media (max-width: 600px) {
++  .secure-connection {
++    font-size: 7px;
++    letter-spacing: 0.7px;
++  }
++  .auth-grid {
++    grid-template-columns: 1fr;
++    padding: 30px 24px;
++    gap: 35px;
++  }
++  .auth-main {
++    padding: 10px 0;
++  }
++  .auth-form-wrap h1 {
++    font-size: 40px;
++  }
++  .auth-tabs {
++    gap: 25px;
++  }
++  .auth-tabs button {
++    font-size: 12px;
++  }
++  .recommended {
++    font-size: 7px;
++  }
++  .passkey-story {
++    padding: 22px 26px;
++  }
++  .fingerprint-scene {
++    height: 185px;
++  }
++  .story-copy {
++    margin-top: 20px;
++  }
++  .story-copy h2 {
++    font-size: 31px;
++  }
++  .story-features {
++    gap: 18px;
++  }
++  .auth-page-bottom {
++    gap: 14px;
++    flex-direction: column;
++    text-align: center;
++    padding-top: 20px;
++  }
++  .settings-grid {
++    grid-template-columns: 1fr;
++    margin: 25px 24px 0;
++    gap: 25px;
++  }
++  .settings-sidebar {
++    border-right: 0;
++    border-bottom: 1px solid var(--account-line);
++    padding: 0 0 15px;
++    display: flex;
++    flex-wrap: wrap;
++    gap: 8px 12px;
++    align-items: center;
++  }
++  .settings-sidebar > .eyebrow,
++  .settings-sidebar > p {
++    display: none;
++  }
++  .account-avatar {
++    margin: 0;
++    width: 32px;
++    height: 32px;
++    font-size: 17px;
++  }
++  .settings-sidebar h2 {
++    margin: 0;
++  }
++  .settings-sidebar nav {
++    margin: 6px 0 0;
++    order: 4;
++    width: 100%;
++    display: flex;
++    gap: 18px;
++  }
++  .signout-button {
++    margin: 0 0 0 auto;
++    font-size: 10px;
++  }
++  .settings-main h1 {
++    font-size: 33px;
++  }
++  .security-banner {
++    padding: 17px 12px;
++  }
++  .security-banner h2 {
++    font-size: 14px;
++  }
++  .settings-section-head h2 {
++    font-size: 21px;
++  }
++  .settings-section-head {
++    align-items: flex-start;
++  }
++  .primary-button.compact {
++    font-size: 9px;
++    padding: 8px;
++  }
++  .passkey-row {
++    padding: 17px 12px;
++    gap: 10px;
++  }
++  .key-detail p {
++    font-size: 8px;
++  }
++  .key-actions {
++    gap: 10px;
++  }
++  .key-device {
++    width: 34px;
++    height: 38px;
++  }
++  .key-device svg {
++    width: 22px;
++  }
++  .settings-info-grid {
++    gap: 20px;
++  }
++  .dialog-inner {
++    padding: 30px 25px;
++  }
++}
++.header-signup-link {
++  font:
++    600 10px Arial,
++    sans-serif;
++  padding: 8px 13px;
++  border: 1px solid #cbd5cd;
++  border-radius: 4px;
++  color: #345842;
++  background: #f7faf5;
++}
++.header-signin-link {
++  font:
++    600 10px Arial,
++    sans-serif;
++  color: #48634b;
++  padding: 8px 4px;
++}
++.header-signin-link span {
++  margin-left: 5px;
++}
++.header-account-link {
++  display: flex;
++  gap: 6px;
++  align-items: center;
++  font:
++    600 10px Arial,
++    sans-serif;
++  color: #345842;
++  padding: 8px 10px;
++  border: 1px solid #d7dfd3;
++  border-radius: 4px;
++}
+diff --git a/tests/auth-store.test.ts b/tests/auth-store.test.ts
+new file mode 100644
+index 0000000..3fe0168
+--- /dev/null
++++ b/tests/auth-store.test.ts
+@@ -0,0 +1,74 @@
++import { test, after } from "node:test";
++import assert from "node:assert/strict";
++import { mkdtempSync, rmSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++const directory = mkdtempSync(join(tmpdir(), "times-auth-"));
++process.env.AUTH_DB_PATH = join(directory, "auth.sqlite");
++const store = await import("../src/lib/auth-store.ts");
++after(() => rmSync(directory, { recursive: true, force: true }));
++
++test("a WebAuthn challenge is consumed once, including with a stale session snapshot", () => {
++  const session = store.newSession();
++  store.saveChallenge(session.id, {
++    value: "challenge",
++    purpose: "signin",
++    expires: Date.now() + 300000,
++  });
++  const stale = store.sessionById(session.id)!;
++  assert.equal(store.takeChallenge(stale)?.value, "challenge");
++  assert.equal(store.takeChallenge(stale), undefined);
++});
++
++test("a deleted session cannot be used to recover a pending challenge", () => {
++  const session = store.newSession();
++  store.saveChallenge(session.id, {
++    value: "secret",
++    purpose: "reauth",
++    expires: Date.now() + 300000,
++  });
++  const stale = store.sessionById(session.id)!;
++  store.deleteSession(session.id);
++  assert.equal(store.sessionById(session.id), undefined);
++  assert.equal(store.takeChallenge(stale), undefined);
++});
++
++test("passkey-only users have no password fallback and retain the WebAuthn user ID", () => {
++  const id = store.token();
++  const user = store.createUser("passkey-reader", undefined, id);
++  assert.equal(user.id, id);
++  assert.equal(user.password, null);
++  assert.equal(store.checkPassword(user, "anything123"), false);
++  assert.throws(() => store.createUser("passkey-reader"));
++});
++
++test("passwords are salted, reject incorrect values, and are never stored as plaintext", () => {
++  const first = store.createUser("reader-one", "secure-password-123");
++  const second = store.createUser("reader-two", "secure-password-123");
++  assert.notEqual(first.password, second.password);
++  assert.ok(!first.password?.includes("secure-password-123"));
++  assert.equal(store.checkPassword(first, "secure-password-123"), true);
++  assert.equal(store.checkPassword(first, "incorrect"), false);
++});
++
++test("passkeys are scoped to their owner and retain counters and usage metadata", () => {
++  const owner = store.createUser("key-owner");
++  const other = store.createUser("other-owner");
++  store.addKey({
++    id: "credential-id",
++    user_id: owner.id,
++    name: "Laptop",
++    public_key: "public-key",
++    counter: 0,
++    transports: "[]",
++    created_at: new Date().toISOString(),
++    last_used: null,
++    backed_up: 0,
++  });
++  assert.equal(store.keysFor(other.id).length, 0);
++  assert.equal(store.keysFor(owner.id).length, 1);
++  store.updateKey("credential-id", 4, true);
++  assert.equal(store.keyById("credential-id")?.counter, 4);
++  assert.equal(store.keyById("credential-id")?.backed_up, 1);
++  assert.ok(store.keyById("credential-id")?.last_used);
++});

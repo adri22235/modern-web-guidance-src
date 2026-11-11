@@ -1,0 +1,200 @@
+diff --git a/analytics.js b/analytics.js
+new file mode 100644
+--- a/analytics.js
++++ b/analytics.js
+@@ -0,0 +1,195 @@
++/*
++ * Daily Grind client-side analytics.
++ *
++ * Records page views and click interactions, then coalesces them into
++ * batched background requests:
++ *   - Events are queued in memory.
++ *   - Each new event (re)starts a debounce timer (DEBOUNCE_MS), so a burst of
++ *     rapid clicks produces a single request once things go quiet.
++ *   - A max-wait ceiling (MAX_WAIT_MS) guarantees a flush even during a
++ *     continuous stream of interactions.
++ *   - The batch is sent when the browser is idle (requestIdleCallback) via
++ *     navigator.sendBeacon, falling back to fetch({ keepalive: true }).
++ *   - Any pending events are flushed when the page is hidden / unloaded
++ *     (e.g. when a tracked link navigates away).
++ *
++ * Privacy: only pathnames are recorded (no query strings or fragments, which
++ * can carry tokens), no form values or free text beyond short link/button
++ * labels, and tracking is disabled when Do Not Track or Global Privacy
++ * Control is enabled.
++ */
++(function () {
++  'use strict';
++
++  var ENDPOINT = '/api/analytics';
++  var DEBOUNCE_MS = 2000;
++  var MAX_WAIT_MS = 10000;
++  var MAX_BATCH = 25;      // events per request
++  var MAX_QUEUE = 200;     // hard cap on buffered events (drop oldest)
++  var MAX_LABEL = 80;
++
++  var nav = window.navigator || {};
++  if (
++    nav.doNotTrack === '1' || window.doNotTrack === '1' ||
++    nav.globalPrivacyControl === true
++  ) {
++    return;
++  }
++
++  var queue = [];
++  var debounceTimer = null;
++  var maxWaitTimer = null;
++  var idleHandle = null;
++
++  var sessionId = (function () {
++    var key = 'dg_analytics_sid';
++    try {
++      var existing = window.sessionStorage.getItem(key);
++      if (existing) return existing;
++      var id = (window.crypto && window.crypto.randomUUID)
++        ? window.crypto.randomUUID()
++        : Date.now().toString(36) + Math.random().toString(36).slice(2);
++      window.sessionStorage.setItem(key, id);
++      return id;
++    } catch (e) {
++      return null;
++    }
++  })();
++
++  function safePath(url) {
++    try {
++      var u = new URL(url, window.location.href);
++      return u.origin === window.location.origin ? u.pathname : u.origin + u.pathname;
++    } catch (e) {
++      return null;
++    }
++  }
++
++  function clip(text) {
++    if (!text) return null;
++    var t = String(text).replace(/\s+/g, ' ').trim();
++    return t.length > MAX_LABEL ? t.slice(0, MAX_LABEL) : t || null;
++  }
++
++  function track(type, data) {
++    var evt = { type: type, ts: Date.now(), path: window.location.pathname };
++    if (data) {
++      for (var k in data) {
++        if (Object.prototype.hasOwnProperty.call(data, k)) evt[k] = data[k];
++      }
++    }
++    queue.push(evt);
++    if (queue.length > MAX_QUEUE) queue.splice(0, queue.length - MAX_QUEUE);
++    schedule();
++  }
++
++  function schedule() {
++    if (queue.length >= MAX_BATCH) {
++      requestFlush();
++      return;
++    }
++    clearTimeout(debounceTimer);
++    debounceTimer = setTimeout(requestFlush, DEBOUNCE_MS);
++    if (!maxWaitTimer) maxWaitTimer = setTimeout(requestFlush, MAX_WAIT_MS);
++  }
++
++  function clearTimers() {
++    clearTimeout(debounceTimer);
++    clearTimeout(maxWaitTimer);
++    debounceTimer = maxWaitTimer = null;
++  }
++
++  // Defer the actual network work until the main thread is idle.
++  function requestFlush() {
++    clearTimers();
++    if (idleHandle !== null) return;
++    if (window.requestIdleCallback) {
++      idleHandle = window.requestIdleCallback(function () {
++        idleHandle = null;
++        flush(false);
++      }, { timeout: 2000 });
++    } else {
++      idleHandle = setTimeout(function () {
++        idleHandle = null;
++        flush(false);
++      }, 0);
++    }
++  }
++
++  function cancelIdle() {
++    if (idleHandle === null) return;
++    if (window.cancelIdleCallback) window.cancelIdleCallback(idleHandle);
++    clearTimeout(idleHandle);
++    idleHandle = null;
++  }
++
++  function send(events) {
++    var body = JSON.stringify({
++      sessionId: sessionId,
++      sentAt: Date.now(),
++      events: events
++    });
++    try {
++      if (nav.sendBeacon && nav.sendBeacon(ENDPOINT, new Blob([body], { type: 'application/json' }))) {
++        return;
++      }
++    } catch (e) { /* fall through */ }
++    if (window.fetch) {
++      window.fetch(ENDPOINT, {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body: body,
++        keepalive: true,
++        credentials: 'same-origin'
++      }).catch(function () { /* analytics must never break the page */ });
++    }
++  }
++
++  // Sends everything queued, in chunks of MAX_BATCH (normally a single request).
++  function flush(urgent) {
++    if (urgent) {
++      clearTimers();
++      cancelIdle();
++    }
++    while (queue.length) {
++      send(queue.splice(0, MAX_BATCH));
++    }
++  }
++
++  // --- Page view ---------------------------------------------------------
++  track('page_view', {
++    title: clip(document.title),
++    referrer: document.referrer ? safePath(document.referrer) : null,
++    viewport: window.innerWidth + 'x' + window.innerHeight
++  });
++
++  // --- Clicks ------------------------------------------------------------
++  document.addEventListener('click', function (e) {
++    var target = e.target instanceof Element ? e.target : null;
++    if (!target) return;
++    var el = target.closest('a, button, [data-track]') || target;
++    var section = el.closest('nav, header, main, footer, section');
++    var data = {
++      tag: el.tagName.toLowerCase(),
++      label: clip(el.getAttribute('data-track') || el.getAttribute('aria-label') || el.textContent),
++      href: el.tagName === 'A' && el.getAttribute('href') ? safePath(el.href) : null,
++      id: el.id || null,
++      className: typeof el.className === 'string' ? clip(el.className) : null,
++      section: section ? section.tagName.toLowerCase() : null,
++      x: Math.round(e.clientX),
++      y: Math.round(e.clientY)
++    };
++    track('click', data);
++  }, { capture: true, passive: true });
++
++  // --- Flush on leave ----------------------------------------------------
++  // visibilitychange/pagehide are the reliable "last chance" signals (unload
++  // is not fired on many mobile browsers and breaks the bfcache).
++  document.addEventListener('visibilitychange', function () {
++    if (document.visibilityState === 'hidden') flush(true);
++  });
++  window.addEventListener('pagehide', function () { flush(true); });
++
++  // Small public API for custom events: window.dgAnalytics.track('name', {...})
++  window.dgAnalytics = { track: track, flush: function () { flush(true); } };
++})();

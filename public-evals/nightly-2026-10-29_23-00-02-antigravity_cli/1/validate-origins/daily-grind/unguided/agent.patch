@@ -1,0 +1,560 @@
+diff --git a/index.html b/index.html
+index 66c9173..2d63679 100644
+--- a/index.html
++++ b/index.html
+@@ -195,18 +195,554 @@
+         </div>
+       </div>
+     </section>
++
++    <section id="order-status-section" style="margin-top: 40px;">
++      <div class="card" id="order-status-banner" data-order-state="idle">
++        <h3>Live Order &amp; Rewards Status</h3>
++        <p id="order-status-text">Waiting for order updates from our trusted ordering portal...</p>
++        <p id="widget-status-text" style="margin-top: 8px; font-size: 0.9rem; color: #5d4037;">Rewards Widget: Not initialized</p>
++      </div>
++    </section>
+   </main>
+ 
+   <footer>
+     <div class="footer-links">
++      <!-- Social & Partner Links -->
+       <a href="/about">Our Story</a> |
+       <a href="/careers">Join the Team</a> |
+       <a href="/contact">Contact Us</a> |
+-      <a href="/privacy-policy">Privacy</a>
++      <a href="/privacy-policy">Privacy</a> |
++      <a href="https://orders.dailygrind.com">Order Portal</a> |
++      <a href="https://roastery.dailygrind.co.uk">UK Roastery</a> |
++      <a href="https://instagram.com/thedailygrind">Instagram</a>
+     </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <!-- Loyalty Rewards Sandboxed Widget Container -->
++  <div id="widget-container" style="display: none;">
++    <iframe
++      id="loyalty-widget"
++      sandbox="allow-scripts"
++      srcdoc="<!DOCTYPE html><html><body><script>window.parent.postMessage({ type: 'WIDGET_INIT', widget: 'loyalty-rewards' }, '*');</script></body></html>"
++      title="Loyalty Widget"
++    ></iframe>
++  </div>
++
++  <script>
++    /**
++     * Origin and Site Validation Utilities for The Daily Grind
++     */
++
++    // Trusted origin for cross-window ordering messages
++    const TRUSTED_ORDER_ORIGIN = 'https://orders.dailygrind.com';
++
++    // Known multi-label public suffixes (eTLDs) to prevent string-splitting bugs
++    // on country-code second-level domains (e.g. .co.uk, .com.au)
++    const MULTI_PART_TLDS = new Set([
++      'co.uk', 'org.uk', 'ac.uk', 'gov.uk', 'me.uk',
++      'com.au', 'net.au', 'org.au', 'edu.au',
++      'co.nz', 'org.nz', 'co.jp', 'ne.jp', 'or.jp',
++      'com.br', 'com.mx', 'co.in', 'com.sg', 'co.za'
++    ]);
++
++    /**
++     * Safely parses a URL string against an optional base URL using the URL API.
++     * Rejects non-HTTP(S) schemes (such as javascript: or data:).
++     *
++     * @param {string} inputUrl
++     * @param {string} [baseUrl]
++     * @returns {URL|null}
++     */
++    function parseHttpUrl(inputUrl, baseUrl = window.location.origin) {
++      if (typeof inputUrl !== 'string' || !inputUrl.trim()) {
++        return null;
++      }
++      try {
++        const parsed = baseUrl ? new URL(inputUrl, baseUrl) : new URL(inputUrl);
++        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
++          return null;
++        }
++        return parsed;
++      } catch {
++        return null;
++      }
++    }
++
++    /**
++     * Extracts the registrable domain (eTLD+1) from a hostname without naive
++     * `.split('.').slice(-2)` bugs. Handles localhost, IP addresses, and multi-part TLDs.
++     *
++     * @param {string} hostname
++     * @returns {string|null}
++     */
++    function getRegistrableDomain(hostname) {
++      if (typeof hostname !== 'string' || !hostname) {
++        return null;
++      }
++      const normalized = hostname.toLowerCase().replace(/\.$/, '');
++
++      // IPv6 literal
++      if (normalized.startsWith('[') && normalized.endsWith(']')) {
++        return normalized;
++      }
++
++      // IPv4 literal
++      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(normalized)) {
++        return normalized;
++      }
++
++      const labels = normalized.split('.');
++      if (labels.some(label => !label)) {
++        return null;
++      }
++
++      // Single-label host (e.g., localhost)
++      if (labels.length === 1) {
++        return labels[0];
++      }
++
++      const lastTwo = `${labels[labels.length - 2]}.${labels[labels.length - 1]}`;
++      if (MULTI_PART_TLDS.has(lastTwo)) {
++        // If hostname is only the public suffix itself (e.g. "co.uk"), it has no registrable domain
++        if (labels.length < 3) {
++          return null;
++        }
++        return `${labels[labels.length - 3]}.${lastTwo}`;
++      }
++
++      return lastTwo;
++    }
++
++    /**
++     * Returns the site (scheme + registrable domain) of a URL or origin.
++     *
++     * @param {string|URL} urlOrOrigin
++     * @returns {string|null}
++     */
++    function getSite(urlOrOrigin) {
++      const parsed = urlOrOrigin instanceof URL ? urlOrOrigin : parseHttpUrl(String(urlOrOrigin));
++      if (!parsed) {
++        return null;
++      }
++      const registrableDomain = getRegistrableDomain(parsed.hostname);
++      if (!registrableDomain) {
++        return null;
++      }
++      return `${parsed.protocol}//${registrableDomain}`;
++    }
++
++    /**
++     * Checks whether two URLs/origins are strictly the same origin
++     * (scheme + hostname + port).
++     *
++     * @param {string|URL} urlA
++     * @param {string|URL} [urlB=window.location.origin]
++     * @returns {boolean}
++     */
++    function isSameOrigin(urlA, urlB = window.location.origin) {
++      const parsedA = urlA instanceof URL ? urlA : parseHttpUrl(String(urlA));
++      const parsedB = urlB instanceof URL ? urlB : parseHttpUrl(String(urlB));
++      if (!parsedA || !parsedB) {
++        return false;
++      }
++      if (parsedA.origin === 'null' || parsedB.origin === 'null') {
++        return false;
++      }
++      return parsedA.origin === parsedB.origin;
++    }
++
++    /**
++     * Checks whether two URLs/origins belong to the same site (same registrable domain
++     * and compatible HTTP/HTTPS scheme without HTTPS-to-HTTP downgrade).
++     *
++     * @param {string|URL} targetUrl
++     * @param {string|URL} [referenceUrl=window.location.href]
++     * @param {object} [options]
++     * @param {boolean} [options.requireHttps=false]
++     * @returns {boolean}
++     */
++    function isSameSite(targetUrl, referenceUrl = window.location.href, options = {}) {
++      const parsedRef = referenceUrl instanceof URL ? referenceUrl : parseHttpUrl(String(referenceUrl));
++      if (!parsedRef) {
++        return false;
++      }
++      const parsedTarget = targetUrl instanceof URL ? targetUrl : parseHttpUrl(String(targetUrl), parsedRef.origin);
++      if (!parsedTarget) {
++        return false;
++      }
++      if (options.requireHttps && parsedTarget.protocol !== 'https:') {
++        return false;
++      }
++      const targetDomain = getRegistrableDomain(parsedTarget.hostname);
++      const refDomain = getRegistrableDomain(parsedRef.hostname);
++      if (!targetDomain || !refDomain) {
++        return false;
++      }
++      // Prevent scheme downgrade (e.g., https -> http) while allowing http -> https upgrade or matching scheme
++      if (parsedRef.protocol === 'https:' && parsedTarget.protocol !== 'https:') {
++        return false;
++      }
++      return targetDomain === refDomain;
++    }
++
++    /**
++     * Validates a candidate redirect URL to ensure it is a safe same-site (or same-origin)
++     * HTTP/HTTPS destination without naive string prefix or splitting bugs
++     * (such as `https://dailygrind.com.evil.com`, `//evil.com`, or `.co.uk` suffix confusion).
++     *
++     * @param {string} redirectUrl
++     * @param {string} [referenceUrl=window.location.href]
++     * @returns {string|null} Normalized href if valid, or null if rejected.
++     */
++    function validateSameSiteRedirect(redirectUrl, referenceUrl = window.location.href) {
++      if (typeof redirectUrl !== 'string' || !redirectUrl.trim()) {
++        return null;
++      }
++      const raw = redirectUrl.trim();
++      // Reject backslash tricks (e.g. /\evil.com or https://dailygrind.com\@evil.com)
++      if (raw.includes('\\')) {
++        return null;
++      }
++
++      const parsedRef = parseHttpUrl(referenceUrl);
++      if (!parsedRef) {
++        return null;
++      }
++
++      const parsedTarget = parseHttpUrl(raw, parsedRef.origin);
++      if (!parsedTarget) {
++        return null;
++      }
++
++      // Reject embedded credentials (e.g. https://dailygrind.com@evil.com)
++      if (parsedTarget.username || parsedTarget.password) {
++        return null;
++      }
++
++      if (!isSameSite(parsedTarget, parsedRef)) {
++        return null;
++      }
++
++      return parsedTarget.href;
++    }
++
++    /**
++     * Classifies a link URL relative to a reference URL (defaults to current page)
++     * using URL parsing and registrable domain extraction rather than string splitting.
++     *
++     * @param {string} href
++     * @param {string} [referenceUrl=window.location.href]
++     * @returns {{ valid: boolean, href: string|null, origin: string|null, site: string|null, sameOrigin: boolean, sameSite: boolean, isExternal: boolean }}
++     */
++    function validateExternalLink(href, referenceUrl = window.location.href) {
++      const parsedRef = parseHttpUrl(referenceUrl);
++      if (!parsedRef || typeof href !== 'string' || href.includes('\\')) {
++        return {
++          valid: false,
++          href: null,
++          origin: null,
++          site: null,
++          sameOrigin: false,
++          sameSite: false,
++          isExternal: false
++        };
++      }
++
++      const parsed = parseHttpUrl(href, parsedRef.origin);
++      if (!parsed || parsed.username || parsed.password) {
++        return {
++          valid: false,
++          href: null,
++          origin: null,
++          site: null,
++          sameOrigin: false,
++          sameSite: false,
++          isExternal: false
++        };
++      }
++
++      const sameOrigin = isSameOrigin(parsed, parsedRef);
++      const sameSite = isSameSite(parsed, parsedRef);
++      return {
++        valid: true,
++        href: parsed.href,
++        origin: parsed.origin,
++        site: getSite(parsed),
++        sameOrigin,
++        sameSite,
++        isExternal: !sameSite
++      };
++    }
++
++    /**
++     * Inspects and hardens anchor elements on the page.
++     * - Marks cross-origin / external-site links with `rel="noopener noreferrer"`
++     *   and `data-external-origin` / `data-external-site` attributes.
++     * - Neutralizes unsafe `javascript:` / `data:` hrefs.
++     * - Validates redirect query parameters on links such as `/logout?redirect=...`.
++     *
++     * @param {ParentNode} [root=document]
++     * @param {string} [referenceUrl=window.location.href]
++     */
++    function validateAndHardenLinks(root = document, referenceUrl = window.location.href) {
++      const anchors = root.querySelectorAll('a[href]');
++      anchors.forEach(anchor => {
++        const rawHref = anchor.getAttribute('href');
++        if (!rawHref) return;
++
++        const info = validateExternalLink(rawHref, referenceUrl);
++        if (!info.valid) {
++          anchor.removeAttribute('href');
++          anchor.setAttribute('data-invalid-link', 'true');
++          return;
++        }
++
++        const parsed = new URL(info.href);
++
++        if (!info.sameOrigin) {
++          anchor.setAttribute('data-external-origin', 'true');
++          const existingRel = new Set(
++            (anchor.getAttribute('rel') || '').split(/\s+/).filter(Boolean)
++          );
++          existingRel.add('noopener');
++          existingRel.add('noreferrer');
++          anchor.setAttribute('rel', Array.from(existingRel).join(' '));
++        } else {
++          anchor.removeAttribute('data-external-origin');
++        }
++
++        if (!info.sameSite) {
++          anchor.setAttribute('data-external-site', 'true');
++        } else {
++          anchor.removeAttribute('data-external-site');
++        }
++
++        // Validate redirect / returnTo / next / continue parameters on links if present
++        for (const param of ['redirect', 'returnTo', 'next', 'continue']) {
++          if (parsed.searchParams.has(param)) {
++            const candidate = parsed.searchParams.get(param);
++            const validated = validateSameSiteRedirect(candidate, referenceUrl);
++            if (!validated) {
++              parsed.searchParams.delete(param);
++              anchor.setAttribute('href', parsed.pathname + parsed.search + parsed.hash);
++            }
++          }
++        }
++      });
++    }
++
++    /**
++     * Sandboxed Widget Identity Pinning & Cross-Window Message Validation
++     *
++     * Sandboxed iframes without `allow-same-origin` serialize their `event.origin`
++     * as the string `"null"`. Because any sandboxed iframe on any page also has
++     * `event.origin === "null"`, checking `event.origin === "null"` alone cannot
++     * distinguish the legitimate widget from another sandboxed iframe.
++     *
++     * We pin `pinnedWidgetSource = event.source` on the initial handshake
++     * (optionally scoped to the expected widget iframe's `contentWindow` if present)
++     * and verify `event.source === pinnedWidgetSource` on all subsequent messages.
++     */
++    function createMessageSecurityController(options = {}) {
++      const trustedOrderOrigin = options.trustedOrderOrigin || TRUSTED_ORDER_ORIGIN;
++      let expectedWidgetWindow = options.expectedWidgetWindow || null;
++      let pinnedWidgetSource = null;
++      const acceptedOrderMessages = [];
++      const acceptedWidgetMessages = [];
++      const rejectedMessages = [];
++
++      function updateStatusUI(result) {
++        if (typeof document === 'undefined') return;
++        const orderBanner = document.getElementById('order-status-banner');
++        const orderText = document.getElementById('order-status-text');
++        const widgetText = document.getElementById('widget-status-text');
++
++        if (result.accepted && result.channel === 'order') {
++          if (orderBanner) orderBanner.setAttribute('data-order-state', 'updated');
++          if (orderText) {
++            const summary = result.data.orderId
++              ? `Order #${result.data.orderId}: ${result.data.status || 'Received'}`
++              : `Order update received: ${result.data.status || 'Active'}`;
++            orderText.textContent = summary;
++          }
++        } else if (result.accepted && result.channel === 'widget') {
++          if (widgetText) {
++            widgetText.textContent =
++              result.action === 'pinned'
++                ? 'Rewards Widget: Initialized & Pinned'
++                : `Rewards Widget: ${result.data.status || result.data.type || 'Message accepted'}`;
++          }
++        }
++      }
++
++      function handleMessage(event) {
++        if (!event || typeof event !== 'object') {
++          return { accepted: false, reason: 'invalid-event' };
++        }
++
++        const { origin, source, data } = event;
++        if (!data || typeof data !== 'object') {
++          rejectedMessages.push({ origin, reason: 'invalid-payload' });
++          return { accepted: false, reason: 'invalid-payload' };
++        }
++
++        // Case 1: Sandboxed iframe widget messages (opaque origin === "null")
++        if (origin === 'null') {
++          // Must have a valid MessageEventSource reference
++          if (!source) {
++            rejectedMessages.push({ origin, reason: 'missing-source' });
++            return { accepted: false, reason: 'missing-source' };
++          }
++
++          // Initialization handshake: pin sender identity if not yet pinned
++          const isInitType =
++            data.type === 'WIDGET_INIT' ||
++            data.type === 'INIT' ||
++            data.type === 'init' ||
++            data.action === 'init';
++
++          if (isInitType) {
++            if (pinnedWidgetSource !== null) {
++              // Already pinned: reject re-initialization attempts from any source
++              rejectedMessages.push({ origin, reason: 'already-pinned' });
++              return { accepted: false, reason: 'already-pinned' };
++            }
++            if (expectedWidgetWindow && source !== expectedWidgetWindow) {
++              rejectedMessages.push({ origin, reason: 'unexpected-widget-window' });
++              return { accepted: false, reason: 'unexpected-widget-window' };
++            }
++            pinnedWidgetSource = source;
++            acceptedWidgetMessages.push(data);
++            const result = { accepted: true, channel: 'widget', action: 'pinned', data };
++            updateStatusUI(result);
++            return result;
++          }
++
++          // Subsequent messages from a sandboxed iframe: must match pinnedWidgetSource
++          if (pinnedWidgetSource === null || source !== pinnedWidgetSource) {
++            rejectedMessages.push({ origin, reason: 'unpinned-or-mismatched-source' });
++            return { accepted: false, reason: 'unpinned-or-mismatched-source' };
++          }
++
++          acceptedWidgetMessages.push(data);
++          const result = { accepted: true, channel: 'widget', action: 'message', data };
++          updateStatusUI(result);
++          return result;
++        }
++
++        // Case 2: Cross-window messages from the trusted ordering origin
++        // Use exact origin comparison against the parsed trusted origin (never indexOf/includes/startsWith)
++        const parsedIncomingOrigin = parseHttpUrl(origin, null);
++        const parsedTrustedOrigin = parseHttpUrl(trustedOrderOrigin, null);
++        if (
++          !parsedIncomingOrigin ||
++          !parsedTrustedOrigin ||
++          parsedIncomingOrigin.origin !== parsedTrustedOrigin.origin
++        ) {
++          rejectedMessages.push({ origin, reason: 'untrusted-origin' });
++          return { accepted: false, reason: 'untrusted-origin' };
++        }
++
++        // If the ordering message includes a redirect URL, validate that it is same-site
++        if (typeof data.redirectUrl === 'string') {
++          const safeRedirect = validateSameSiteRedirect(data.redirectUrl, trustedOrderOrigin);
++          if (!safeRedirect) {
++            rejectedMessages.push({ origin, reason: 'invalid-redirect-url' });
++            return { accepted: false, reason: 'invalid-redirect-url' };
++          }
++        }
++
++        acceptedOrderMessages.push(data);
++        const result = { accepted: true, channel: 'order', data };
++        updateStatusUI(result);
++        return result;
++      }
++
++      function setExpectedWidgetWindow(win) {
++        expectedWidgetWindow = win;
++      }
++
++      function resetPinnedWidget() {
++        pinnedWidgetSource = null;
++      }
++
++      function getPinnedWidgetSource() {
++        return pinnedWidgetSource;
++      }
++
++      return {
++        handleMessage,
++        setExpectedWidgetWindow,
++        resetPinnedWidget,
++        getPinnedWidgetSource,
++        acceptedOrderMessages,
++        acceptedWidgetMessages,
++        rejectedMessages
++      };
++    }
++
++    // Initialize default controller and wire up DOM/window listeners
++    const securityController = createMessageSecurityController({
++      trustedOrderOrigin: TRUSTED_ORDER_ORIGIN
++    });
++
++    window.addEventListener('message', event => {
++      securityController.handleMessage(event);
++    });
++
++    window.addEventListener('DOMContentLoaded', () => {
++      validateAndHardenLinks(document, window.location.href);
++
++      // Intercept clicks on anchors to block invalid/cross-site redirects dynamically added
++      document.addEventListener('click', event => {
++        const anchor = event.target && event.target.closest ? event.target.closest('a') : null;
++        if (!anchor) return;
++        if (anchor.hasAttribute('data-invalid-link')) {
++          event.preventDefault();
++          return;
++        }
++        const rawHref = anchor.getAttribute('href');
++        if (!rawHref) return;
++        const linkCheck = validateExternalLink(rawHref, window.location.href);
++        if (!linkCheck.valid) {
++          event.preventDefault();
++          anchor.removeAttribute('href');
++          anchor.setAttribute('data-invalid-link', 'true');
++        }
++      });
++
++      // Handle page-level ?redirect=... parameter safely on logout link if present
++      const pageParams = new URLSearchParams(window.location.search);
++      if (pageParams.has('redirect')) {
++        const candidateRedirect = pageParams.get('redirect');
++        const safeRedirect = validateSameSiteRedirect(candidateRedirect, window.location.href);
++        const logoutLink = document.querySelector('.logout-link');
++        if (logoutLink) {
++          if (safeRedirect) {
++            logoutLink.setAttribute('data-safe-redirect', safeRedirect);
++          } else {
++            logoutLink.setAttribute('data-rejected-redirect', 'true');
++          }
++        }
++      }
++    });
++
++    // Expose API on window for integration and verification
++    window.DailyGrindSecurity = {
++      TRUSTED_ORDER_ORIGIN,
++      parseHttpUrl,
++      getRegistrableDomain,
++      getSite,
++      isSameOrigin,
++      isSameSite,
++      validateSameSiteRedirect,
++      validateExternalLink,
++      validateAndHardenLinks,
++      createMessageSecurityController,
++      securityController
++    };
++  </script>
+ </body>
+ 
+ </html>

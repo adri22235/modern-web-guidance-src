@@ -1,0 +1,228 @@
+diff --git a/README.md b/README.md
+index 4479b53..5baf409 100644
+--- a/README.md
++++ b/README.md
+@@ -15,3 +15,26 @@ The application will now be running on `http://localhost:11224`.
+ - **[React](https://react.dev/)**: Used for UI components.
+ - **[Tailwind CSS](https://tailwindcss.com/)**: For styling the application.
+ - **[Astro DB](https://docs.astro.build/en/guides/database/)**: Powers the comments feature, using a libSQL-compatible database.
++
++## Developer diagnostics
++
++The homepage includes independent hardware (private LAN IPv4) and companion CLI
++(loopback) connection cards. The editable defaults are
++`http://192.168.1.100:8080/api/status` and
++`http://127.0.0.1:3000/api/status`; replace these with the endpoints your services
++actually expose. The widget does not install or start a companion service.
++
++Each Connect action makes a browser-side CORS GET request with
++`targetAddressSpace: 'local'` for hardware or `'loopback'` for the CLI. No server
++proxy or automatic discovery is involved. Use HTTPS for the site (localhost is
++also suitable for development), a browser supporting Local Network Access, and
++allow the appropriate network permission when prompted. See the
++[Chrome Local Network Access guide](https://developer.chrome.com/docs/modern-web-guidance/guides/security/local-network-access).
++
++Services must return a successful HTTP status and allow the page's origin with
++`Access-Control-Allow-Origin`. Requests omit credentials and reject redirects.
++Hardware should listen on its LAN interface, while the CLI should listen on
++loopback. JSON and plain text responses are supported; the displayed response is
++limited to 16 KiB. Each check times out after 10 seconds and can be cancelled.
++“Reachable” describes a completed check, not a persistent connection; use Check
++again to refresh it.
+diff --git a/src/components/DiagnosticsWidget.tsx b/src/components/DiagnosticsWidget.tsx
+new file mode 100644
+index 0000000..f435a97
+--- /dev/null
++++ b/src/components/DiagnosticsWidget.tsx
+@@ -0,0 +1,172 @@
++import { useEffect, useRef, useState } from 'react';
++import { CommandLineIcon, CpuChipIcon, ArrowPathIcon, SignalIcon } from '@heroicons/react/24/outline';
++
++type AddressSpace = 'local' | 'loopback';
++type Phase = 'idle' | 'connecting' | 'success' | 'error';
++// These browser options are newer than TypeScript's DOM definitions.
++type LocalRequestInit = RequestInit & { targetAddressSpace: AddressSpace };
++
++function validateEndpoint(value: string, space: AddressSpace): URL {
++  const url = new URL(value);
++  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) {
++    throw new Error('Use an HTTP or HTTPS URL without credentials or a fragment.');
++  }
++  const host = url.hostname;
++  const octets = host.split('.').map(Number);
++  const ipv4 = octets.length === 4 && octets.every(n => Number.isInteger(n) && n >= 0 && n <= 255);
++  const loopback = host === 'localhost' || host === '[::1]' || (ipv4 && octets[0] === 127);
++  const privateLan = ipv4 && (octets[0] === 10 ||
++    (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
++    (octets[0] === 192 && octets[1] === 168));
++  if (space === 'local' ? !privateLan : !loopback) {
++    throw new Error(space === 'local'
++      ? 'Enter a private IPv4 address: 192.168.x.x, 10.x.x.x, or 172.16–31.x.x.'
++      : 'Enter a loopback address: 127.0.0.1, localhost, or [::1].');
++  }
++  return url;
++}
++
++function ConnectionCard({ space, title, description, initialEndpoint }: {
++  space: AddressSpace; title: string; description: string; initialEndpoint: string;
++}) {
++  const [endpoint, setEndpoint] = useState(initialEndpoint);
++  const [phase, setPhase] = useState<Phase>('idle');
++  const [message, setMessage] = useState('Ready when you are.');
++  const [response, setResponse] = useState('');
++  const request = useRef<AbortController | null>(null);
++  const inputId = `diagnostics-${space}`;
++  const Icon = space === 'local' ? CpuChipIcon : CommandLineIcon;
++
++  useEffect(() => () => { request.current?.abort(); }, []);
++
++  function reset() {
++    request.current?.abort();
++    request.current = null;
++    setPhase('idle');
++    setResponse('');
++    setMessage('Ready when you are.');
++  }
++
++  async function connect(event: React.FormEvent<HTMLFormElement>) {
++    event.preventDefault();
++    let url: URL;
++    try {
++      url = validateEndpoint(endpoint.trim(), space);
++    } catch (error) {
++      setPhase('error');
++      setMessage(error instanceof TypeError ? 'Enter a complete URL, including http:// or https://.' : (error as Error).message);
++      return;
++    }
++    if (!window.isSecureContext) {
++      setPhase('error');
++      setMessage('Open The DevTools Times over HTTPS (or localhost) to use browser network permissions.');
++      return;
++    }
++    const controller = new AbortController();
++    request.current = controller;
++    setPhase('connecting');
++    setResponse('');
++    setMessage('Waiting for the endpoint. Allow browser network access if prompted.');
++    const started = performance.now();
++    const timeout = window.setTimeout(() => controller.abort(), 10000);
++    try {
++      const options: LocalRequestInit = {
++        method: 'GET', mode: 'cors', credentials: 'omit', cache: 'no-store',
++        redirect: 'error', signal: controller.signal, targetAddressSpace: space,
++      };
++      const result = await fetch(url.href, options);
++      if (!result.ok) throw new Error(`Endpoint returned HTTP ${result.status}. Check the URL and service, then retry.`);
++      // Limit diagnostic output, including responses from a streaming endpoint.
++      const reader = result.body?.getReader();
++      const decoder = new TextDecoder();
++      let body = '';
++      let bytes = 0;
++      if (reader) {
++        try {
++          while (bytes < 16384) {
++            const chunk = await reader.read();
++            if (chunk.done) break;
++            const remaining = 16384 - bytes;
++            body += decoder.decode(chunk.value.subarray(0, remaining), { stream: true });
++            bytes += chunk.value.length;
++          }
++          body += decoder.decode();
++        } finally {
++          await reader.cancel();
++        }
++      }
++      if (request.current !== controller) return;
++      const elapsed = Math.round(performance.now() - started);
++      let formatted = body;
++      try { formatted = JSON.stringify(JSON.parse(body), null, 2); } catch { /* Plain text is also supported. */ }
++      setResponse((formatted || '(Empty response)') + (bytes >= 16384 ? '\n[Response limited to 16 KiB]' : ''));
++      setPhase('success');
++      setMessage(`HTTP ${result.status} · ${elapsed} ms · Checked at ${new Date().toLocaleTimeString()}`);
++    } catch (error) {
++      if (request.current !== controller) return;
++      setPhase('error');
++      setMessage(controller.signal.aborted
++        ? 'No complete response within 10 seconds. Check that the service is running and the address is correct.'
++        : error instanceof TypeError
++          ? 'Could not reach the endpoint. Check the service, browser network permission, and endpoint CORS configuration.'
++          : (error as Error).message);
++    } finally {
++      window.clearTimeout(timeout);
++      if (request.current === controller) request.current = null;
++    }
++  }
++
++  const labels = { idle: 'Not connected', connecting: 'Connecting', success: 'Reachable', error: 'Connection failed' };
++  return (
++    <article className="rounded-lg border border-stone-200 bg-white p-5 sm:p-6">
++      <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
++        <div className="flex items-center gap-3">
++          <span className="rounded-md bg-stone-100 p-2.5 text-stone-700"><Icon className="h-6 w-6" aria-hidden="true" /></span>
++          <div><h3 className="font-semibold text-stone-900">{title}</h3><p className="mt-0.5 font-mono text-[11px] uppercase tracking-wider text-stone-500">{space === 'local' ? 'Private Wi-Fi · LAN' : 'Your machine · Loopback'}</p></div>
++        </div>
++        <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${phase === 'success' ? 'bg-emerald-50 text-emerald-800' : phase === 'error' ? 'bg-red-50 text-red-800' : 'bg-stone-100 text-stone-600'}`}>
++          <span className={`h-1.5 w-1.5 rounded-full ${phase === 'success' ? 'bg-emerald-500' : phase === 'error' ? 'bg-red-500' : phase === 'connecting' ? 'animate-pulse bg-amber-500' : 'bg-stone-400'}`} />{labels[phase]}
++        </span>
++      </div>
++      <p className="mb-5 text-sm leading-6 text-stone-600">{description}</p>
++      <form onSubmit={connect}>
++        <label htmlFor={inputId} className="mb-2 block text-xs font-semibold text-stone-700">Status endpoint</label>
++        <input id={inputId} type="url" required value={endpoint} disabled={phase === 'connecting'} spellCheck={false} autoCapitalize="none" autoComplete="off" aria-describedby={`${inputId}-message`} onChange={event => { reset(); setEndpoint(event.target.value); }} className="w-full rounded-md border border-stone-300 bg-stone-50 px-3 py-2.5 font-mono text-sm text-stone-800 focus:border-amber-600 focus:outline-none focus:ring-2 focus:ring-amber-100 disabled:opacity-60" />
++        <div className="mt-3 flex gap-2">
++          <button type="submit" disabled={phase === 'connecting'} className="inline-flex items-center justify-center gap-2 rounded-md bg-stone-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-stone-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-600 disabled:opacity-50">
++            {phase === 'success' ? <ArrowPathIcon className="h-4 w-4" aria-hidden="true" /> : <SignalIcon className="h-4 w-4" aria-hidden="true" />}
++            {phase === 'connecting' ? 'Connecting…' : phase === 'success' ? 'Check again' : phase === 'error' ? 'Retry connection' : 'Connect'}
++          </button>
++          {(phase === 'connecting' || phase === 'success') && <button type="button" onClick={reset} className="rounded-md border border-stone-300 px-3 py-2 text-sm text-stone-700 hover:bg-stone-50 focus-visible:outline-2 focus-visible:outline-amber-600">{phase === 'connecting' ? 'Cancel' : 'Clear'}</button>}
++        </div>
++      </form>
++      <p id={`${inputId}-message`} role="status" aria-live="polite" className={`mt-4 text-xs leading-5 ${phase === 'error' ? 'text-red-700' : 'text-stone-500'}`}>{message}</p>
++      {phase === 'success' && <details className="mt-3 text-xs text-stone-600"><summary className="cursor-pointer font-semibold">View response</summary><pre className="mt-2 max-h-52 overflow-auto rounded-md bg-stone-950 p-3 font-mono text-xs text-stone-100">{response}</pre></details>}
++    </article>
++  );
++}
++
++export default function DiagnosticsWidget() {
++  return (
++    <section aria-labelledby="diagnostics-title" className="my-8 overflow-hidden rounded-xl border border-stone-200 bg-[#f7f6f2]">
++      <div className="flex flex-wrap items-center justify-between gap-4 border-b border-stone-200 px-5 py-5 sm:px-7">
++        <div><p className="mb-1.5 text-[10px] font-bold uppercase tracking-[0.2em] text-amber-700">The developer workbench</p><h2 id="diagnostics-title" className="font-brand text-3xl text-stone-900">Developer diagnostics</h2></div>
++        <span className="flex items-center gap-2 font-mono text-xs text-stone-500"><span className="h-2 w-2 rounded-full bg-amber-500" />Browser → your devices</span>
++      </div>
++      <div className="px-5 py-6 sm:px-7">
++        <p className="mb-5 max-w-2xl text-sm leading-6 text-stone-600">Bring your test bench to the browser. Check a hardware device on your Wi-Fi network or a companion CLI on this machine.</p>
++        <div className="grid gap-4 md:grid-cols-2">
++          <ConnectionCard space="local" title="Hardware test device" description="Join the same Wi-Fi network as your device, then enter its diagnostic endpoint." initialEndpoint="http://192.168.1.100:8080/api/status" />
++          <ConnectionCard space="loopback" title="Local companion CLI" description="Start your companion CLI, then enter the status endpoint it exposes on this machine." initialEndpoint="http://127.0.0.1:3000/api/status" />
++        </div>
++        <p className="mt-4 text-xs leading-5 text-stone-500">Connections start only when you click Connect. Each check sends one GET request directly from your browser; the result is a snapshot.</p>
++        <details className="mt-4 border-t border-stone-200 pt-4 text-xs leading-6 text-stone-600">
++          <summary className="cursor-pointer font-semibold text-stone-800">Connection setup & troubleshooting</summary>
++          <p className="mt-2">Use HTTPS for this site and allow local network or loopback access when your browser asks. Browser support varies; if blocked, try a current browser supporting Local Network Access and review this site’s permissions. Your operating system may also request network access.</p>
++          <p className="mt-2">Both endpoints must accept GET requests and allow this site’s origin through CORS (Access-Control-Allow-Origin). The CLI must listen on loopback; the hardware service must listen on its LAN interface. A JSON or text response with an HTTP 2xx status confirms reachability. No credentials are sent.</p>
++          <a className="mt-2 inline-block underline decoration-stone-400 underline-offset-2 hover:text-stone-900" href="https://developer.chrome.com/docs/modern-web-guidance/guides/security/local-network-access" target="_blank" rel="noreferrer">Browser network access guide ↗</a>
++        </details>
++      </div>
++    </section>
++  );
++}
+diff --git a/src/pages/index.astro b/src/pages/index.astro
+index 92f6399..abaccb5 100644
+--- a/src/pages/index.astro
++++ b/src/pages/index.astro
+@@ -1,5 +1,6 @@
+ ---
+ import Layout from '../layouts/Layout.astro';
++import DiagnosticsWidget from '../components/DiagnosticsWidget';
+ import ArticleTeaser from '../components/ArticleTeaser.astro';
+ import TopStoryTeaserGrid from '../components/TopStoryTeaserGrid.astro';
+ import Ad from '../components/AdSlotBanner';
+@@ -56,6 +57,7 @@ politicsArticles[2] = {
+ 
+     <!-- Main Content Area -->
+     <main class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-6 mt-6">
++        <DiagnosticsWidget client:load />
+         <ArticleTeaser article={topArticle} large={true} />
+     </main>
+ 

@@ -1,0 +1,149 @@
+diff --git a/index.html b/index.html
+index 66c9173..15b2806 100644
+--- a/index.html
++++ b/index.html
+@@ -3,6 +3,7 @@
+ 
+ <head>
+   <meta charset="UTF-8">
++  <meta name="referrer" content="strict-origin-when-cross-origin">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <title>The Daily Grind | Artisanal Coffee</title>
+   <style>
+@@ -72,6 +73,10 @@
+       border-radius: 4px;
+     }
+ 
++    .section-title {
++      text-align: center;
++    }
++
+     /* Hero Section */
+     .hero {
+       height: 60vh;
+@@ -176,7 +181,7 @@
+ 
+   <main class="container">
+     <section>
+-      <h2 style="text-align: center;">Seasonal Favorites</h2>
++      <h2 class="section-title">Seasonal Favorites</h2>
+       <div class="grid">
+         <div class="card">
+           <h3>Maple Oat Latte</h3>
+diff --git a/server.js b/server.js
+index 52c2fd5..b7bc553 100644
+--- a/server.js
++++ b/server.js
+@@ -1,30 +1,97 @@
+ const http = require('node:http');
+ const fs = require('node:fs');
+ const path = require('node:path');
++const crypto = require('node:crypto');
+ 
+ const PORT = parseInt(process.env.PORT || '11222', 10);
+-const WORK_DIR = __dirname;
++const INDEX_PATH = path.join(__dirname, 'index.html');
++
++// The page ships one inline <style> block and no scripts. Allow that exact
++// block by hash instead of 'unsafe-inline', and block all script execution.
++function buildCsp(html) {
++  const styles = [...html.matchAll(/<style>([\s\S]*?)<\/style>/g)];
++  const hashes = styles.map(
++    (m) => `'sha256-${crypto.createHash('sha256').update(m[1]).digest('base64')}'`
++  );
++  return [
++    "default-src 'none'",
++    "script-src 'none'",
++    `style-src ${hashes.join(' ') || "'none'"}`,
++    "img-src 'self' https://images.unsplash.com",
++    "connect-src 'none'",
++    "font-src 'none'",
++    "object-src 'none'",
++    "base-uri 'none'",
++    "form-action 'self'",
++    "frame-ancestors 'none'",
++    "require-trusted-types-for 'script'",
++    'upgrade-insecure-requests',
++  ].join('; ');
++}
++
++const html = fs.readFileSync(INDEX_PATH);
++const csp = buildCsp(html.toString('utf8'));
++
++function securityHeaders(req) {
++  const headers = {
++    'Content-Security-Policy': csp,
++    'X-Content-Type-Options': 'nosniff',
++    'Referrer-Policy': 'strict-origin-when-cross-origin',
++    'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=(), usb=()',
++    'Cross-Origin-Opener-Policy': 'same-origin',
++    'Cross-Origin-Resource-Policy': 'same-origin',
++    'X-Frame-Options': 'DENY',
++  };
++  // Only assert HSTS when the request actually arrived over HTTPS (e.g. via a proxy).
++  if (req.headers['x-forwarded-proto'] === 'https') {
++    headers['Strict-Transport-Security'] = 'max-age=300; includeSubDomains';
++  }
++  return headers;
++}
++
++// Expire every cookie the browser sent, so the session ends even though the
++// server does not know cookie names or attributes in advance.
++function expiredCookies(req) {
++  const names = (req.headers.cookie || '')
++    .split(';')
++    .map((c) => c.split('=')[0].trim())
++    .filter((n) => /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(n));
++  return names.map((n) => `${n}=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax`);
++}
+ 
+ const server = http.createServer((req, res) => {
+-  const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+-  const pathname = parsedUrl.pathname;
++  const { pathname } = new URL(req.url, 'http://localhost');
++  const base = securityHeaders(req);
+ 
+   if (pathname === '/logout' || pathname === '/logout/') {
+-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+-    res.end('Logged out');
+-    return;
++    if (req.method !== 'GET' && req.method !== 'POST') {
++      res.writeHead(405, { ...base, Allow: 'GET, POST' });
++      return res.end();
++    }
++    const headers = {
++      ...base,
++      Location: '/',
++      'Cache-Control': 'no-store',
++      'Clear-Site-Data': '"cookies", "storage", "cache"',
++    };
++    const cookies = expiredCookies(req);
++    if (cookies.length) headers['Set-Cookie'] = cookies;
++    res.writeHead(303, headers);
++    return res.end();
+   }
+ 
+-  const filePath = path.join(WORK_DIR, 'index.html');
+-  fs.readFile(filePath, (err, data) => {
+-    if (err) {
+-      res.writeHead(500);
+-      res.end('Server error');
+-      return;
+-    }
+-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+-    res.end(data);
++  if (req.method !== 'GET' && req.method !== 'HEAD') {
++    res.writeHead(405, { ...base, Allow: 'GET, HEAD' });
++    return res.end();
++  }
++
++  res.writeHead(200, {
++    ...base,
++    'Content-Type': 'text/html; charset=utf-8',
++    'Content-Length': html.length,
++    'Cache-Control': 'no-cache',
+   });
++  res.end(req.method === 'HEAD' ? undefined : html);
+ });
+ 
+ server.listen(PORT, () => {

@@ -1,0 +1,534 @@
+diff --git a/index.html b/index.html
+index 66c9173..fffc138 100644
+--- a/index.html
++++ b/index.html
+@@ -152,6 +152,130 @@
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++    /* My Account / Passkeys */
++    dialog.account {
++      border: none;
++      border-radius: 8px;
++      padding: 28px;
++      width: min(520px, 94vw);
++      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
++      color: var(--text);
++      margin: auto;
++    }
++
++    dialog.account::backdrop {
++      background: rgba(0, 0, 0, 0.55);
++    }
++
++    dialog.account h2 {
++      color: var(--primary);
++      margin-bottom: 4px;
++    }
++
++    dialog.account h3 {
++      color: var(--primary);
++      margin: 20px 0 8px;
++      font-size: 1.05rem;
++    }
++
++    dialog.account .sub {
++      font-size: 0.9rem;
++      opacity: 0.8;
++      margin-bottom: 14px;
++    }
++
++    dialog.account label {
++      display: block;
++      font-size: 0.85rem;
++      margin-top: 10px;
++    }
++
++    dialog.account input {
++      width: 100%;
++      padding: 8px 10px;
++      border: 1px solid var(--secondary);
++      border-radius: 4px;
++      font: inherit;
++    }
++
++    dialog.account button {
++      font: inherit;
++      cursor: pointer;
++      border: none;
++      border-radius: 5px;
++      padding: 8px 16px;
++      background: var(--primary);
++      color: white;
++      margin-top: 14px;
++      margin-right: 8px;
++    }
++
++    dialog.account button.secondary {
++      background: var(--secondary);
++      color: var(--text);
++    }
++
++    dialog.account button.danger {
++      background: #b71c1c;
++    }
++
++    dialog.account button.small {
++      padding: 4px 10px;
++      margin: 0 0 0 6px;
++      font-size: 0.8rem;
++    }
++
++    dialog.account button:disabled {
++      opacity: 0.5;
++      cursor: wait;
++    }
++
++    dialog.account .close {
++      position: absolute;
++      top: 10px;
++      right: 10px;
++      margin: 0;
++      padding: 2px 10px;
++      background: transparent;
++      color: var(--text);
++      font-size: 1.4rem;
++    }
++
++    .passkey-list {
++      list-style: none;
++    }
++
++    .passkey-list li {
++      display: flex;
++      align-items: center;
++      justify-content: space-between;
++      gap: 8px;
++      padding: 10px 0;
++      border-bottom: 1px solid var(--secondary);
++      font-size: 0.9rem;
++    }
++
++    .passkey-list small {
++      display: block;
++      opacity: 0.7;
++    }
++
++    .msg {
++      margin-top: 12px;
++      padding: 8px 10px;
++      border-radius: 4px;
++      font-size: 0.85rem;
++      background: #fff3e0;
++    }
++
++    .msg.error {
++      background: #ffebee;
++      color: #b71c1c;
++    }
++
++    .msg:empty {
++      display: none;
++    }
+   </style>
+ </head>
+ 
+@@ -163,8 +287,8 @@
+       <li><a href="/menu">Menu</a></li>
+       <li><a href="/locations">Locations</a></li>
+       <li><a href="/rewards">Rewards</a></li>
+-      <li><a href="/account">My Account</a></li>
+-      <li><a href="/logout" class="logout-link">Logout</a></li>
++      <li><a href="/account" id="account-link">My Account</a></li>
++      <li><a href="/logout" class="logout-link" id="logout-link" hidden>Logout</a></li>
+     </ul>
+   </nav>
+ 
+@@ -207,6 +331,387 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <dialog class="account" id="account-dialog" aria-labelledby="account-title">
++    <button type="button" class="close" id="account-close" aria-label="Close">&times;</button>
++    <h2 id="account-title">My Account</h2>
++    <div id="account-view"></div>
++    <div class="msg" id="account-msg" role="status" aria-live="polite"></div>
++  </dialog>
++
++  <script>
++    (() => {
++      'use strict';
++
++      // Passkeys (WebAuthn) for My Account.
++      // This site is static, so there is no backend: accounts and public keys live in
++      // localStorage and assertions are verified in the browser. The flows mirror a real
++      // relying-party implementation, so verification can be moved server-side later.
++      const USERS_KEY = 'dg_users';
++      const SESSION_KEY = 'dg_session';
++      const REAUTH_WINDOW_MS = 5 * 60 * 1000;
++      const enc = new TextEncoder();
++
++      const $ = (id) => document.getElementById(id);
++      const dialog = $('account-dialog');
++      const view = $('account-view');
++      const msgEl = $('account-msg');
++
++      // ---------- helpers ----------
++      const b64u = {
++        enc: (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
++          .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''),
++        dec: (str) => {
++          const s = str.replace(/-/g, '+').replace(/_/g, '/');
++          const bin = atob(s + '='.repeat((4 - (s.length % 4)) % 4));
++          return Uint8Array.from(bin, (c) => c.charCodeAt(0));
++        },
++      };
++      const rand = (n = 32) => crypto.getRandomValues(new Uint8Array(n));
++      const esc = (t) => String(t).replace(/[&<>"']/g, (c) =>
++        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
++      const fmt = (ts) => ts ? new Date(ts).toLocaleString() : 'never';
++
++      const loadUsers = () => {
++        try { return JSON.parse(localStorage.getItem(USERS_KEY)) || {}; } catch { return {}; }
++      };
++      const saveUsers = (u) => localStorage.setItem(USERS_KEY, JSON.stringify(u));
++      const getSession = () => {
++        try { return JSON.parse(sessionStorage.getItem(SESSION_KEY)); } catch { return null; }
++      };
++      const setSession = (s) => s
++        ? sessionStorage.setItem(SESSION_KEY, JSON.stringify(s))
++        : sessionStorage.removeItem(SESSION_KEY);
++      const currentUser = () => {
++        const s = getSession();
++        return s ? loadUsers()[s.userId] || null : null;
++      };
++      const updateUser = (user) => {
++        const users = loadUsers();
++        users[user.id] = user;
++        saveUsers(users);
++      };
++
++      const supported = () => !!(window.PublicKeyCredential && navigator.credentials);
++
++      function message(text, isError) {
++        msgEl.textContent = text || '';
++        msgEl.classList.toggle('error', !!isError);
++      }
++
++      function describeError(e) {
++        if (e && e.name === 'NotAllowedError') return 'Passkey request was cancelled or timed out.';
++        if (e && e.name === 'InvalidStateError') return 'This device already has a passkey for this account.';
++        return (e && e.message) || 'Something went wrong.';
++      }
++
++      async function busy(btn, fn) {
++        if (btn) btn.disabled = true;
++        message('');
++        try { await fn(); } catch (e) { message(describeError(e), true); }
++        if (btn && btn.isConnected) btn.disabled = false;
++      }
++
++      // ---------- WebAuthn verification (client-side relying party) ----------
++      const concat = (...arrs) => {
++        const out = new Uint8Array(arrs.reduce((n, a) => n + a.length, 0));
++        let o = 0;
++        for (const a of arrs) { out.set(a, o); o += a.length; }
++        return out;
++      };
++
++      // ECDSA signatures from authenticators are DER; WebCrypto wants raw r||s.
++      function derToRaw(der, size = 32) {
++        let i = 2;
++        if (der[1] & 0x80) i += der[1] & 0x7f;
++        const readInt = () => {
++          const len = der[i + 1];
++          let int = der.slice(i + 2, i + 2 + len);
++          i += 2 + len;
++          while (int.length > size && int[0] === 0) int = int.slice(1);
++          const out = new Uint8Array(size);
++          out.set(int, size - int.length);
++          return out;
++        };
++        const r = readInt();
++        const sg = readInt();
++        return concat(r, sg);
++      }
++
++      async function verifyAssertion(cred, expectedChallenge, record, requireUV) {
++        const r = cred.response;
++        const clientData = JSON.parse(new TextDecoder().decode(r.clientDataJSON));
++        if (clientData.type !== 'webauthn.get') throw new Error('Unexpected response type.');
++        if (clientData.challenge !== b64u.enc(expectedChallenge)) throw new Error('Challenge mismatch.');
++        if (clientData.origin !== location.origin) throw new Error('Origin mismatch.');
++
++        const authData = new Uint8Array(r.authenticatorData);
++        const rpHash = new Uint8Array(await crypto.subtle.digest('SHA-256', enc.encode(location.hostname)));
++        if (b64u.enc(authData.slice(0, 32)) !== b64u.enc(rpHash)) throw new Error('Relying party mismatch.');
++        const flags = authData[32];
++        if (!(flags & 0x01)) throw new Error('User presence not confirmed.');
++        if (requireUV && !(flags & 0x04)) throw new Error('User verification required.');
++
++        const counter = new DataView(authData.buffer, authData.byteOffset).getUint32(33);
++        if (counter !== 0 && record.counter && counter <= record.counter) {
++          throw new Error('Signature counter regressed; credential may be cloned.');
++        }
++
++        const clientHash = new Uint8Array(await crypto.subtle.digest('SHA-256', r.clientDataJSON));
++        const signed = concat(authData, clientHash);
++        const spki = b64u.dec(record.publicKey);
++        const sig = new Uint8Array(r.signature);
++        let ok;
++        if (record.alg === -7) {
++          const key = await crypto.subtle.importKey('spki', spki, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
++          ok = await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, derToRaw(sig), signed);
++        } else if (record.alg === -257) {
++          const key = await crypto.subtle.importKey('spki', spki, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
++          ok = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key, sig, signed);
++        } else {
++          throw new Error('Unsupported passkey algorithm.');
++        }
++        if (!ok) throw new Error('Passkey signature could not be verified.');
++        return counter;
++      }
++
++      function deviceLabel() {
++        const ua = navigator.userAgent;
++        const os = /iPhone|iPad/.test(ua) ? 'iOS' : /Android/.test(ua) ? 'Android'
++          : /Mac/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows' : /Linux/.test(ua) ? 'Linux' : 'Device';
++        return `${os} passkey`;
++      }
++
++      async function createPasskey(user, existing) {
++        const cred = await navigator.credentials.create({
++          publicKey: {
++            challenge: rand(),
++            rp: { name: 'The Daily Grind', id: location.hostname },
++            user: { id: b64u.dec(user.id), name: user.email, displayName: user.name },
++            pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
++            authenticatorSelection: { residentKey: 'required', requireResidentKey: true, userVerification: 'preferred' },
++            excludeCredentials: existing.map((p) => ({ type: 'public-key', id: b64u.dec(p.id), transports: p.transports })),
++            attestation: 'none',
++            timeout: 60000,
++          },
++        });
++        const r = cred.response;
++        const alg = r.getPublicKeyAlgorithm && r.getPublicKeyAlgorithm();
++        const pub = r.getPublicKey && r.getPublicKey();
++        if (!pub || (alg !== -7 && alg !== -257)) throw new Error('This browser did not return a usable passkey.');
++        return {
++          id: cred.id,
++          publicKey: b64u.enc(pub),
++          alg,
++          transports: r.getTransports ? r.getTransports() : [],
++          label: deviceLabel(),
++          createdAt: Date.now(),
++          lastUsed: null,
++          counter: 0,
++        };
++      }
++
++      // Runs an assertion. `user` limits to that account's passkeys (reauth); otherwise discoverable sign-in.
++      async function authenticate(user, requireUV) {
++        const challenge = rand();
++        const cred = await navigator.credentials.get({
++          publicKey: {
++            challenge,
++            rpId: location.hostname,
++            allowCredentials: user
++              ? user.passkeys.map((p) => ({ type: 'public-key', id: b64u.dec(p.id), transports: p.transports }))
++              : [],
++            userVerification: requireUV ? 'required' : 'preferred',
++            timeout: 60000,
++          },
++        });
++        const users = loadUsers();
++        const owner = user || Object.values(users).find((u) => u.passkeys.some((p) => p.id === cred.id));
++        const record = owner && owner.passkeys.find((p) => p.id === cred.id);
++        if (!record) throw new Error('That passkey is not registered with The Daily Grind.');
++        record.counter = await verifyAssertion(cred, challenge, record, requireUV);
++        record.lastUsed = Date.now();
++        updateUser(owner);
++        return owner;
++      }
++
++      // ---------- reauthentication ----------
++      const isFresh = () => {
++        const s = getSession();
++        return !!s && Date.now() - s.authedAt < REAUTH_WINDOW_MS;
++      };
++
++      async function requireReauth() {
++        if (isFresh()) return;
++        const user = currentUser();
++        message('Confirm it\u2019s you with your passkey to continue.');
++        await authenticate(user, true);
++        setSession({ userId: user.id, authedAt: Date.now() });
++        message('');
++      }
++
++      // ---------- views ----------
++      function syncNav() {
++        $('logout-link').hidden = !currentUser();
++        $('account-link').textContent = currentUser() ? 'My Account' : 'Sign In';
++      }
++
++      function render() {
++        syncNav();
++        const user = currentUser();
++        if (!supported()) {
++          view.innerHTML = '<p class="sub">Passkeys are not supported in this browser.</p>';
++        } else if (user) {
++          renderAccount(user);
++        } else {
++          renderSignedOut();
++        }
++      }
++
++      function renderSignedOut() {
++        view.innerHTML = `
++          <p class="sub">Sign in with a passkey, or create an account. No password needed.</p>
++          <button type="button" id="signin-btn">Sign in with a passkey</button>
++          <h3>New here?</h3>
++          <form id="register-form">
++            <label>Full name <input name="name" required autocomplete="name"></label>
++            <label>Email <input name="email" type="email" required autocomplete="email"></label>
++            <button type="submit">Create account with a passkey</button>
++          </form>`;
++
++        $('signin-btn').onclick = (e) => busy(e.target, async () => {
++          const user = await authenticate(null, false);
++          setSession({ userId: user.id, authedAt: Date.now() });
++          render();
++          message(`Welcome back, ${user.name}!`);
++        });
++
++        $('register-form').onsubmit = (e) => {
++          e.preventDefault();
++          const f = new FormData(e.target);
++          const email = f.get('email').trim().toLowerCase();
++          const name = f.get('name').trim();
++          return busy(e.target.querySelector('button'), async () => {
++            if (Object.values(loadUsers()).some((u) => u.email === email)) {
++              throw new Error('An account with that email already exists. Sign in with your passkey instead.');
++            }
++            const user = { id: b64u.enc(rand(16)), name, email, passkeys: [], createdAt: Date.now() };
++            user.passkeys.push(await createPasskey(user, []));
++            updateUser(user);
++            setSession({ userId: user.id, authedAt: Date.now() });
++            render();
++            message('Account created. Your passkey is saved.');
++          });
++        };
++      }
++
++      function renderAccount(user) {
++        const only = user.passkeys.length === 1;
++        view.innerHTML = `
++          <p class="sub">Signed in as ${esc(user.email)}</p>
++
++          <h3>Profile</h3>
++          <form id="profile-form">
++            <label>Full name <input name="name" required value="${esc(user.name)}" autocomplete="name"></label>
++            <label>Email <input name="email" type="email" required value="${esc(user.email)}" autocomplete="email"></label>
++            <button type="submit">Save profile</button>
++          </form>
++
++          <h3>Saved passkeys</h3>
++          <ul class="passkey-list">
++            ${user.passkeys.map((p) => `
++              <li>
++                <span>${esc(p.label)}<small>Added ${fmt(p.createdAt)} · Last used ${fmt(p.lastUsed)}</small></span>
++                <span>
++                  <button type="button" class="small secondary" data-rename="${esc(p.id)}">Rename</button>
++                  <button type="button" class="small danger" data-delete="${esc(p.id)}" ${only ? 'disabled title="You need at least one passkey"' : ''}>Delete</button>
++                </span>
++              </li>`).join('')}
++          </ul>
++          <button type="button" id="add-passkey">Add a passkey</button>
++          <button type="button" class="secondary" id="signout-btn">Sign out</button>`;
++
++        $('profile-form').onsubmit = (e) => {
++          e.preventDefault();
++          const f = new FormData(e.target);
++          return busy(e.target.querySelector('button'), async () => {
++            const name = f.get('name').trim();
++            const email = f.get('email').trim().toLowerCase();
++            const emailChanged = email !== user.email;
++            if (emailChanged) {
++              if (Object.values(loadUsers()).some((u) => u.id !== user.id && u.email === email)) {
++                throw new Error('That email is already in use.');
++              }
++              await requireReauth(); // sign-in identifier changes are sensitive
++            }
++            const fresh = currentUser();
++            fresh.name = name;
++            fresh.email = email;
++            updateUser(fresh);
++            render();
++            message('Profile updated.');
++          });
++        };
++
++        $('add-passkey').onclick = (e) => busy(e.target, async () => {
++          await requireReauth();
++          const fresh = currentUser();
++          fresh.passkeys.push(await createPasskey(fresh, fresh.passkeys));
++          updateUser(fresh);
++          render();
++          message('Passkey added.');
++        });
++
++        $('signout-btn').onclick = signOut;
++
++        view.querySelectorAll('[data-rename]').forEach((b) => b.onclick = () => {
++          const fresh = currentUser();
++          const p = fresh.passkeys.find((x) => x.id === b.dataset.rename);
++          const label = prompt('Name this passkey', p.label);
++          if (label && label.trim()) {
++            p.label = label.trim().slice(0, 60);
++            updateUser(fresh);
++            render();
++            message('Passkey renamed.');
++          }
++        });
++
++        view.querySelectorAll('[data-delete]').forEach((b) => b.onclick = () => busy(b, async () => {
++          if (!confirm('Delete this passkey? You will no longer be able to sign in with it.')) return;
++          await requireReauth();
++          const fresh = currentUser();
++          if (fresh.passkeys.length < 2) throw new Error('You need at least one passkey.');
++          fresh.passkeys = fresh.passkeys.filter((x) => x.id !== b.dataset.delete);
++          updateUser(fresh);
++          render();
++          message('Passkey deleted. Remove it from your device\u2019s passkey manager too if you like.');
++        }));
++      }
++
++      function signOut() {
++        setSession(null);
++        render();
++        message('You have been signed out.');
++      }
++
++      // ---------- wiring ----------
++      $('account-link').addEventListener('click', (e) => {
++        e.preventDefault();
++        message('');
++        render();
++        dialog.showModal();
++      });
++      $('logout-link').addEventListener('click', (e) => {
++        e.preventDefault();
++        setSession(null);
++        syncNav();
++      });
++      $('account-close').addEventListener('click', () => dialog.close());
++      dialog.addEventListener('click', (e) => { if (e.target === dialog) dialog.close(); });
++
++      syncNav();
++    })();
++  </script>
++
+ </body>
+ 
+ </html>

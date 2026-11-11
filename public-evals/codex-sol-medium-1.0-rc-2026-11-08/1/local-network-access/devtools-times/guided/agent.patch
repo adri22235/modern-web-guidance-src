@@ -1,0 +1,296 @@
+diff --git a/README.md b/README.md
+index 4479b53..2c2ba8e 100644
+--- a/README.md
++++ b/README.md
+@@ -2,6 +2,31 @@
+ 
+ This project is a sample news application built with Astro, designed to serve as a testing ground for new features in Chrome DevTools.
+ 
++## Developer diagnostics
++
++The homepage includes independent browser-to-device and browser-to-CLI status checks.
++No connection request is made until the reader submits the corresponding form. Defaults
++are `http://192.168.1.100:8080/api/status` and `http://127.0.0.1:45678/health`;
++readers can edit the full URL, including port and path. These are example endpoints,
++not services bundled with this application.
++
++Serve the page over HTTPS. Each endpoint must support a read-only GET, return a 2xx
++status with an optional text/JSON body, and include `Access-Control-Allow-Origin`
++for the deployed page's origin (scheme, host, and port, without the `/devtools-times/`
++path). Requests omit cookies and authentication; redirects are rejected. Local
++network and loopback browser permissions are checked separately, with a
++user-initiated fallback when permission queries are unsupported. Browser support
++for HTTP local connections varies; use a current Chromium browser or an endpoint
++with trusted HTTPS if blocked. No application-server proxy is involved.
++
++LAN URLs accept private/link-local IPv4 addresses or `.local` names. CLI URLs accept
++the 127/8 range, `localhost`/`.localhost`, or `[::1]`. Each request has a 10-second
++timeout and a 4,096-character response preview. A successful status check is a snapshot, not
++a persistent telemetry session. Permission changes are observed while mounted.
++
++Run the address-space and request-policy tests with `node --test tests/diagnostics.test.mjs`
++(Node with TypeScript stripping support), and compile with `pnpm build`.
++
+ 
+ ```sh
+ pnpm install && pnpm run start
+diff --git a/src/components/DiagnosticsWidget.tsx b/src/components/DiagnosticsWidget.tsx
+new file mode 100644
+index 0000000..71c22e2
+--- /dev/null
++++ b/src/components/DiagnosticsWidget.tsx
+@@ -0,0 +1,150 @@
++import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
++import { diagnosticEndpoint, diagnosticRequestOptions, type AddressSpace } from '../lib/diagnostics';
++
++function ConnectionPanel({ space }: { space: AddressSpace }) {
++  const isDevice = space === 'local';
++  const title = isDevice ? 'Hardware test device' : 'Companion CLI';
++  const permissionName = isDevice ? 'local-network' : 'loopback-network';
++  const id = useId();
++  const [endpoint, setEndpoint] = useState(isDevice ? 'http://192.168.1.100:8080/api/status' : 'http://127.0.0.1:45678/health');
++  const [permission, setPermission] = useState<PermissionState | 'unknown'>('unknown');
++  const [ready, setReady] = useState(false);
++  const [secure, setSecure] = useState(true);
++  const [busy, setBusy] = useState(false);
++  const [invalid, setInvalid] = useState(false);
++  const [message, setMessage] = useState('Not connected.');
++  const [result, setResult] = useState('');
++  const controller = useRef<AbortController | null>(null);
++
++  useEffect(() => {
++    let disposed = false;
++    let status: PermissionStatus | undefined;
++    const update = () => { if (!disposed && status) setPermission(status.state); };
++    setSecure(window.isSecureContext);
++    setReady(true);
++    async function observePermission() {
++      try {
++        status = await navigator.permissions.query({ name: permissionName as PermissionName });
++        if (disposed) return;
++        update();
++        status.addEventListener('change', update);
++      } catch {
++        // Unsupported granular permissions still allow a user-initiated attempt.
++      }
++    }
++    void observePermission();
++    return () => {
++      disposed = true;
++      status?.removeEventListener('change', update);
++      const activeRequest = controller.current;
++      controller.current = null;
++      activeRequest?.abort();
++    };
++  }, [permissionName]);
++
++  async function connect(event: FormEvent<HTMLFormElement>) {
++    event.preventDefault();
++    if (busy) return;
++    const input = event.currentTarget.elements.namedItem('endpoint') as HTMLInputElement;
++    let url: URL;
++    try {
++      url = diagnosticEndpoint(endpoint, space);
++    } catch (error) {
++      setInvalid(true);
++      setMessage(error instanceof Error ? error.message : 'Enter a valid endpoint URL.');
++      setResult('');
++      input.focus();
++      return;
++    }
++    if (!window.isSecureContext || permission === 'denied') return;
++    const requestController = new AbortController();
++    controller.current = requestController;
++    setBusy(true);
++    setInvalid(false);
++    setResult('');
++    setMessage('Connecting… Allow the browser permission prompt if shown.');
++    const timeout = window.setTimeout(() => requestController.abort('timeout'), 10000);
++    try {
++      const start = performance.now();
++      const response = await fetch(url, diagnosticRequestOptions(space, requestController.signal));
++      if (!response.ok) throw new Error(`Endpoint returned HTTP ${response.status}. Check the URL and service logs.`);
++      // Limit the preview without buffering an unbounded device response.
++      const reader = response.body?.getReader();
++      const decoder = new TextDecoder();
++      let preview = '';
++      if (reader) {
++        try {
++          while (preview.length <= 4096) {
++            const { done, value } = await reader.read();
++            if (done) break;
++            preview += decoder.decode(value, { stream: true });
++          }
++          preview += decoder.decode();
++        } finally {
++          await reader.cancel();
++        }
++      }
++      if (controller.current !== requestController) return;
++      setResult(preview.length > 4096 ? `${preview.slice(0, 4096)}\n…preview truncated` : preview || '(Empty response body)');
++      setMessage(`Connected · HTTP ${response.status} · ${Math.round(performance.now() - start)} ms. Status checked at ${new Date().toLocaleTimeString()}.`);
++    } catch (error) {
++      if (controller.current !== requestController) return;
++      setMessage(requestController.signal.aborted
++        ? 'Connection timed out after 10 seconds. Check the endpoint and try again.'
++        : error instanceof TypeError
++          ? `Could not connect. ${isDevice ? 'Check device power and the same Wi-Fi network.' : 'Start the companion CLI and check its port.'} Check browser site permissions, endpoint CORS, and browser support for local connections.`
++          : error instanceof Error ? error.message : 'Connection failed. Check the endpoint and try again.');
++    } finally {
++      window.clearTimeout(timeout);
++      if (controller.current === requestController) {
++        controller.current = null;
++        setBusy(false);
++      }
++    }
++  }
++
++  return (
++    <form onSubmit={connect} aria-labelledby={`${id}-title`} className="rounded border border-gray-300 bg-white p-5">
++      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
++        <h3 id={`${id}-title`} className="font-semibold text-gray-900">{title}</h3>
++        <span className="rounded bg-gray-100 px-2 py-1 text-xs font-medium text-gray-700">{isDevice ? 'Private Wi-Fi LAN' : 'This machine'}</span>
++      </div>
++      <p id={`${id}-help`} className="mb-4 text-sm text-gray-600">
++        {isDevice ? 'Read diagnostics from a test device on your Wi-Fi network.' : 'Read diagnostics from the companion service running on your computer.'}
++        {' '}Connect requests {isDevice ? 'Local network' : 'Loopback network'} access if needed.
++      </p>
++      <label htmlFor={`${id}-url`} className="mb-1 block text-sm font-medium">Status endpoint (required)</label>
++      <input id={`${id}-url`} name="endpoint" type="url" required value={endpoint}
++        onChange={event => { setEndpoint(event.target.value); setInvalid(false); setResult(''); setMessage('Not connected.'); }}
++        disabled={busy} autoComplete="off" autoCapitalize="none" autoCorrect="off" spellCheck={false}
++        aria-invalid={invalid} aria-describedby={`${id}-help ${id}-status`}
++        className="min-h-12 w-full rounded border border-gray-500 px-3 py-2 text-base focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-700 disabled:bg-gray-100" />
++      <p className="mt-2 text-xs text-gray-600">Permission: {permission === 'unknown' ? 'browser will check on connect' : permission === 'prompt' ? 'ask on connect' : permission}</p>
++      {!secure && <p className="mt-3 text-sm text-red-800">Open this page over HTTPS to connect to local endpoints.</p>}
++      {permission === 'denied' && <p className="mt-3 text-sm text-red-800">Access is blocked. Open browser site settings, allow {isDevice ? 'Local network' : 'Loopback network'} access, then try again. Reload if needed.</p>}
++      <button type="submit" disabled={!ready || !secure || busy || permission === 'denied'}
++        className="mt-4 min-h-12 rounded bg-gray-900 px-4 py-2 text-sm font-semibold text-white hover:bg-gray-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-700 disabled:cursor-not-allowed disabled:opacity-60">
++        {busy ? 'Connecting…' : isDevice ? 'Connect to device' : 'Connect to CLI'}
++      </button>
++      <p id={`${id}-status`} role="status" aria-atomic="true" className="mt-3 text-sm text-gray-700">{message}</p>
++      {result && <details className="mt-3 text-sm"><summary className="cursor-pointer py-2 font-medium">Response preview</summary><pre className="max-h-52 overflow-auto whitespace-pre-wrap break-all rounded bg-gray-100 p-3 text-xs">{result}</pre></details>}
++    </form>
++  );
++}
++
++export default function DiagnosticsWidget() {
++  return (
++    <section aria-labelledby="diagnostics-title" className="mx-4 my-6 border-y-2 border-gray-900 bg-gray-50 px-4 py-6 sm:mx-6 sm:px-6">
++      <p className="mb-1 text-xs font-semibold uppercase tracking-widest text-gray-600">Developer tools</p>
++      <h2 id="diagnostics-title" className="font-brand text-3xl text-gray-900">Developer diagnostics</h2>
++      <p className="mt-2 max-w-3xl text-sm text-gray-700">Connect your test bench to The DevTools Times. Each button makes a status request directly from your browser to the endpoint you choose.</p>
++      <div className="mt-5 grid gap-4 lg:grid-cols-2"><ConnectionPanel space="local" /><ConnectionPanel space="loopback" /></div>
++      <details className="mt-4 text-sm text-gray-700">
++        <summary className="cursor-pointer py-2 font-semibold">Connection requirements & troubleshooting</summary>
++        <p className="mt-2">Use HTTPS for this page and a browser supporting local network connections. If your browser blocks an HTTP endpoint, try a trusted HTTPS endpoint or a current Chromium browser. The device must be on your network; the CLI must be running on this computer.</p>
++        <p className="mt-2">The endpoint must accept GET and return a successful HTTP status. Configure its CORS response header Access-Control-Allow-Origin to allow this page’s origin. Browser permission and CORS are both required. Requests omit credentials and stop after 10 seconds. A successful check is a snapshot; click Connect again to refresh.</p>
++      </details>
++      <noscript><p className="mt-3">Enable JavaScript to connect to your device or CLI.</p></noscript>
++    </section>
++  );
++}
+diff --git a/src/lib/diagnostics.ts b/src/lib/diagnostics.ts
+new file mode 100644
+index 0000000..6391c03
+--- /dev/null
++++ b/src/lib/diagnostics.ts
+@@ -0,0 +1,29 @@
++export type AddressSpace = 'local' | 'loopback';
++
++export function diagnosticEndpoint(value: string, space: AddressSpace): URL {
++  const url = new URL(value);
++  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) {
++    throw new Error('Use an HTTP or HTTPS URL without credentials or a fragment.');
++  }
++  const host = url.hostname.toLowerCase();
++  const octets = host.split('.').map(Number);
++  const ipv4 = octets.length === 4 && octets.every(n => Number.isInteger(n) && n >= 0 && n <= 255);
++  const loopback = host === 'localhost' || host.endsWith('.localhost') || host === '[::1]' || (ipv4 && octets[0] === 127);
++  const local = (ipv4 && (octets[0] === 10 ||
++    (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
++    (octets[0] === 192 && octets[1] === 168) ||
++    (octets[0] === 169 && octets[1] === 254))) || host.endsWith('.local');
++  if (space === 'loopback' ? !loopback : !local) {
++    throw new Error(space === 'loopback'
++      ? 'Use a loopback address such as http://127.0.0.1:45678/health or localhost.'
++      : 'Use a private IPv4 address such as http://192.168.1.100:8080/api/status or a .local hostname.');
++  }
++  return url;
++}
++
++export function diagnosticRequestOptions(space: AddressSpace, signal: AbortSignal): RequestInit & { targetAddressSpace: AddressSpace } {
++  return {
++    method: 'GET', mode: 'cors', credentials: 'omit', cache: 'no-store',
++    redirect: 'error', referrerPolicy: 'no-referrer', targetAddressSpace: space, signal,
++  };
++}
+diff --git a/src/pages/index.astro b/src/pages/index.astro
+index 92f6399..46ca2fb 100644
+--- a/src/pages/index.astro
++++ b/src/pages/index.astro
+@@ -1,5 +1,6 @@
+ ---
+ import Layout from '../layouts/Layout.astro';
++import DiagnosticsWidget from '../components/DiagnosticsWidget';
+ import ArticleTeaser from '../components/ArticleTeaser.astro';
+ import TopStoryTeaserGrid from '../components/TopStoryTeaserGrid.astro';
+ import Ad from '../components/AdSlotBanner';
+@@ -55,6 +56,7 @@ politicsArticles[2] = {
+     </div>
+ 
+     <!-- Main Content Area -->
++    <DiagnosticsWidget client:load />
+     <main class="max-w-6xl mx-auto px-4 sm:px-6 lg:px-6 mt-6">
+         <ArticleTeaser article={topArticle} large={true} />
+     </main>
+@@ -81,4 +83,4 @@ politicsArticles[2] = {
+         <TopStoryTeaserGrid title="Politics" articles={politicsArticles} />
+         
+     </div>
+-</Layout>
+\ No newline at end of file
++</Layout>
+diff --git a/tests/diagnostics.test.mjs b/tests/diagnostics.test.mjs
+new file mode 100644
+index 0000000..2152dd2
+--- /dev/null
++++ b/tests/diagnostics.test.mjs
+@@ -0,0 +1,37 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++import { diagnosticEndpoint, diagnosticRequestOptions } from '../src/lib/diagnostics.ts';
++
++test('LAN endpoints stay in private IPv4 and mDNS address spaces', () => {
++  for (const host of ['192.168.1.100', '10.0.0.1', '172.16.0.1', '172.31.255.254', '169.254.1.1', 'bench.local']) {
++    assert.equal(diagnosticEndpoint(`http://${host}:8080/api/status`, 'local').hostname, host);
++  }
++  for (const host of ['127.0.0.1', 'localhost', '[::1]', '172.15.0.1', '172.32.0.1', '192.169.1.1', '8.8.8.8', 'example.com']) {
++    assert.throws(() => diagnosticEndpoint(`http://${host}/status`, 'local'));
++  }
++});
++
++test('CLI endpoints stay on the reader’s own machine', () => {
++  for (const host of ['127.0.0.1', '127.1.2.3', 'localhost', 'cli.localhost', '[::1]']) {
++    assert.equal(diagnosticEndpoint(`http://${host}:45678/health`, 'loopback').hostname, host);
++  }
++  for (const host of ['192.168.1.100', 'bench.local', 'example.com']) {
++    assert.throws(() => diagnosticEndpoint(`http://${host}/health`, 'loopback'));
++  }
++});
++
++test('rejects unsupported schemes, credentials, fragments and malformed URLs', () => {
++  for (const value of ['not a URL', 'ftp://127.0.0.1/health', 'http://user:secret@127.0.0.1/health', 'http://127.0.0.1/health#part']) {
++    assert.throws(() => diagnosticEndpoint(value, 'loopback'));
++  }
++});
++
++test('requests declare distinct address spaces and omit credentials and redirects', () => {
++  const signal = new AbortController().signal;
++  for (const space of ['local', 'loopback']) {
++    assert.deepEqual(diagnosticRequestOptions(space, signal), {
++      method: 'GET', mode: 'cors', credentials: 'omit', cache: 'no-store',
++      redirect: 'error', referrerPolicy: 'no-referrer', targetAddressSpace: space, signal,
++    });
++  }
++});

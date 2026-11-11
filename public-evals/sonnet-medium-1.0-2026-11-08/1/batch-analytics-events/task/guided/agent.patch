@@ -1,0 +1,113 @@
+diff --git a/analytics.js b/analytics.js
+new file mode 100644
+--- a/analytics.js
++++ b/analytics.js
+@@ -0,0 +1,108 @@
++// Minimal analytics: records page views and clicks, debounced and batched
++// into a single deferred request via fetchLater().
++
++// Polyfill for browsers without fetchLater(): sends when the page is hidden.
++globalThis.fetchLater ??= function fetchLater(url, init = {}) {
++  let timeoutHandle;
++  let activated = false;
++
++  function sendNow() {
++    if (!(init.signal && init.signal.aborted)) {
++      if (
++        'keepalive' in Request.prototype ||
++        init.method !== 'POST' ||
++        init.headers
++      ) {
++        fetch(url, Object.assign({}, init, {keepalive: true}));
++        activated = true;
++      } else {
++        activated = navigator.sendBeacon(url, init.body);
++      }
++    }
++    destroy();
++  }
++
++  function destroy() {
++    document.removeEventListener('visibilitychange', sendNow);
++    clearTimeout(timeoutHandle);
++  }
++
++  if (document.visibilityState === 'hidden') {
++    queueMicrotask(sendNow);
++  } else {
++    document.addEventListener('visibilitychange', sendNow);
++    if (typeof init.activateAfter === 'number' && init.activateAfter >= 0) {
++      timeoutHandle = setTimeout(sendNow, init.activateAfter);
++    }
++  }
++
++  if (init.signal) {
++    init.signal.addEventListener('abort', destroy);
++  }
++
++  return {
++    get activated() {
++      return activated;
++    },
++  };
++};
++
++const ANALYTICS_ENDPOINT = '/api/analytics';
++// All events within this window are coalesced into one request.
++const BATCH_WINDOW = 10 * 1000;
++// Keep the payload well under the fetchLater() quota (~64KB per origin).
++const MAX_QUEUE_SIZE = 100;
++
++const eventQueue = [];
++let fetchLaterResult;
++let fetchLaterController;
++
++function serializeElement(el) {
++  if (!(el instanceof Element)) return '';
++  const target = el.closest('a, button, [id]') || el;
++  let selector = target.tagName.toLowerCase();
++  if (target.id) selector += `#${target.id}`;
++  else if (target.classList.length) selector += `.${[...target.classList].join('.')}`;
++  return {
++    selector,
++    text: (target.textContent || '').trim().slice(0, 50),
++    href: target.getAttribute('href') || undefined,
++  };
++}
++
++function trackEvent(eventData) {
++  // Previous batch already sent, or queue full: start a new batch.
++  if (fetchLaterResult?.activated || eventQueue.length >= MAX_QUEUE_SIZE) {
++    fetchLaterController = null;
++    fetchLaterResult = null;
++    eventQueue.length = 0;
++  }
++
++  eventQueue.push({...eventData, time: Date.now(), path: location.pathname});
++
++  // Replace the pending request with one carrying the full queue.
++  fetchLaterController?.abort();
++  fetchLaterController = new AbortController();
++
++  try {
++    fetchLaterResult = fetchLater(ANALYTICS_ENDPOINT, {
++      method: 'POST',
++      headers: {'content-type': 'application/json'},
++      body: JSON.stringify(eventQueue),
++      signal: fetchLaterController.signal,
++      activateAfter: BATCH_WINDOW,
++    });
++  } catch {
++    // Quota exceeded or unsupported; analytics are best-effort.
++  }
++}
++
++if (document.readyState === 'complete') {
++  trackEvent({type: 'page_view'});
++} else {
++  window.addEventListener('load', () => trackEvent({type: 'page_view'}));
++}
++
++window.addEventListener('click', (event) => {
++  trackEvent({type: 'click', target: serializeElement(event.target)});
++});

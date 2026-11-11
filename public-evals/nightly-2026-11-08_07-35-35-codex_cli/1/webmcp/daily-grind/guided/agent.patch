@@ -1,0 +1,252 @@
+diff --git a/browser-tools.js b/browser-tools.js
+new file mode 100644
+index 0000000..408689b
+--- /dev/null
++++ b/browser-tools.js
+@@ -0,0 +1,143 @@
++(() => {
++  // Read the same menu visitors see, so tool results and cards stay in sync.
++  const cards = [...document.querySelectorAll('[data-drink-id]')];
++  const menu = cards.map((card) => ({
++    id: card.dataset.drinkId,
++    name: card.querySelector('h3').textContent.trim(),
++    description: card.querySelector('p').textContent.trim(),
++    detailsUrl: card.querySelector('a').getAttribute('href'),
++  }));
++  const form = document.querySelector('#order-form');
++  const drinkSelect = document.querySelector('#order-drink');
++  const quantityInput = document.querySelector('#order-quantity');
++  const status = document.querySelector('#order-status');
++
++  for (const drink of menu) {
++    const option = document.createElement('option');
++    option.value = drink.id;
++    option.textContent = drink.name;
++    drinkSelect.append(option);
++  }
++
++  const drinkIds = menu.map((drink) => drink.id);
++  const drinkProperty = {
++    type: 'string', enum: drinkIds,
++    description: 'The seasonal drink to select.',
++  };
++  const invalidInput = (message) => ({ ok: false, error: message });
++  const isObject = (input) => input !== null && typeof input === 'object' && !Array.isArray(input);
++  const hasOnlyKeys = (input, keys) => isObject(input) && Object.keys(input).every((key) => keys.includes(key));
++
++  function highlightDrink(drinkId) {
++    for (const card of cards) {
++      card.dataset.selected = String(card.dataset.drinkId === drinkId);
++    }
++    drinkSelect.value = drinkId;
++  }
++
++  function selectDrink(input) {
++    if (!hasOnlyKeys(input, ['drinkId']) || !drinkIds.includes(input.drinkId)) {
++      return { ...invalidInput('Choose a drink from the seasonal menu.'), availableDrinkIds: drinkIds };
++    }
++    const drink = menu.find((item) => item.id === input.drinkId);
++    highlightDrink(drink.id);
++    status.textContent = `${drink.name} selected. Choose a quantity and place your demo order.`;
++    return { ok: true, selectedDrink: { ...drink } };
++  }
++
++  function orderDrink(input) {
++    if (!hasOnlyKeys(input, ['drinkId', 'quantity']) || !drinkIds.includes(input.drinkId)) {
++      return { ...invalidInput('Choose a drink from the seasonal menu.'), availableDrinkIds: drinkIds };
++    }
++    const quantity = input.quantity === undefined ? 1 : input.quantity;
++    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 10) {
++      return invalidInput('Quantity must be a whole number between 1 and 10.');
++    }
++    const drink = menu.find((item) => item.id === input.drinkId);
++    highlightDrink(drink.id);
++    quantityInput.value = String(quantity);
++    status.textContent = `Demo order ready: ${quantity} × ${drink.name}. No payment taken or order sent.`;
++    return { ok: true, order: { drinkId: drink.id, drinkName: drink.name, quantity, status: 'demo' } };
++  }
++
++  // Human controls and agents use the same validated actions.
++  form.addEventListener('submit', (event) => {
++    event.preventDefault();
++    const result = orderDrink({ drinkId: drinkSelect.value, quantity: quantityInput.valueAsNumber });
++    if (!result.ok) status.textContent = result.error;
++  });
++  drinkSelect.addEventListener('change', () => selectDrink({ drinkId: drinkSelect.value }));
++  for (const button of document.querySelectorAll('[data-order-drink]')) {
++    button.addEventListener('click', () => {
++      selectDrink({ drinkId: button.dataset.orderDrink });
++      form.scrollIntoView({ block: 'center' });
++      drinkSelect.focus({ preventScroll: true });
++    });
++  }
++
++  const tools = [
++    {
++      name: 'get_seasonal_menu',
++      description: 'Query the Daily Grind Seasonal Favorites menu to find drinks and their descriptions.',
++      inputSchema: {
++        type: 'object', additionalProperties: false,
++        properties: { query: { type: 'string', maxLength: 200, default: '', description: 'Words to match in a drink name or description.' } },
++      },
++      execute(input = {}) {
++        if (!hasOnlyKeys(input, ['query'])) return invalidInput('Provide an object with an optional query.');
++        const query = input.query === undefined ? '' : input.query;
++        if (typeof query !== 'string' || query.length > 200) return invalidInput('Query must be text of at most 200 characters.');
++        const matches = menu.filter((drink) => `${drink.name} ${drink.description}`.toLowerCase().includes(query.trim().toLowerCase()));
++        return { ok: true, category: 'Seasonal Favorites', drinks: matches.map((drink) => ({ ...drink })) };
++      },
++      annotations: { readOnlyHint: true },
++    },
++    {
++      name: 'select_drink',
++      description: 'Highlight a seasonal drink on the page and select it in the order form.',
++      inputSchema: {
++        type: 'object', additionalProperties: false,
++        properties: { drinkId: drinkProperty }, required: ['drinkId'],
++      },
++      execute: selectDrink,
++      annotations: { readOnlyHint: false },
++    },
++    {
++      name: 'order_drink',
++      description: 'Create a demo drink order and display its summary on the homepage. Replaces the previous demo order; no payment or café submission occurs.',
++      inputSchema: {
++        type: 'object', additionalProperties: false,
++        properties: {
++          drinkId: drinkProperty,
++          quantity: { type: 'integer', minimum: 1, maximum: 10, default: 1, description: 'Number of drinks to prepare in the demo order.' },
++        },
++        required: ['drinkId'],
++      },
++      execute: orderDrink,
++      annotations: { readOnlyHint: false, consequentialHint: false },
++    },
++  ];
++
++  // Unsupported browsers retain all ordinary controls. Never overwrite a native API.
++  let registration;
++  async function registerTools() {
++    if (!document.modelContext?.registerTool || registration) return;
++    const controller = new AbortController();
++    registration = controller;
++    try {
++      for (const tool of tools) {
++        await document.modelContext.registerTool(tool, { signal: controller.signal });
++      }
++    } catch (error) {
++      controller.abort();
++      if (registration === controller) registration = undefined;
++      console.warn('Daily Grind browser tools could not be registered.', error);
++    }
++  }
++  window.addEventListener('pagehide', () => {
++    registration?.abort();
++    registration = undefined;
++  });
++  window.addEventListener('pageshow', () => { void registerTools(); });
++  void registerTools();
++})();
+diff --git a/index.html b/index.html
+index 66c9173..7b3b121 100644
+--- a/index.html
++++ b/index.html
+@@ -129,12 +129,42 @@
+       border-radius: 5px;
+       margin-top: 15px;
+       transition: background 0.3s;
++      border: 0;
++      font: inherit;
++      cursor: pointer;
+     }
+ 
+     .btn:hover {
+       background: #3e2723;
+     }
+ 
++    .card[data-selected="true"] {
++      outline: 3px solid var(--primary);
++      outline-offset: 3px;
++    }
++
++    #drink-order {
++      margin-top: 32px;
++      padding: 24px;
++      background: var(--secondary);
++      border-radius: 8px;
++      scroll-margin-top: 90px;
++    }
++
++    #order-form {
++      display: flex;
++      flex-wrap: wrap;
++      align-items: end;
++      gap: 16px;
++      margin: 16px 0;
++    }
++
++    #order-form label { display: grid; gap: 4px; }
++    #order-form select, #order-form input { font: inherit; padding: 8px; max-width: 100%; }
++    #order-form .btn { margin-top: 0; }
++    #order-status { min-height: 1.6em; }
++    :focus-visible { outline: 3px solid #a35c00; outline-offset: 4px; }
++
+     footer {
+       background: var(--secondary);
+       text-align: center;
+@@ -171,30 +201,43 @@
+   <header class="hero">
+     <h1>Wake Up Your Senses</h1>
+     <p>Ethically sourced, locally roasted, delivered to your cup.</p>
+-    <a href="/order-online" class="btn">Order Now</a>
++    <a href="#drink-order" class="btn">Order Now</a>
+   </header>
+ 
+   <main class="container">
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+       <div class="grid">
+-        <div class="card">
++        <div class="card" data-drink-id="maple-oat-latte">
+           <h3>Maple Oat Latte</h3>
+           <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+           <a href="/menu/seasonal" class="btn">View Details</a>
++          <button type="button" class="btn" data-order-drink="maple-oat-latte">Choose drink</button>
+         </div>
+-        <div class="card">
++        <div class="card" data-drink-id="dark-roast-espresso">
+           <h3>Dark Roast Espresso</h3>
+           <p>Bold, smokey, and perfect for a morning boost.</p>
+           <a href="/menu/espresso" class="btn">View Details</a>
++          <button type="button" class="btn" data-order-drink="dark-roast-espresso">Choose drink</button>
+         </div>
+-        <div class="card">
++        <div class="card" data-drink-id="cold-brew">
+           <h3>Cold Brew</h3>
+           <p>Steeped for 18 hours for maximum smoothness.</p>
+           <a href="/menu/cold-brew" class="btn">View Details</a>
++          <button type="button" class="btn" data-order-drink="cold-brew">Choose drink</button>
+         </div>
+       </div>
+     </section>
++    <section id="drink-order" aria-labelledby="order-heading">
++      <h2 id="order-heading">Your coffee order</h2>
++      <p>Try a demo order on this page. No payment is taken or order sent to a café.</p>
++      <form id="order-form">
++        <label>Drink<select id="order-drink" name="drinkId" required></select></label>
++        <label>Quantity<input id="order-quantity" name="quantity" type="number" min="1" max="10" step="1" value="1" required></label>
++        <button class="btn" type="submit">Place demo order</button>
++      </form>
++      <p id="order-status" role="status" aria-live="polite" aria-atomic="true">Choose a seasonal favorite to get started.</p>
++    </section>
+   </main>
+ 
+   <footer>
+@@ -207,6 +250,7 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script src="./browser-tools.js" defer></script>
+ </body>
+ 
+ </html>

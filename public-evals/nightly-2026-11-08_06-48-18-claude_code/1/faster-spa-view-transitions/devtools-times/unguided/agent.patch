@@ -1,0 +1,273 @@
+diff --git a/src/layouts/Layout.astro b/src/layouts/Layout.astro
+index dcf9696..232506e 100644
+--- a/src/layouts/Layout.astro
++++ b/src/layouts/Layout.astro
+@@ -8,9 +8,15 @@ import { ClientRouter } from "astro:transitions";
+ 
+ export interface Props {
+   title: string;
++  /**
++   * Keep this page's DOM alive after navigating away so returning to it is
++   * instant (see src/scripts/view-cache.ts). Disable for pages holding
++   * sensitive or must-be-fresh state.
++   */
++  viewCache?: boolean;
+ }
+ 
+-const { title } = Astro.props;
++const { title, viewCache = true } = Astro.props;
+ const baseUrl = import.meta.env.BASE_URL;
+ ---
+ 
+@@ -45,11 +51,16 @@ const baseUrl = import.meta.env.BASE_URL;
+         <div>
+           <Header />
+         </div>
+-        <main class="bg-white relative">
++        <main class="bg-white relative" data-view-root data-view-cache={viewCache ? undefined : "off"}>
+           <slot />
+         </main>
+       </div>
+     </div>
+     <Footer />
++    <!-- Parked views of previously visited pages; persisted across navigations. -->
++    <div id="view-cache" hidden inert aria-hidden="true" transition:persist="view-cache"></div>
++    <script>
++      import "../scripts/view-cache.ts";
++    </script>
+   </body>
+ </html>
+diff --git a/src/pages/signin.astro b/src/pages/signin.astro
+index 6844450..81e4381 100644
+--- a/src/pages/signin.astro
++++ b/src/pages/signin.astro
+@@ -3,7 +3,7 @@ import Layout from '../layouts/Layout.astro';
+ import SignInForm from '../components/SignInForm';
+ ---
+ 
+-<Layout title="Sign In | The DevTools Times">
++<Layout title="Sign In | The DevTools Times" viewCache={false}>
+   <div class="py-12 px-4 sm:px-6 lg:px-8">
+     <SignInForm client:load />
+   </div>
+diff --git a/src/pages/signup.astro b/src/pages/signup.astro
+index dc93e5d..e18db8a 100644
+--- a/src/pages/signup.astro
++++ b/src/pages/signup.astro
+@@ -3,7 +3,7 @@ import Layout from '../layouts/Layout.astro';
+ import SignUpForm from '../components/SignUpForm';
+ ---
+ 
+-<Layout title="Sign Up | The DevTools Times">
++<Layout title="Sign Up | The DevTools Times" viewCache={false}>
+   <div class="py-12 px-4 sm:px-6 lg:px-8">
+     <SignUpForm client:load />
+   </div>
+diff --git a/src/scripts/view-cache.ts b/src/scripts/view-cache.ts
+new file mode 100644
+index 0000000..c88bbd5
+--- /dev/null
++++ b/src/scripts/view-cache.ts
+@@ -0,0 +1,202 @@
++/**
++ * View cache for Astro's <ClientRouter />.
++ *
++ * By default every client-side navigation fetches the next page, parses it and
++ * replaces the whole <body>, throwing away the DOM (and the hydrated islands)
++ * of the page being left. Going back means fetching, parsing, re-rendering and
++ * re-hydrating everything again.
++ *
++ * This module keeps the live `<main data-view-root>` element of pages you
++ * leave inside a hidden, `transition:persist`-ed container. When you navigate
++ * back to such a page, the network request is skipped entirely and the
++ * preserved element is moved back into place, together with its scroll
++ * containers, form values, <details> state and hydrated island state.
++ *
++ * - Back/forward (history traversal) always reuses a cached view.
++ * - Link clicks / programmatic navigation reuse a cached view only if it is
++ *   younger than PUSH_MAX_AGE_MS, so regular navigation stays reasonably fresh.
++ * - Form submissions and reloads of the current URL always hit the network.
++ * - Pages can opt out with `data-view-cache="off"` on their view root.
++ */
++import { swapFunctions } from "astro:transitions/client";
++import type {
++  TransitionBeforePreparationEvent,
++  TransitionBeforeSwapEvent,
++} from "astro:transitions/client";
++
++const ROOT_SELECTOR = "main[data-view-root]";
++const CONTAINER_ID = "view-cache";
++const MAX_ENTRIES = 8;
++const PUSH_MAX_AGE_MS = 5 * 60 * 1000;
++
++interface CachedView {
++  root: HTMLElement;
++  /** Pristine <head> of the server document that produced this view. */
++  head: HTMLHeadElement;
++  htmlAttrs: Array<[string, string]>;
++  storedAt: number;
++}
++
++/** Map insertion order doubles as LRU order (oldest first). */
++const views = new Map<string, CachedView>();
++/** Synthetic documents produced by our loader, mapped to the view they restore. */
++const restoredDocs = new WeakMap<Document, CachedView>();
++
++let currentKey = keyOf(new URL(location.href));
++let currentHead = document.head.cloneNode(true) as HTMLHeadElement;
++let currentHtmlAttrs = attrsOf(document.documentElement);
++
++function keyOf(url: URL): string {
++  const path = url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname;
++  return path + url.search;
++}
++
++function attrsOf(el: Element): Array<[string, string]> {
++  return Array.from(el.attributes, (a) => [a.name, a.value] as [string, string]);
++}
++
++function getContainer(): HTMLElement | null {
++  return document.getElementById(CONTAINER_ID);
++}
++
++/** The view root currently on screen (not one parked in the cache). */
++function getLiveRoot(container: HTMLElement | null): HTMLElement | null {
++  for (const el of document.querySelectorAll<HTMLElement>(ROOT_SELECTOR)) {
++    if (!container?.contains(el)) return el;
++  }
++  return null;
++}
++
++/**
++ * Move a node without tearing it down when the browser supports the atomic
++ * `moveBefore()` DOM API (preserves focus, iframes, animations and avoids
++ * disconnect/connect callbacks); otherwise fall back to a regular insert.
++ */
++function moveNode(parent: Node, node: Node, before: Node | null = null) {
++  const p = parent as Node & { moveBefore?: (n: Node, c: Node | null) => void };
++  if (typeof p.moveBefore === "function" && node.isConnected && parent.isConnected) {
++    try {
++      p.moveBefore(node, before);
++      return;
++    } catch {
++      /* fall through */
++    }
++  }
++  parent.insertBefore(node, before);
++}
++
++function dropEntry(key: string) {
++  const entry = views.get(key);
++  if (!entry) return;
++  views.delete(key);
++  // Detaching lets Astro unmount its islands on the upcoming `astro:after-swap`.
++  entry.root.remove();
++}
++
++function isCacheable(root: HTMLElement): boolean {
++  return root.dataset.viewCache !== "off";
++}
++
++function isReusable(entry: CachedView, navigationType: string): boolean {
++  if (!entry.root.isConnected) return false;
++  if (navigationType === "traverse") return true;
++  return Date.now() - entry.storedAt <= PUSH_MAX_AGE_MS;
++}
++
++/** Park the outgoing live view inside the hidden container. */
++function park(root: HTMLElement, container: HTMLElement, key: string, head: HTMLHeadElement, htmlAttrs: Array<[string, string]>) {
++  dropEntry(key);
++  moveNode(container, root);
++  views.set(key, { root, head, htmlAttrs, storedAt: Date.now() });
++  while (views.size > MAX_ENTRIES) {
++    dropEntry(views.keys().next().value as string);
++  }
++}
++
++/** Build a lightweight document carrying only what the router needs (<html> attrs + <head>). */
++function buildDocument(entry: CachedView): Document {
++  const doc = document.implementation.createHTMLDocument("");
++  for (const [name, value] of entry.htmlAttrs) doc.documentElement.setAttribute(name, value);
++  doc.head.replaceWith(doc.importNode(entry.head, true));
++  restoredDocs.set(doc, entry);
++  return doc;
++}
++
++document.addEventListener("astro:before-preparation", (event: TransitionBeforePreparationEvent) => {
++  if (event.formData) return;
++  const key = keyOf(event.to);
++  if (key === currentKey) return; // reload of the current view: always go to the network
++
++  const entry = views.get(key);
++  if (!entry) return;
++  if (!isReusable(entry, event.navigationType)) {
++    dropEntry(key);
++    return;
++  }
++  const container = getContainer();
++  if (!container || !getLiveRoot(container)) return;
++
++  // Replace the network fetch with the cached view.
++  event.loader = async () => {
++    event.newDocument = buildDocument(entry);
++  };
++});
++
++document.addEventListener("astro:before-swap", (event: TransitionBeforeSwapEvent) => {
++  const container = getContainer();
++  const outgoing = getLiveRoot(container);
++  const outgoingKey = currentKey;
++  const outgoingHead = currentHead;
++  const outgoingAttrs = currentHtmlAttrs;
++  const toKey = keyOf(event.to);
++  const entry = restoredDocs.get(event.newDocument);
++
++  if (entry) {
++    currentHead = entry.head;
++    currentHtmlAttrs = entry.htmlAttrs;
++  } else {
++    // Fresh server document: any cached copy of the destination is stale.
++    if (toKey !== outgoingKey) dropEntry(toKey);
++    currentHead = event.newDocument.head.cloneNode(true) as HTMLHeadElement;
++    currentHtmlAttrs = attrsOf(event.newDocument.documentElement);
++  }
++
++  const shouldPark =
++    !!outgoing && !!container && isCacheable(outgoing) && outgoingKey !== toKey;
++  const parkOutgoing = () => park(outgoing!, container!, outgoingKey, outgoingHead, outgoingAttrs);
++  const defaultSwap = event.swap;
++
++  event.swap = () => {
++    if (entry && outgoing && container) {
++      // Cached view: keep the page shell (header, footer, their islands) and
++      // only exchange the view root, so nothing is re-parsed or re-hydrated.
++      const { deselectScripts, swapRootAttributes, swapHeadElements, saveFocus } = swapFunctions;
++      deselectScripts(event.newDocument);
++      swapRootAttributes(event.newDocument);
++      swapHeadElements(event.newDocument);
++      const restoreFocus = saveFocus();
++
++      views.delete(toKey);
++      moveNode(outgoing.parentNode!, entry.root, outgoing);
++      if (shouldPark) parkOutgoing();
++      else outgoing.remove();
++
++      restoreFocus();
++      return;
++    }
++
++    // Fresh document: park the outgoing view, then let Astro swap the body.
++    // The container is `transition:persist`-ed, so it (and everything parked
++    // in it) is carried over into the new body.
++    if (shouldPark) parkOutgoing();
++    defaultSwap();
++  };
++});
++
++document.addEventListener("astro:page-load", () => {
++  currentKey = keyOf(new URL(location.href));
++  // If we landed on a page without the cache container, parked views are gone.
++  for (const [key, entry] of views) {
++    if (!entry.root.isConnected) views.delete(key);
++  }
++});

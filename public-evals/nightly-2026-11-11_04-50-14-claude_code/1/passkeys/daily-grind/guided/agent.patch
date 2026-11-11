@@ -1,0 +1,2487 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..f9157fe
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,3 @@
++node_modules/
++data/
++public/vendor/
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..557e0f7
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,32 @@
++# The Daily Grind
++
++Coffee shop homepage with a customer **My Account** area (`/account`) supporting passkeys.
++
++## Run
++
++```sh
++pnpm install
++pnpm start            # builds the WebAuthn polyfill bundle, then starts the server on :11222
++```
++
++| Env var    | Default                     | Purpose                                                        |
++| ---------- | --------------------------- | -------------------------------------------------------------- |
++| `PORT`     | `11222`                     | Listen port                                                    |
++| `ORIGIN`   | `http://localhost:$PORT`    | Exact public origin (WebAuthn verifies this; must be HTTPS in production) |
++| `RP_ID`    | hostname of `ORIGIN`        | WebAuthn Relying Party ID (e.g. `dailygrind.example` to cover subdomains) |
++| `DATA_DIR` | `./data`                    | JSON store for accounts/passkeys and the cached AAGUID registry |
++
++## Account features
++
++- **Registration** – email, name and password; afterwards customers are offered a passkey (platform authenticator).
++- **Sign-in** – email/password with passkey autofill (conditional mediation) plus a "Sign in with a passkey" button.
++  After a password sign-in, a passkey is silently offered via conditional create where supported.
++- **Passkey management** – list (provider name/icon from the AAGUID registry, created/last-used dates),
++  create (security keys allowed), rename, delete. The list is synced to password managers with
++  `PublicKeyCredential.signalAllAcceptedCredentials()`.
++- **Profile updates** – name and email; synced with `signalCurrentUserDetails()`.
++- **Reauthentication** – creating/deleting passkeys and profile changes require identity confirmation within
++  the last 5 minutes, using one of the customer's own passkeys (`allowCredentials`, UV required) or their password.
++
++Server: `server/index.js` (Node `http` + `@simplewebauthn/server`). Client: `public/js/webauthn.js`, `public/js/account.js`.
++Sessions are in memory and data is a JSON file. Use a real session store and database in production.
+diff --git a/package.json b/package.json
+index 2bd4d77..007f7c4 100644
+--- a/package.json
++++ b/package.json
+@@ -2,9 +2,24 @@
+   "name": "daily-grind",
+   "version": "1.0.0",
+   "scripts": {
+-    "start": "pnpm dlx statikk --port ${PORT:-11222}"
++    "build": "esbuild node_modules/webauthn-polyfills/esm/index.js --bundle --format=esm --minify --target=es2020 --outfile=public/vendor/webauthn-polyfills.js",
++    "prestart": "pnpm run build",
++    "start": "node server/index.js"
+   },
+   "pnpm": {
+-    "onlyBuiltDependencies": []
++    "onlyBuiltDependencies": [
++      "esbuild"
++    ]
++  },
++  "dependencies": {
++    "@simplewebauthn/server": "^14.1.0",
++    "webauthn-polyfills": "^0.1.7"
++  },
++  "devDependencies": {
++    "esbuild": "^0.28.2"
++  },
++  "type": "module",
++  "engines": {
++    "node": ">=22"
+   }
+ }
+diff --git a/public/account.html b/public/account.html
+new file mode 100644
+index 0000000..0a41113
+--- /dev/null
++++ b/public/account.html
+@@ -0,0 +1,235 @@
++<!DOCTYPE html>
++<html lang="en">
++
++<head>
++  <meta charset="UTF-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <title>My Account | The Daily Grind</title>
++  <link rel="stylesheet" href="/css/site.css">
++  <link rel="stylesheet" href="/css/account.css">
++  <script type="module" src="/js/account.js"></script>
++</head>
++
++<body>
++
++  <nav>
++    <div class="logo"><a href="/">THE DAILY GRIND</a></div>
++    <ul>
++      <li><a href="/menu">Menu</a></li>
++      <li><a href="/locations">Locations</a></li>
++      <li><a href="/rewards">Rewards</a></li>
++      <li><a href="/account" aria-current="page">My Account</a></li>
++      <li data-signed-in hidden><a href="/logout" class="logout-link" id="nav-logout">Logout</a></li>
++    </ul>
++  </nav>
++
++  <main class="account">
++    <p id="loading" class="loading">Loading your account…</p>
++
++    <!-- Global status messages -->
++    <div id="toast" class="toast" role="status" aria-live="polite"></div>
++
++    <!-- ============ Signed out: sign in ============ -->
++    <section id="signin-view" class="auth-card" aria-labelledby="signin-title" hidden>
++      <h1 id="signin-title">Sign in</h1>
++      <p id="signin-desc" class="muted">Sign in with your passkey, or use your email and password.</p>
++
++      <form id="signin-form" novalidate>
++        <div class="field">
++          <label for="signin-email">Email</label>
++          <input type="email" id="signin-email" name="email" autocomplete="username webauthn" spellcheck="false"
++            aria-describedby="signin-desc" enterkeyhint="next" required autofocus>
++        </div>
++        <div class="field">
++          <label for="signin-password">Password</label>
++          <div class="password-wrap">
++            <input type="password" id="signin-password" name="password" autocomplete="current-password"
++              enterkeyhint="done" required>
++            <button type="button" class="toggle-password" aria-controls="signin-password"
++              aria-pressed="false">Show</button>
++          </div>
++        </div>
++        <p class="form-error" id="signin-error" role="alert"></p>
++        <button type="submit" class="btn btn-block">Sign in</button>
++      </form>
++
++      <div id="passkey-signin-group" hidden>
++        <div class="divider"><span>or</span></div>
++        <button type="button" id="passkey-signin" class="btn btn-outline btn-block">
++          <svg class="icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm0 2c-3.3 0-7 1.7-7 4v2h11.3a6 6 0 0 1-.3-2c0-1.2.3-2.3 1-3.3-1.4-.5-3.1-.7-5-.7Zm11.5 1.5a3 3 0 1 0-4 2.8V22l1.5 1 1.5-1.2-1-1 1-1-1-.8v-1.7a3 3 0 0 0 2-2.8Zm-3-1a1 1 0 1 1 0 2 1 1 0 0 1 0-2Z"/></svg>
++          Sign in with a passkey
++        </button>
++      </div>
++
++      <p class="switch">New to The Daily Grind? <a href="#register">Create an account</a></p>
++    </section>
++
++    <!-- ============ Signed out: register ============ -->
++    <section id="register-view" class="auth-card" aria-labelledby="register-title" hidden>
++      <h1 id="register-title">Create your account</h1>
++      <p class="muted">Earn rewards, save your favorites and order ahead.</p>
++
++      <form id="register-form" novalidate>
++        <div class="field">
++          <label for="register-name">Name</label>
++          <input type="text" id="register-name" name="displayName" autocomplete="name" maxlength="64"
++            enterkeyhint="next" required>
++        </div>
++        <div class="field">
++          <label for="register-email">Email</label>
++          <input type="email" id="register-email" name="email" autocomplete="username" spellcheck="false"
++            enterkeyhint="next" required>
++        </div>
++        <div class="field">
++          <label for="register-password">Password</label>
++          <div class="password-wrap">
++            <input type="password" id="register-password" name="password" autocomplete="new-password" minlength="8"
++              aria-describedby="register-password-hint" enterkeyhint="done" required>
++            <button type="button" class="toggle-password" aria-controls="register-password"
++              aria-pressed="false">Show</button>
++          </div>
++          <p id="register-password-hint" class="hint">At least 8 characters. You can add a passkey next.</p>
++        </div>
++        <p class="form-error" id="register-error" role="alert"></p>
++        <button type="submit" class="btn btn-block">Create account</button>
++      </form>
++
++      <p class="switch">Already have an account? <a href="#signin">Sign in</a></p>
++    </section>
++
++    <!-- ============ Post-registration passkey promotion ============ -->
++    <section id="promo-view" class="auth-card promo" aria-labelledby="promo-title" hidden>
++      <svg class="promo-icon" aria-hidden="true" viewBox="0 0 24 24"><path d="M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm0 2c-3.3 0-7 1.7-7 4v2h11.3a6 6 0 0 1-.3-2c0-1.2.3-2.3 1-3.3-1.4-.5-3.1-.7-5-.7Zm11.5 1.5a3 3 0 1 0-4 2.8V22l1.5 1 1.5-1.2-1-1 1-1-1-.8v-1.7a3 3 0 0 0 2-2.8Zm-3-1a1 1 0 1 1 0 2 1 1 0 0 1 0-2Z"/></svg>
++      <h1 id="promo-title">Sign in faster with a passkey</h1>
++      <p class="muted">Use your fingerprint, face or screen lock to sign in. No password to remember, and passkeys
++        can’t be phished.</p>
++      <p class="form-error" id="promo-error" role="alert"></p>
++      <button type="button" id="promo-create" class="btn btn-block">Create a passkey</button>
++      <button type="button" id="promo-skip" class="btn btn-ghost btn-block">Not now</button>
++    </section>
++
++    <!-- ============ Signed in: account dashboard ============ -->
++    <section id="account-view" aria-labelledby="account-title" hidden>
++      <header class="account-header">
++        <h1 id="account-title">Hi, <span id="greeting-name"></span></h1>
++        <p class="muted">Manage your profile and how you sign in.</p>
++      </header>
++
++      <div class="panels">
++        <section class="panel" aria-labelledby="profile-title">
++          <h2 id="profile-title">Profile</h2>
++          <form id="profile-form" novalidate>
++            <div class="field">
++              <label for="profile-name">Name</label>
++              <input type="text" id="profile-name" name="displayName" autocomplete="name" maxlength="64" required>
++            </div>
++            <div class="field">
++              <label for="profile-email">Email</label>
++              <input type="email" id="profile-email" name="email" autocomplete="username" spellcheck="false" required>
++            </div>
++            <p class="hint">For your security, we’ll ask you to confirm it’s you before saving.</p>
++            <p class="form-error" id="profile-error" role="alert"></p>
++            <button type="submit" class="btn">Save changes</button>
++          </form>
++        </section>
++
++        <section class="panel" aria-labelledby="passkeys-title">
++          <div class="panel-heading">
++            <h2 id="passkeys-title">Passkeys</h2>
++            <button type="button" id="create-passkey" class="btn btn-small" hidden>Create a passkey</button>
++          </div>
++          <p class="muted">Passkeys let you sign in with your fingerprint, face, screen lock or security key.</p>
++          <p id="passkeys-unsupported" class="notice" hidden>
++            This browser or device doesn’t support passkeys. You can keep signing in with your password, or add a
++            passkey from a supported device.
++          </p>
++          <p class="form-error" id="passkeys-error" role="alert"></p>
++          <ul id="passkey-list" class="passkey-list" aria-labelledby="passkeys-title"></ul>
++          <p id="passkeys-empty" class="empty" hidden>No passkeys yet. Create one to sign in without a password.</p>
++        </section>
++      </div>
++
++      <p class="signout-row"><button type="button" id="signout" class="btn btn-ghost">Sign out</button></p>
++    </section>
++  </main>
++
++  <template id="passkey-item-template">
++    <li class="passkey-item">
++      <img class="provider-icon" alt="" width="32" height="32">
++      <div class="passkey-info">
++        <p class="passkey-name"></p>
++        <p class="passkey-meta"><span class="passkey-created"></span><span class="passkey-used"></span></p>
++        <p class="passkey-badge"></p>
++      </div>
++      <div class="passkey-actions">
++        <button type="button" class="btn btn-small btn-outline" data-action="rename">Rename</button>
++        <button type="button" class="btn btn-small btn-danger" data-action="delete">Delete</button>
++      </div>
++    </li>
++  </template>
++
++  <!-- Reauthentication -->
++  <dialog id="reauth-dialog" aria-labelledby="reauth-title" aria-describedby="reauth-desc">
++    <h2 id="reauth-title">Confirm it’s you</h2>
++    <p id="reauth-desc" class="muted">To keep your account safe, please verify your identity to continue.</p>
++    <div id="reauth-passkey-group">
++      <button type="button" id="reauth-passkey" class="btn btn-block">Use your passkey</button>
++      <div class="divider"><span>or</span></div>
++    </div>
++    <form id="reauth-password-form" novalidate>
++      <!-- Helps password managers pick the right saved password -->
++      <input type="email" id="reauth-username" name="username" autocomplete="username" hidden readonly>
++      <div class="field">
++        <label for="reauth-password">Password</label>
++        <input type="password" id="reauth-password" name="password" autocomplete="current-password" required>
++      </div>
++      <p class="form-error" id="reauth-error" role="alert"></p>
++      <div class="dialog-actions">
++        <button type="button" class="btn btn-ghost" data-close>Cancel</button>
++        <button type="submit" class="btn btn-outline">Confirm with password</button>
++      </div>
++    </form>
++  </dialog>
++
++  <!-- Rename a passkey -->
++  <dialog id="rename-dialog" aria-labelledby="rename-title">
++    <h2 id="rename-title">Rename passkey</h2>
++    <form id="rename-form" method="dialog">
++      <div class="field">
++        <label for="rename-input">Passkey name</label>
++        <input type="text" id="rename-input" name="name" maxlength="64" autocomplete="off" required autofocus>
++      </div>
++      <p class="form-error" id="rename-error" role="alert"></p>
++      <div class="dialog-actions">
++        <button type="submit" value="cancel" class="btn btn-ghost" formnovalidate>Cancel</button>
++        <button type="submit" value="save" class="btn">Save</button>
++      </div>
++    </form>
++  </dialog>
++
++  <!-- Confirm passkey deletion -->
++  <dialog id="delete-dialog" aria-labelledby="delete-title" aria-describedby="delete-desc">
++    <h2 id="delete-title">Delete this passkey?</h2>
++    <p id="delete-desc" class="muted">You won’t be able to sign in to The Daily Grind with
++      “<span id="delete-name"></span>” anymore.</p>
++    <form method="dialog">
++      <div class="dialog-actions">
++        <button value="cancel" class="btn btn-ghost" autofocus>Keep passkey</button>
++        <button value="delete" class="btn btn-danger">Delete</button>
++      </div>
++    </form>
++  </dialog>
++
++  <footer>
++    <div class="footer-links">
++      <a href="/about">Our Story</a> |
++      <a href="/careers">Join the Team</a> |
++      <a href="/contact">Contact Us</a> |
++      <a href="/privacy-policy">Privacy</a>
++    </div>
++    <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
++  </footer>
++
++</body>
++
++</html>
+diff --git a/public/css/account.css b/public/css/account.css
+new file mode 100644
+index 0000000..a182a0d
+--- /dev/null
++++ b/public/css/account.css
+@@ -0,0 +1,409 @@
++/* My Account page */
++
++.logo a {
++  color: inherit;
++  text-decoration: none;
++}
++
++nav a[aria-current="page"] {
++  color: var(--accent);
++}
++
++.account {
++  max-width: 960px;
++  min-height: 60vh;
++  margin: 40px auto;
++  padding: 0 20px;
++}
++
++.loading,
++.muted,
++.hint {
++  color: #6d4c41;
++}
++
++.hint {
++  font-size: 0.85rem;
++  margin-top: 4px;
++}
++
++h1 {
++  color: var(--primary);
++  font-size: 1.8rem;
++  line-height: 1.2;
++  margin-bottom: 6px;
++}
++
++h2 {
++  color: var(--primary);
++  font-size: 1.25rem;
++  margin-bottom: 8px;
++}
++
++/* Cards */
++.auth-card,
++.panel {
++  background: white;
++  border-radius: 8px;
++  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++  padding: 28px;
++}
++
++.auth-card {
++  max-width: 420px;
++  margin: 0 auto;
++}
++
++.auth-card > .muted {
++  margin-bottom: 20px;
++}
++
++.promo {
++  text-align: center;
++}
++
++.promo-icon {
++  width: 56px;
++  height: 56px;
++  fill: var(--primary);
++  margin-bottom: 12px;
++}
++
++.panels {
++  display: grid;
++  grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));
++  gap: 24px;
++  align-items: start;
++}
++
++.account-header {
++  margin-bottom: 24px;
++}
++
++.panel-heading {
++  display: flex;
++  justify-content: space-between;
++  align-items: center;
++  gap: 12px;
++  flex-wrap: wrap;
++}
++
++/* Forms */
++.field {
++  margin-bottom: 16px;
++}
++
++label {
++  display: block;
++  font-weight: 600;
++  font-size: 0.9rem;
++  margin-bottom: 4px;
++}
++
++input[type="text"],
++input[type="email"],
++input[type="password"] {
++  width: 100%;
++  font: inherit;
++  padding: 10px 12px;
++  border: 1px solid #a1887f;
++  border-radius: 5px;
++  background: white;
++  color: var(--text);
++}
++
++input:focus-visible {
++  outline: 2px solid var(--accent);
++  outline-offset: 1px;
++  border-color: var(--primary);
++}
++
++input:user-invalid {
++  border-color: #c62828;
++}
++
++.password-wrap {
++  position: relative;
++}
++
++.password-wrap input {
++  padding-right: 64px;
++}
++
++.toggle-password {
++  position: absolute;
++  inset-block: 4px;
++  right: 4px;
++  font: inherit;
++  font-size: 0.8rem;
++  font-weight: 600;
++  border: 0;
++  border-radius: 4px;
++  background: transparent;
++  color: var(--primary);
++  padding: 0 10px;
++  cursor: pointer;
++}
++
++.toggle-password:hover {
++  background: var(--secondary);
++}
++
++.form-error {
++  color: #c62828;
++  font-size: 0.9rem;
++  margin-bottom: 8px;
++}
++
++.form-error:empty {
++  display: none;
++}
++
++/* Buttons (extends .btn from site.css) */
++button.btn {
++  font: inherit;
++  border: 2px solid var(--primary);
++  cursor: pointer;
++  margin-top: 0;
++}
++
++.btn:disabled {
++  opacity: 0.6;
++  cursor: progress;
++}
++
++.btn-block {
++  display: flex;
++  width: 100%;
++  justify-content: center;
++  align-items: center;
++  gap: 8px;
++}
++
++.btn-block + .btn-block {
++  margin-top: 10px;
++}
++
++.btn-outline {
++  background: white;
++  color: var(--primary);
++}
++
++.btn-outline:hover {
++  background: var(--secondary);
++}
++
++.btn-ghost {
++  background: transparent;
++  border-color: transparent;
++  color: var(--primary);
++}
++
++.btn-ghost:hover {
++  background: var(--secondary);
++}
++
++.btn-danger {
++  background: #b71c1c;
++  border-color: #b71c1c;
++  color: white;
++}
++
++.btn-danger:hover {
++  background: #8e1414;
++}
++
++button.btn-outline.btn-danger,
++.passkey-actions .btn-danger {
++  background: white;
++  color: #b71c1c;
++}
++
++.passkey-actions .btn-danger:hover {
++  background: #ffebee;
++}
++
++.btn-small {
++  padding: 5px 12px;
++  font-size: 0.85rem;
++}
++
++.btn:focus-visible,
++.toggle-password:focus-visible,
++.switch a:focus-visible {
++  outline: 2px solid var(--accent);
++  outline-offset: 2px;
++}
++
++.icon {
++  width: 20px;
++  height: 20px;
++  fill: currentColor;
++}
++
++.divider {
++  display: flex;
++  align-items: center;
++  gap: 12px;
++  color: #8d6e63;
++  font-size: 0.85rem;
++  margin: 18px 0;
++}
++
++.divider::before,
++.divider::after {
++  content: "";
++  flex: 1;
++  border-top: 1px solid var(--secondary);
++}
++
++.switch {
++  margin-top: 20px;
++  text-align: center;
++  font-size: 0.9rem;
++}
++
++.switch a {
++  color: var(--primary);
++  font-weight: 600;
++}
++
++/* Passkey list */
++.passkey-list {
++  list-style: none;
++  margin-top: 16px;
++}
++
++.passkey-item {
++  display: grid;
++  grid-template-columns: 32px 1fr auto;
++  gap: 12px;
++  align-items: center;
++  padding: 14px 0;
++  border-top: 1px solid var(--secondary);
++}
++
++.provider-icon {
++  width: 32px;
++  height: 32px;
++  object-fit: contain;
++}
++
++/* Generic key icon when the AAGUID has no registry icon */
++.provider-icon.generic {
++  border-radius: 50%;
++  background: var(--secondary) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%234e342e'%3E%3Cpath d='M7 14a2 2 0 1 1 0-4 2 2 0 0 1 0 4Zm5.6-4A6 6 0 1 0 12.6 14H17v4h4v-4h2v-4H12.6Z'/%3E%3C/svg%3E") center / 20px no-repeat;
++}
++
++.passkey-name {
++  font-weight: 600;
++  overflow-wrap: anywhere;
++}
++
++.passkey-meta,
++.passkey-badge {
++  font-size: 0.8rem;
++  color: #6d4c41;
++}
++
++.passkey-actions {
++  display: flex;
++  gap: 6px;
++  flex-wrap: wrap;
++  justify-content: flex-end;
++}
++
++@media (max-width: 520px) {
++  .passkey-item {
++    grid-template-columns: 32px 1fr;
++  }
++
++  .passkey-actions {
++    grid-column: 1 / -1;
++    justify-content: flex-start;
++  }
++}
++
++.empty,
++.notice {
++  margin-top: 16px;
++  padding: 14px;
++  border-radius: 6px;
++  background: #efebe9;
++  font-size: 0.9rem;
++}
++
++.signout-row {
++  margin-top: 24px;
++  text-align: center;
++}
++
++/* Toast */
++.toast {
++  position: fixed;
++  left: 50%;
++  bottom: 24px;
++  translate: -50% 16px;
++  max-width: min(90vw, 480px);
++  background: var(--text);
++  color: white;
++  padding: 12px 20px;
++  border-radius: 6px;
++  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
++  opacity: 0;
++  pointer-events: none;
++  transition: opacity 0.2s, translate 0.2s;
++  z-index: 2000;
++}
++
++.toast.visible {
++  opacity: 1;
++  translate: -50% 0;
++}
++
++.toast:empty {
++  display: none;
++}
++
++@media (prefers-reduced-motion: reduce) {
++  .toast {
++    transition: none;
++  }
++}
++
++/* Dialogs */
++dialog {
++  width: min(92vw, 420px);
++  margin: auto;
++  border: 0;
++  border-radius: 10px;
++  padding: 28px;
++  color: var(--text);
++  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
++}
++
++dialog::backdrop {
++  background: rgba(30, 20, 15, 0.55);
++  /* Keep scroll gestures over the backdrop from scrolling the page */
++  overflow: hidden;
++  overscroll-behavior: contain;
++}
++
++dialog:modal {
++  overscroll-behavior: contain;
++}
++
++dialog h2 {
++  margin-bottom: 6px;
++}
++
++dialog > .muted {
++  margin-bottom: 18px;
++}
++
++.dialog-actions {
++  display: flex;
++  justify-content: flex-end;
++  gap: 8px;
++  margin-top: 8px;
++}
+diff --git a/public/css/site.css b/public/css/site.css
+new file mode 100644
+index 0000000..2a7a0ba
+--- /dev/null
++++ b/public/css/site.css
+@@ -0,0 +1,102 @@
++:root {
++  --primary: #4e342e;
++  --secondary: #d7ccc8;
++  --accent: #ffab40;
++  --text: #3e2723;
++  --light: #fafafa;
++}
++
++* {
++  box-sizing: border-box;
++  margin: 0;
++  padding: 0;
++}
++
++body {
++  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
++  line-height: 1.6;
++  color: var(--text);
++  background-color: var(--light);
++}
++
++/* Navigation */
++nav {
++  background: var(--primary);
++  color: white;
++  padding: 1rem 5%;
++  display: flex;
++  justify-content: space-between;
++  align-items: center;
++  position: sticky;
++  top: 0;
++  z-index: 1000;
++}
++
++.logo {
++  font-size: 1.5rem;
++  font-weight: bold;
++  letter-spacing: 1px;
++}
++
++nav ul {
++  display: flex;
++  list-style: none;
++}
++
++nav ul li {
++  margin-left: 20px;
++}
++
++nav a {
++  color: white;
++  text-decoration: none;
++  font-size: 0.9rem;
++  transition: color 0.3s;
++}
++
++nav a:hover {
++  color: var(--accent);
++}
++
++.logout-link {
++  border: 1px solid var(--accent);
++  padding: 5px 12px;
++  border-radius: 4px;
++}
++
++.btn {
++  display: inline-block;
++  background: var(--primary);
++  color: white;
++  padding: 10px 20px;
++  text-decoration: none;
++  border-radius: 5px;
++  margin-top: 15px;
++  transition: background 0.3s;
++}
++
++.btn:hover {
++  background: #3e2723;
++}
++
++footer {
++  background: var(--secondary);
++  text-align: center;
++  padding: 40px 20px;
++  margin-top: 40px;
++}
++
++.footer-links {
++  margin-bottom: 20px;
++}
++
++.footer-links a {
++  margin: 0 10px;
++  color: var(--text);
++  text-decoration: none;
++  font-size: 0.85rem;
++}
++
++[hidden] {
++  display: none !important;
++}
+diff --git a/index.html b/public/index.html
+similarity index 61%
+rename from index.html
+rename to public/index.html
+index 66c9173..8281e24 100644
+--- a/index.html
++++ b/public/index.html
+@@ -5,73 +5,9 @@
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <title>The Daily Grind | Artisanal Coffee</title>
++  <link rel="stylesheet" href="/css/site.css">
++  <script type="module" src="/js/nav.js"></script>
+   <style>
+-    :root {
+-      --primary: #4e342e;
+-      --secondary: #d7ccc8;
+-      --accent: #ffab40;
+-      --text: #3e2723;
+-      --light: #fafafa;
+-    }
+-
+-    * {
+-      box-sizing: border-box;
+-      margin: 0;
+-      padding: 0;
+-    }
+-
+-    body {
+-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+-      line-height: 1.6;
+-      color: var(--text);
+-      background-color: var(--light);
+-    }
+-
+-    /* Navigation */
+-    nav {
+-      background: var(--primary);
+-      color: white;
+-      padding: 1rem 5%;
+-      display: flex;
+-      justify-content: space-between;
+-      align-items: center;
+-      position: sticky;
+-      top: 0;
+-      z-index: 1000;
+-    }
+-
+-    .logo {
+-      font-size: 1.5rem;
+-      font-weight: bold;
+-      letter-spacing: 1px;
+-    }
+-
+-    nav ul {
+-      display: flex;
+-      list-style: none;
+-    }
+-
+-    nav ul li {
+-      margin-left: 20px;
+-    }
+-
+-    nav a {
+-      color: white;
+-      text-decoration: none;
+-      font-size: 0.9rem;
+-      transition: color 0.3s;
+-    }
+-
+-    nav a:hover {
+-      color: var(--accent);
+-    }
+-
+-    .logout-link {
+-      border: 1px solid var(--accent);
+-      padding: 5px 12px;
+-      border-radius: 4px;
+-    }
+-
+     /* Hero Section */
+     .hero {
+       height: 60vh;
+@@ -120,38 +56,6 @@
+       color: var(--primary);
+     }
+ 
+-    .btn {
+-      display: inline-block;
+-      background: var(--primary);
+-      color: white;
+-      padding: 10px 20px;
+-      text-decoration: none;
+-      border-radius: 5px;
+-      margin-top: 15px;
+-      transition: background 0.3s;
+-    }
+-
+-    .btn:hover {
+-      background: #3e2723;
+-    }
+-
+-    footer {
+-      background: var(--secondary);
+-      text-align: center;
+-      padding: 40px 20px;
+-      margin-top: 40px;
+-    }
+-
+-    .footer-links {
+-      margin-bottom: 20px;
+-    }
+-
+-    .footer-links a {
+-      margin: 0 10px;
+-      color: var(--text);
+-      text-decoration: none;
+-      font-size: 0.85rem;
+-    }
+   </style>
+ </head>
+ 
+@@ -164,7 +68,7 @@
+       <li><a href="/locations">Locations</a></li>
+       <li><a href="/rewards">Rewards</a></li>
+       <li><a href="/account">My Account</a></li>
+-      <li><a href="/logout" class="logout-link">Logout</a></li>
++      <li data-signed-in hidden><a href="/logout" class="logout-link">Logout</a></li>
+     </ul>
+   </nav>
+ 
+diff --git a/public/js/account.js b/public/js/account.js
+new file mode 100644
+index 0000000..38684f3
+--- /dev/null
++++ b/public/js/account.js
+@@ -0,0 +1,529 @@
++// "My Account": customer registration, sign-in (password + passkeys), passkey management,
++// profile updates and reauthentication.
++import {
++  ApiError,
++  CANCELLED,
++  api,
++  authenticateWithPasskey,
++  getCapabilities,
++  registerPasskey,
++  signalAllAcceptedCredentials,
++  signalCurrentUserDetails,
++} from './webauthn.js';
++
++const $ = (id) => document.getElementById(id);
++
++const views = {
++  signin: $('signin-view'),
++  register: $('register-view'),
++  promo: $('promo-view'),
++  account: $('account-view'),
++};
++
++const state = {
++  /** @type {null | { email: string, displayName: string, createdAt: number, passkeyCount: number }} */
++  user: null,
++  /** @type {Record<string, boolean | undefined>} */
++  caps: {},
++  /** Controller for the pending conditional-mediation (autofill) request. */
++  autofill: new AbortController(),
++};
++
++const hasWebAuthn = () => typeof window.PublicKeyCredential === 'function';
++const canCreatePasskeys = () => hasWebAuthn() && Boolean(state.caps.passkeyPlatformAuthenticator);
++
++// ---------------------------------------------------------------------------
++// UI helpers
++// ---------------------------------------------------------------------------
++
++function showView(name) {
++  $('loading').hidden = true;
++  for (const [key, el] of Object.entries(views)) el.hidden = key !== name;
++  for (const el of document.querySelectorAll('[data-signed-in]')) el.hidden = !state.user;
++  const titles = {
++    signin: 'Sign in',
++    register: 'Create your account',
++    promo: 'Create a passkey',
++    account: 'My Account',
++  };
++  document.title = `${titles[name]} | The Daily Grind`;
++}
++
++let toastTimer;
++function toast(message) {
++  const el = $('toast');
++  el.textContent = message;
++  el.classList.add('visible');
++  clearTimeout(toastTimer);
++  toastTimer = setTimeout(() => el.classList.remove('visible'), 6000);
++}
++
++function showError(id, err) {
++  const el = $(id);
++  if (!err) {
++    el.textContent = '';
++    return;
++  }
++  if (!(err instanceof ApiError)) console.error(err);
++  el.textContent = err instanceof ApiError ? err.message : 'Something went wrong. Please try again.';
++}
++
++/** Disable a button while an async action runs. */
++async function busy(button, fn) {
++  button.disabled = true;
++  button.setAttribute('aria-busy', 'true');
++  try {
++    return await fn();
++  } finally {
++    button.disabled = false;
++    button.removeAttribute('aria-busy');
++  }
++}
++
++/** Resolve with the dialog's returnValue once it closes ('' when dismissed with Esc). */
++function dialogResult(dialog) {
++  return new Promise((resolve) => {
++    dialog.addEventListener(
++      'close',
++      () => {
++        const value = dialog.returnValue;
++        dialog.returnValue = '';
++        resolve(value);
++      },
++      { once: true },
++    );
++  });
++}
++
++const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' });
++const formatDate = (epoch) => dateFormat.format(new Date(epoch));
++
++for (const toggle of document.querySelectorAll('.toggle-password')) {
++  toggle.setAttribute('aria-label', 'Show password');
++  toggle.addEventListener('click', () => {
++    const input = $(toggle.getAttribute('aria-controls'));
++    const show = input.type === 'password';
++    input.type = show ? 'text' : 'password';
++    toggle.textContent = show ? 'Hide' : 'Show';
++    toggle.setAttribute('aria-pressed', String(show));
++    toggle.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
++  });
++}
++
++// ---------------------------------------------------------------------------
++// Routing
++// ---------------------------------------------------------------------------
++
++function routeSignedOut() {
++  if (location.hash === '#register') {
++    stopAutofill();
++    showView('register');
++    $('register-name').focus();
++  } else {
++    showView('signin');
++    $('passkey-signin-group').hidden = !hasWebAuthn();
++    $('signin-email').focus(); // Dedicated sign-in view: surface passkey autofill immediately.
++    startAutofill();
++  }
++}
++
++window.addEventListener('hashchange', () => {
++  if (!state.user) routeSignedOut();
++});
++
++function onSignedIn(user, { promote = false } = {}) {
++  state.user = user;
++  stopAutofill();
++  if (location.hash) history.replaceState(null, '', location.pathname);
++  if (promote && canCreatePasskeys() && state.caps.conditionalGet) {
++    showError('promo-error', null);
++    showView('promo');
++    $('promo-create').focus();
++  } else {
++    showAccount();
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Passkey sign-in (conditional mediation + explicit button)
++// ---------------------------------------------------------------------------
++
++function stopAutofill() {
++  state.autofill.abort();
++  state.autofill = new AbortController();
++}
++
++async function startAutofill() {
++  if (!state.caps.conditionalGet) return;
++  stopAutofill();
++  const { signal } = state.autofill;
++  try {
++    const result = await authenticateWithPasskey({
++      optionsPath: '/api/signin/passkey/options',
++      verifyPath: '/api/signin/passkey/verify',
++      mediation: 'conditional',
++      signal,
++    });
++    if (result === CANCELLED || signal.aborted) return;
++    onSignedIn(result.user);
++  } catch (err) {
++    if (signal.aborted) return;
++    showError('signin-error', err);
++    // Re-arm autofill so the customer can pick another passkey (only after a rejected passkey,
++    // not on network/server failures, to avoid a retry loop).
++    if (!views.signin.hidden && err instanceof ApiError && err.status >= 400 && err.status < 500) startAutofill();
++  }
++}
++
++$('passkey-signin').addEventListener('click', (event) =>
++  busy(event.currentTarget, async () => {
++    showError('signin-error', null);
++    stopAutofill(); // Abort pending conditional request to avoid prompt collisions.
++    try {
++      const result = await authenticateWithPasskey({
++        optionsPath: '/api/signin/passkey/options',
++        verifyPath: '/api/signin/passkey/verify',
++        signal: state.autofill.signal,
++      });
++      if (result !== CANCELLED) return onSignedIn(result.user);
++    } catch (err) {
++      showError('signin-error', err);
++    }
++    startAutofill(); // Re-arm autofill after a cancelled/failed explicit prompt.
++  }),
++);
++
++// ---------------------------------------------------------------------------
++// Password sign-in (+ conditional create) and registration (+ promotion)
++// ---------------------------------------------------------------------------
++
++$('signin-form').addEventListener('submit', async (event) => {
++  event.preventDefault();
++  const form = event.currentTarget;
++  showError('signin-error', null);
++  if (!form.reportValidity()) return;
++  const data = new FormData(form);
++  await busy(form.querySelector('[type=submit]'), async () => {
++    try {
++      const { user } = await api('/api/signin/password', {
++        method: 'POST',
++        body: { email: data.get('email'), password: data.get('password') },
++      });
++      stopAutofill(); // Must abort conditional get before conditional create.
++      onSignedIn(user);
++      tryConditionalCreate();
++      form.reset();
++    } catch (err) {
++      showError('signin-error', err);
++    }
++  });
++});
++
++/** Silently offer a passkey right after a successful password sign-in, where supported. */
++async function tryConditionalCreate() {
++  if (!state.caps.conditionalCreate) return;
++  try {
++    const credential = await registerPasskey({ conditional: true });
++    if (credential === CANCELLED) return;
++    toast(`Passkey saved to ${credential.name}. Next time, sign in without your password.`);
++    await loadPasskeys();
++  } catch (err) {
++    // Conditional create is opportunistic; never interrupt the customer with errors.
++    console.warn('Conditional passkey creation skipped:', err);
++  }
++}
++
++$('register-form').addEventListener('submit', async (event) => {
++  event.preventDefault();
++  const form = event.currentTarget;
++  showError('register-error', null);
++  if (!form.reportValidity()) return;
++  const data = new FormData(form);
++  await busy(form.querySelector('[type=submit]'), async () => {
++    try {
++      const { user } = await api('/api/account', {
++        method: 'POST',
++        body: {
++          displayName: data.get('displayName'),
++          email: data.get('email'),
++          password: data.get('password'),
++        },
++      });
++      form.reset();
++      onSignedIn(user, { promote: true });
++    } catch (err) {
++      showError('register-error', err);
++    }
++  });
++});
++
++$('promo-create').addEventListener('click', (event) =>
++  busy(event.currentTarget, async () => {
++    showError('promo-error', null);
++    try {
++      const credential = await registerPasskey({ promotion: true });
++      if (credential === CANCELLED) return;
++      toast(`Passkey created in ${credential.name}.`);
++      showAccount();
++    } catch (err) {
++      showError('promo-error', err);
++    }
++  }),
++);
++
++$('promo-skip').addEventListener('click', () => showAccount());
++
++// ---------------------------------------------------------------------------
++// Reauthentication
++// ---------------------------------------------------------------------------
++
++const reauthDialog = $('reauth-dialog');
++let finishReauth = null;
++
++/** Ask the signed-in customer to verify their identity. Resolves true when verified. */
++function reauthenticate() {
++  const usePasskey = hasWebAuthn() && state.user.passkeyCount > 0;
++  $('reauth-passkey-group').hidden = !usePasskey;
++  $('reauth-username').value = state.user.email;
++  $('reauth-password').value = '';
++  showError('reauth-error', null);
++  // Autofocus the primary option.
++  $('reauth-passkey').toggleAttribute('autofocus', usePasskey);
++  $('reauth-password').toggleAttribute('autofocus', !usePasskey);
++
++  return new Promise((resolve) => {
++    let verified = false;
++    finishReauth = () => {
++      verified = true;
++      reauthDialog.close();
++    };
++    reauthDialog.addEventListener(
++      'close',
++      () => {
++        finishReauth = null;
++        resolve(verified);
++      },
++      { once: true },
++    );
++    reauthDialog.showModal();
++  });
++}
++
++$('reauth-passkey').addEventListener('click', (event) =>
++  busy(event.currentTarget, async () => {
++    showError('reauth-error', null);
++    try {
++      const result = await authenticateWithPasskey({
++        optionsPath: '/api/reauth/options',
++        verifyPath: '/api/reauth/verify',
++      });
++      if (result !== CANCELLED) finishReauth?.();
++    } catch (err) {
++      showError('reauth-error', err);
++    }
++  }),
++);
++
++$('reauth-password-form').addEventListener('submit', async (event) => {
++  event.preventDefault();
++  const form = event.currentTarget;
++  showError('reauth-error', null);
++  if (!form.reportValidity()) return;
++  await busy(form.querySelector('[type=submit]'), async () => {
++    try {
++      await api('/api/reauth/password', { method: 'POST', body: { password: $('reauth-password').value } });
++      finishReauth?.();
++    } catch (err) {
++      showError('reauth-error', err);
++    }
++  });
++});
++
++reauthDialog.querySelector('[data-close]').addEventListener('click', () => reauthDialog.close());
++
++/** Run a sensitive action; if the server asks for reauthentication, verify and retry once. */
++async function withReauth(action) {
++  try {
++    return await action();
++  } catch (err) {
++    if (!(err instanceof ApiError && err.code === 'reauth_required')) throw err;
++    if (!(await reauthenticate())) return CANCELLED;
++    return action();
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Account dashboard: profile + passkey management
++// ---------------------------------------------------------------------------
++
++function renderProfile() {
++  $('greeting-name').textContent = state.user.displayName;
++  $('profile-name').value = state.user.displayName;
++  $('profile-email').value = state.user.email;
++}
++
++async function showAccount() {
++  renderProfile();
++  showError('profile-error', null);
++  showError('passkeys-error', null);
++  const supported = canCreatePasskeys();
++  $('create-passkey').hidden = !supported;
++  $('passkeys-unsupported').hidden = supported;
++  showView('account');
++  await loadPasskeys();
++}
++
++async function loadPasskeys() {
++  try {
++    const { rpId, userId, credentials } = await api('/api/passkeys');
++    state.user.passkeyCount = credentials.length;
++    renderPasskeys(credentials);
++    // Keep password managers in sync with the server's list on every load/change.
++    await signalAllAcceptedCredentials(rpId, userId, credentials);
++  } catch (err) {
++    if (err instanceof ApiError && err.code === 'signed_out') return handleSignedOut();
++    showError('passkeys-error', err);
++  }
++}
++
++function renderPasskeys(credentials) {
++  const list = $('passkey-list');
++  const template = $('passkey-item-template');
++  list.replaceChildren(
++    ...credentials.map((cred) => {
++      const item = template.content.firstElementChild.cloneNode(true);
++      const icon = item.querySelector('.provider-icon');
++      if (cred.providerIcon) icon.src = cred.providerIcon;
++      else icon.classList.add('generic');
++      item.querySelector('.passkey-name').textContent = cred.name;
++      item.querySelector('.passkey-created').textContent = `Created ${formatDate(cred.registeredAt)}`;
++      item.querySelector('.passkey-used').textContent = cred.lastUsedAt
++        ? ` · Last used ${formatDate(cred.lastUsedAt)}`
++        : ' · Never used';
++      item.querySelector('.passkey-badge').textContent =
++        cred.credentialDeviceType === 'multiDevice' ? 'Synced across your devices' : 'Saved on one device';
++      for (const button of item.querySelectorAll('button')) {
++        button.setAttribute('aria-label', `${button.textContent} ${cred.name}`);
++        button.addEventListener('click', () =>
++          button.dataset.action === 'rename' ? renamePasskey(cred) : deletePasskey(cred, button),
++        );
++      }
++      return item;
++    }),
++  );
++  $('passkeys-empty').hidden = credentials.length > 0;
++}
++
++$('create-passkey').addEventListener('click', (event) =>
++  busy(event.currentTarget, async () => {
++    showError('passkeys-error', null);
++    try {
++      // Management flow: no authenticatorAttachment, so security keys are allowed too.
++      const credential = await withReauth(() => registerPasskey());
++      if (credential === CANCELLED) return;
++      toast(`Passkey created in ${credential.name}.`);
++      await loadPasskeys();
++    } catch (err) {
++      showError('passkeys-error', err);
++    }
++  }),
++);
++
++const renameDialog = $('rename-dialog');
++async function renamePasskey(cred) {
++  showError('passkeys-error', null);
++  $('rename-input').value = cred.name;
++  renameDialog.showModal();
++  if ((await dialogResult(renameDialog)) !== 'save') return;
++  const name = $('rename-input').value.trim();
++  if (!name || name === cred.name) return;
++  try {
++    // Nickname is a server-side label only; no Signal API call needed.
++    await api(`/api/passkeys/${encodeURIComponent(cred.id)}`, { method: 'PUT', body: { name } });
++    toast('Passkey renamed.');
++    await loadPasskeys();
++  } catch (err) {
++    showError('passkeys-error', err);
++  }
++}
++
++const deleteDialog = $('delete-dialog');
++async function deletePasskey(cred, button) {
++  showError('passkeys-error', null);
++  $('delete-name').textContent = cred.name;
++  deleteDialog.showModal();
++  if ((await dialogResult(deleteDialog)) !== 'delete') return;
++  await busy(button, async () => {
++    try {
++      const result = await withReauth(() =>
++        api(`/api/passkeys/${encodeURIComponent(cred.id)}`, { method: 'DELETE' }),
++      );
++      if (result === CANCELLED) return;
++      toast('Passkey deleted.');
++      await loadPasskeys(); // Also signals the remaining accepted credentials.
++    } catch (err) {
++      showError('passkeys-error', err);
++    }
++  });
++}
++
++$('profile-form').addEventListener('submit', async (event) => {
++  event.preventDefault();
++  const form = event.currentTarget;
++  showError('profile-error', null);
++  if (!form.reportValidity()) return;
++  const email = $('profile-email').value.trim();
++  const displayName = $('profile-name').value.trim();
++  if (email === state.user.email && displayName === state.user.displayName) {
++    toast('No changes to save.');
++    return;
++  }
++  await busy(form.querySelector('[type=submit]'), async () => {
++    try {
++      const result = await withReauth(() => api('/api/user', { method: 'PUT', body: { email, displayName } }));
++      if (result === CANCELLED) return;
++      state.user = result.user;
++      renderProfile();
++      toast('Profile updated.');
++      // Update the account name shown by password managers for existing passkeys.
++      await signalCurrentUserDetails(result.rpId, result.userId, result.user.email, result.user.displayName);
++    } catch (err) {
++      if (err instanceof ApiError && err.code === 'signed_out') return handleSignedOut();
++      showError('profile-error', err);
++    }
++  });
++});
++
++// ---------------------------------------------------------------------------
++// Sign out
++// ---------------------------------------------------------------------------
++
++function handleSignedOut() {
++  state.user = null;
++  routeSignedOut();
++}
++
++$('signout').addEventListener('click', (event) =>
++  busy(event.currentTarget, async () => {
++    try {
++      await api('/api/logout', { method: 'POST', body: {} });
++    } finally {
++      handleSignedOut();
++      toast('You’ve been signed out.');
++    }
++  }),
++);
++
++// ---------------------------------------------------------------------------
++// Boot
++// ---------------------------------------------------------------------------
++
++state.caps = await getCapabilities();
++try {
++  const { user } = await api('/api/session');
++  state.user = user;
++} catch {
++  state.user = null;
++}
++if (state.user) showAccount();
++else routeSignedOut();
+diff --git a/public/js/nav.js b/public/js/nav.js
+new file mode 100644
+index 0000000..f63d8cb
+--- /dev/null
++++ b/public/js/nav.js
+@@ -0,0 +1,8 @@
++// Show the Logout link only when a customer is signed in.
++try {
++  const response = await fetch('/api/session', { credentials: 'same-origin' });
++  const { user } = await response.json();
++  for (const el of document.querySelectorAll('[data-signed-in]')) el.hidden = !user;
++} catch {
++  // Leave the nav as rendered.
++}
+diff --git a/public/js/webauthn.js b/public/js/webauthn.js
+new file mode 100644
+index 0000000..b6c561b
+--- /dev/null
++++ b/public/js/webauthn.js
+@@ -0,0 +1,163 @@
++// Native WebAuthn helpers shared by the account UI.
++// Polyfills parseCreationOptionsFromJSON / parseRequestOptionsFromJSON / toJSON / getClientCapabilities
++// whenever PublicKeyCredential exists but those newer methods don't.
++import '/vendor/webauthn-polyfills.js';
++
++export class ApiError extends Error {
++  constructor(status, code, message) {
++    super(message || 'Something went wrong. Please try again.');
++    this.status = status;
++    this.code = code;
++  }
++}
++
++/** JSON fetch wrapper. Throws ApiError for non-2xx responses (status preserved for Signal API decisions). */
++export async function api(path, { method = 'GET', body } = {}) {
++  const response = await fetch(path, {
++    method,
++    credentials: 'same-origin',
++    headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
++    body: body !== undefined ? JSON.stringify(body) : undefined,
++  });
++  const data = await response.json().catch(() => ({}));
++  if (!response.ok) throw new ApiError(response.status, data.error, data.message);
++  return data;
++}
++
++const EMPTY_CAPABILITIES = Object.freeze({});
++
++/** @returns {Promise<Record<string, boolean | undefined>>} */
++export async function getCapabilities() {
++  if (!window.PublicKeyCredential?.getClientCapabilities) return EMPTY_CAPABILITIES;
++  try {
++    const caps = await PublicKeyCredential.getClientCapabilities();
++    return {
++      ...caps,
++      // The polyfill can't detect passkeyPlatformAuthenticator (it needs hybrid detection), so fall
++      // back to the user-verifying platform authenticator check in that case.
++      passkeyPlatformAuthenticator: caps.passkeyPlatformAuthenticator ?? caps.userVerifyingPlatformAuthenticator,
++    };
++  } catch {
++    return EMPTY_CAPABILITIES;
++  }
++}
++
++/** Valid unpadded Base64URL: non-empty, [A-Za-z0-9_-] only, no '=' padding, length % 4 !== 1. */
++export function isValidBase64Url(value) {
++  return typeof value === 'string' && value.length > 0 && value.length % 4 !== 1 && /^[A-Za-z0-9_-]+$/.test(value);
++}
++
++// --- Signal API (progressive enhancement; failures are non-fatal and logged with console.warn) ---
++
++export async function signalUnknownCredential(rpId, credentialId) {
++  if (!window.PublicKeyCredential?.signalUnknownCredential) return;
++  if (!rpId || !isValidBase64Url(credentialId)) return;
++  try {
++    // rpId always comes from the server's options, never window.location.hostname.
++    await PublicKeyCredential.signalUnknownCredential({ rpId, credentialId });
++  } catch (e) {
++    console.warn('signalUnknownCredential sync warning:', e);
++  }
++}
++
++export async function signalAllAcceptedCredentials(rpId, userId, credentials) {
++  if (!window.PublicKeyCredential?.signalAllAcceptedCredentials) return;
++  const allAcceptedCredentialIds = credentials.map((c) => c.id);
++  if (!rpId || !isValidBase64Url(userId) || !allAcceptedCredentialIds.every(isValidBase64Url)) {
++    console.warn('signalAllAcceptedCredentials skipped: server rpId and valid Base64URL IDs are required.');
++    return;
++  }
++  try {
++    await PublicKeyCredential.signalAllAcceptedCredentials({ rpId, userId, allAcceptedCredentialIds });
++  } catch (e) {
++    console.warn('signalAllAcceptedCredentials sync warning:', e);
++  }
++}
++
++export async function signalCurrentUserDetails(rpId, userId, name, displayName) {
++  if (!window.PublicKeyCredential?.signalCurrentUserDetails) return;
++  if (!rpId || !isValidBase64Url(userId)) {
++    console.warn('signalCurrentUserDetails skipped: server rpId and valid Base64URL userId are required.');
++    return;
++  }
++  try {
++    await PublicKeyCredential.signalCurrentUserDetails({ rpId, userId, name, displayName });
++  } catch (e) {
++    console.warn('signalCurrentUserDetails sync warning:', e);
++  }
++}
++
++// --- Flows ---------------------------------------------------------------------------------------
++
++/** Result of a WebAuthn ceremony the user dismissed; callers should stay quiet. */
++export const CANCELLED = Symbol('cancelled');
++
++/**
++ * Register a new passkey for the signed-in customer.
++ * @param {{ promotion?: boolean, conditional?: boolean }} opts
++ * @returns {Promise<object | typeof CANCELLED>} The stored credential, or CANCELLED.
++ */
++export async function registerPasskey({ promotion = false, conditional = false } = {}) {
++  const optionsJSON = await api('/api/passkeys/register/options', { method: 'POST', body: { promotion, conditional } });
++  const publicKey = PublicKeyCredential.parseCreationOptionsFromJSON(optionsJSON);
++
++  let credential;
++  try {
++    credential = await navigator.credentials.create({
++      publicKey,
++      ...(conditional && { mediation: 'conditional' }),
++    });
++  } catch (err) {
++    if (conditional && ['InvalidStateError', 'NotAllowedError', 'AbortError'].includes(err.name)) return CANCELLED;
++    if (err.name === 'NotAllowedError' || err.name === 'AbortError') return CANCELLED;
++    if (err.name === 'InvalidStateError') {
++      throw new ApiError(409, 'credential_exists', 'You already have a passkey for this account in this passkey provider.');
++    }
++    if (err.name === 'SecurityError') {
++      throw new ApiError(0, 'security_error', 'Passkeys aren’t available on this connection. Please use the secure site.');
++    }
++    throw err;
++  }
++  if (!credential) return CANCELLED;
++
++  // Segregated server verification: an unverified credential is orphaned in the provider, so tell it.
++  const encoded = credential.toJSON();
++  try {
++    const { credential: saved } = await api('/api/passkeys/register/verify', { method: 'POST', body: encoded });
++    return saved;
++  } catch (err) {
++    await signalUnknownCredential(publicKey.rp.id, encoded.id);
++    throw err;
++  }
++}
++
++/**
++ * Run a passkey assertion against the given endpoints. Signals unknown credentials on HTTP 404.
++ * @param {{ optionsPath: string, verifyPath: string, mediation?: CredentialMediationRequirement, signal?: AbortSignal, signalUnknown?: boolean }} opts
++ */
++export async function authenticateWithPasskey({ optionsPath, verifyPath, mediation, signal, signalUnknown = true }) {
++  const optionsJSON = await api(optionsPath, { method: 'POST', body: {} });
++  const publicKey = PublicKeyCredential.parseRequestOptionsFromJSON(optionsJSON);
++
++  let credential;
++  try {
++    credential = await navigator.credentials.get({ publicKey, signal, ...(mediation && { mediation }) });
++  } catch (err) {
++    if (err.name === 'NotAllowedError' || err.name === 'AbortError') return CANCELLED;
++    if (err.name === 'SecurityError') {
++      throw new ApiError(0, 'security_error', 'Passkeys aren’t available on this connection. Please use the secure site.');
++    }
++    throw err;
++  }
++  if (!credential) return CANCELLED;
++
++  const encoded = credential.toJSON();
++  try {
++    return await api(verifyPath, { method: 'POST', body: encoded });
++  } catch (err) {
++    if (signalUnknown && err instanceof ApiError && err.status === 404) {
++      await signalUnknownCredential(publicKey.rpId, encoded.id);
++    }
++    throw err;
++  }
++}
+diff --git a/server/aaguid.js b/server/aaguid.js
+new file mode 100644
+index 0000000..dffb846
+--- /dev/null
++++ b/server/aaguid.js
+@@ -0,0 +1,58 @@
++// AAGUID -> passkey provider name/icon lookup.
++// AAGUIDs are UX hints only (not attested for platform passkeys) — never use them for access decisions.
++import { readFile, writeFile, mkdir } from 'node:fs/promises';
++import { dirname } from 'node:path';
++
++const REGISTRY_URL =
++  'https://raw.githubusercontent.com/passkeydeveloper/passkey-authenticator-aaguids/refs/heads/main/combined_aaguid.json';
++const ZERO_AAGUID = '00000000-0000-0000-0000-000000000000';
++
++/** @type {Record<string, { name: string, icon_light?: string, icon_dark?: string }>} */
++let registry = {};
++
++/** Load the cached registry, then refresh it from the network in the background. */
++export async function loadAaguidRegistry(cacheFile) {
++  try {
++    registry = JSON.parse(await readFile(cacheFile, 'utf8'));
++  } catch {
++    // No cache yet.
++  }
++  try {
++    const res = await fetch(REGISTRY_URL, { signal: AbortSignal.timeout(15_000) });
++    if (!res.ok) throw new Error(`HTTP ${res.status}`);
++    const fresh = await res.json();
++    registry = fresh;
++    await mkdir(dirname(cacheFile), { recursive: true });
++    await writeFile(cacheFile, JSON.stringify(fresh));
++  } catch (err) {
++    console.warn('AAGUID registry refresh failed; using cached copy if present.', err.message);
++  }
++}
++
++/** Derive a readable fallback label from the user agent when the AAGUID is unknown/zeroed. */
++function deviceLabelFromUserAgent(ua = '') {
++  const os =
++    /iPhone|iPad/.test(ua) ? 'iOS' :
++    /Android/.test(ua) ? 'Android' :
++    /Mac OS X/.test(ua) ? 'macOS' :
++    /Windows/.test(ua) ? 'Windows' :
++    /CrOS/.test(ua) ? 'ChromeOS' :
++    /Linux/.test(ua) ? 'Linux' : '';
++  return os ? `Passkey on ${os}` : 'Unknown passkey provider';
++}
++
++/**
++ * @param {string} aaguid
++ * @param {string} [userAgent]
++ * @returns {{ name: string, providerIcon?: string }}
++ */
++export function describeAuthenticator(aaguid, userAgent) {
++  if (!aaguid || aaguid === ZERO_AAGUID) {
++    return { name: deviceLabelFromUserAgent(userAgent), providerIcon: undefined };
++  }
++  const provider = registry[aaguid];
++  return {
++    name: provider?.name || 'Unknown passkey provider',
++    providerIcon: provider?.icon_light,
++  };
++}
+diff --git a/server/db.js b/server/db.js
+new file mode 100644
+index 0000000..648f859
+--- /dev/null
++++ b/server/db.js
+@@ -0,0 +1,96 @@
++// Minimal JSON-file persistence for customers and their passkeys.
++// Swap for a real database in production; the shape mirrors the tables you'd need.
++import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
++import { dirname } from 'node:path';
++
++/**
++ * @typedef {object} User
++ * @property {string} id               Internal account ID
++ * @property {string} passkeyUserId    Unpadded Base64URL WebAuthn user handle (user.id)
++ * @property {string} email            Username (WebAuthn user.name)
++ * @property {string} displayName      WebAuthn user.displayName
++ * @property {string} passwordHash     scrypt hash ("salt:hash", both base64url)
++ * @property {number} createdAt
++ *
++ * @typedef {object} StoredPasskeyCredential
++ * @property {string} id                     Base64URL credential ID
++ * @property {string} passkeyUserId          Owning application user ID (User.id)
++ * @property {string} credentialPublicKey    Base64URL COSE public key
++ * @property {'public-key'} credentialType
++ * @property {'singleDevice'|'multiDevice'} credentialDeviceType
++ * @property {boolean} credentialBackedUp
++ * @property {string} aaguid
++ * @property {string} [providerIcon]
++ * @property {string} name
++ * @property {string[]} transports
++ * @property {number} [lastUsedAt]
++ * @property {number} registeredAt
++ * @property {number} counter
++ */
++
++export class Database {
++  /** @param {string} file */
++  constructor(file) {
++    this.file = file;
++    /** @type {{ users: User[], credentials: StoredPasskeyCredential[] }} */
++    this.data = { users: [], credentials: [] };
++    try {
++      this.data = JSON.parse(readFileSync(file, 'utf8'));
++    } catch (err) {
++      if (err.code !== 'ENOENT') throw err;
++    }
++  }
++
++  #save() {
++    mkdirSync(dirname(this.file), { recursive: true });
++    const tmp = `${this.file}.tmp`;
++    writeFileSync(tmp, JSON.stringify(this.data, null, 2));
++    renameSync(tmp, this.file);
++  }
++
++  // Users
++  findUserById(id) {
++    return this.data.users.find((u) => u.id === id);
++  }
++
++  findUserByEmail(email) {
++    const needle = email.toLowerCase();
++    return this.data.users.find((u) => u.email.toLowerCase() === needle);
++  }
++
++  createUser(user) {
++    this.data.users.push(user);
++    this.#save();
++    return user;
++  }
++
++  updateUser(id, patch) {
++    const user = this.findUserById(id);
++    if (!user) return undefined;
++    Object.assign(user, patch);
++    this.#save();
++    return user;
++  }
++
++  // Credentials
++  findCredentialById(id) {
++    return this.data.credentials.find((c) => c.id === id);
++  }
++
++  findCredentialsByUserId(userId) {
++    return this.data.credentials.filter((c) => c.passkeyUserId === userId);
++  }
++
++  saveCredential(cred) {
++    const i = this.data.credentials.findIndex((c) => c.id === cred.id);
++    if (i === -1) this.data.credentials.push(cred);
++    else this.data.credentials[i] = cred;
++    this.#save();
++    return cred;
++  }
++
++  deleteCredential(id) {
++    this.data.credentials = this.data.credentials.filter((c) => c.id !== id);
++    this.#save();
++  }
++}
+diff --git a/server/index.js b/server/index.js
+new file mode 100644
+index 0000000..f8f8291
+--- /dev/null
++++ b/server/index.js
+@@ -0,0 +1,624 @@
++// The Daily Grind web server: static site + customer account and passkey (WebAuthn) API.
++//
++// Configuration (env):
++//   PORT    Port to listen on (default 11222)
++//   ORIGIN  Exact public origin users load the site from (default http://localhost:PORT)
++//   RP_ID   WebAuthn Relying Party ID — the site's registrable domain (default: ORIGIN's hostname)
++//   DATA_DIR  Where account data is persisted (default ./data)
++import { createServer } from 'node:http';
++import { readFile } from 'node:fs/promises';
++import { randomBytes, randomUUID, scrypt, timingSafeEqual } from 'node:crypto';
++import { promisify } from 'node:util';
++import { extname, join, resolve, sep } from 'node:path';
++import { fileURLToPath } from 'node:url';
++import {
++  generateAuthenticationOptions,
++  generateRegistrationOptions,
++  verifyAuthenticationResponse,
++  verifyRegistrationResponse,
++} from '@simplewebauthn/server';
++import { Database } from './db.js';
++import { describeAuthenticator, loadAaguidRegistry } from './aaguid.js';
++
++const ROOT = fileURLToPath(new URL('..', import.meta.url));
++const PUBLIC_DIR = join(ROOT, 'public');
++const DATA_DIR = resolve(process.env.DATA_DIR || join(ROOT, 'data'));
++
++const PORT = Number(process.env.PORT || 11222);
++const ORIGIN = (process.env.ORIGIN || `http://localhost:${PORT}`).replace(/\/$/, '');
++// Predefined RP ID constant. Clients always read it back from server responses
++// (never from window.location.hostname).
++const RP_ID = process.env.RP_ID || new URL(ORIGIN).hostname;
++const RP_NAME = 'The Daily Grind';
++const SECURE_COOKIES = ORIGIN.startsWith('https://');
++
++const SESSION_COOKIE = 'dg_sid';
++const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
++const REAUTH_WINDOW_MS = 5 * 60 * 1000; // Sensitive actions need authentication within this window.
++const CHALLENGE_TTL_MS = 5 * 60 * 1000;
++
++const db = new Database(join(DATA_DIR, 'db.json'));
++loadAaguidRegistry(join(DATA_DIR, 'aaguids.json'));
++
++// ---------------------------------------------------------------------------
++// Sessions (in-memory; use a shared store in production)
++// ---------------------------------------------------------------------------
++
++/**
++ * @typedef {object} Session
++ * @property {string} [userId]
++ * @property {number} [authAt]           Last time the user proved their identity
++ * @property {{ challenge: string, uv: string, expires: number }} [signin]
++ * @property {{ challenge: string, uv: string, expires: number }} [reauth]
++ * @property {{ challenge: string, conditional: boolean, expires: number }} [registration]
++ * @property {number} lastSeen
++ */
++
++/** @type {Map<string, Session>} */
++const sessions = new Map();
++
++setInterval(() => {
++  const now = Date.now();
++  for (const [sid, s] of sessions) if (now - s.lastSeen > SESSION_TTL_MS) sessions.delete(sid);
++}, 60 * 60 * 1000).unref();
++
++function parseCookies(header = '') {
++  return Object.fromEntries(
++    header.split(';').map((p) => p.trim().split('=')).filter(([k, v]) => k && v).map(([k, v]) => [k, decodeURIComponent(v)]),
++  );
++}
++
++function setSessionCookie(res, sid, maxAgeMs) {
++  const parts = [
++    `${SESSION_COOKIE}=${sid}`,
++    'Path=/',
++    'HttpOnly',
++    'SameSite=Lax',
++    `Max-Age=${Math.floor(maxAgeMs / 1000)}`,
++  ];
++  if (SECURE_COOKIES) parts.push('Secure');
++  res.setHeader('Set-Cookie', parts.join('; '));
++}
++
++function getSession(req, res) {
++  const sid = parseCookies(req.headers.cookie)[SESSION_COOKIE];
++  let session = sid && sessions.get(sid);
++  if (session && Date.now() - session.lastSeen > SESSION_TTL_MS) {
++    sessions.delete(sid);
++    session = undefined;
++  }
++  if (!session) {
++    const newSid = randomBytes(32).toString('base64url');
++    session = { lastSeen: Date.now() };
++    sessions.set(newSid, session);
++    setSessionCookie(res, newSid, SESSION_TTL_MS);
++    req.sid = newSid;
++  } else {
++    req.sid = sid;
++  }
++  session.lastSeen = Date.now();
++  return session;
++}
++
++/** Issue a fresh session ID on sign-in to prevent session fixation. */
++function signIn(req, res, userId) {
++  sessions.delete(req.sid);
++  const sid = randomBytes(32).toString('base64url');
++  const session = { userId, authAt: Date.now(), lastSeen: Date.now() };
++  sessions.set(sid, session);
++  setSessionCookie(res, sid, SESSION_TTL_MS);
++  req.sid = sid;
++  return session;
++}
++
++function signOut(req, res) {
++  sessions.delete(req.sid);
++  setSessionCookie(res, '', 0);
++}
++
++// ---------------------------------------------------------------------------
++// Passwords
++// ---------------------------------------------------------------------------
++
++const scryptAsync = promisify(scrypt);
++const DUMMY_HASH = `${randomBytes(16).toString('base64url')}:${randomBytes(64).toString('base64url')}`;
++
++async function hashPassword(password) {
++  const salt = randomBytes(16);
++  const hash = await scryptAsync(password.normalize('NFKC'), salt, 64);
++  return `${salt.toString('base64url')}:${hash.toString('base64url')}`;
++}
++
++async function verifyPassword(password, stored = DUMMY_HASH) {
++  const [salt, expected] = stored.split(':').map((p) => Buffer.from(p, 'base64url'));
++  const actual = await scryptAsync(password.normalize('NFKC'), salt, 64);
++  return timingSafeEqual(actual, expected);
++}
++
++// Simple failed-attempt limiter for password checks.
++const failures = new Map();
++const MAX_FAILURES = 10;
++const FAILURE_WINDOW_MS = 15 * 60 * 1000;
++
++function isRateLimited(key) {
++  const entry = failures.get(key);
++  if (!entry) return false;
++  if (Date.now() - entry.first > FAILURE_WINDOW_MS) {
++    failures.delete(key);
++    return false;
++  }
++  return entry.count >= MAX_FAILURES;
++}
++
++function recordFailure(key) {
++  const entry = failures.get(key);
++  if (!entry || Date.now() - entry.first > FAILURE_WINDOW_MS) failures.set(key, { count: 1, first: Date.now() });
++  else entry.count++;
++}
++
++// ---------------------------------------------------------------------------
++// HTTP helpers
++// ---------------------------------------------------------------------------
++
++class HttpError extends Error {
++  constructor(status, code, message = code) {
++    super(message);
++    this.status = status;
++    this.code = code;
++  }
++}
++
++function sendJson(res, status, body) {
++  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
++  res.end(JSON.stringify(body));
++}
++
++async function readJson(req) {
++  if (!/^application\/json\b/i.test(req.headers['content-type'] || '')) {
++    throw new HttpError(415, 'unsupported_media_type', 'Expected application/json.');
++  }
++  let size = 0;
++  const chunks = [];
++  for await (const chunk of req) {
++    size += chunk.length;
++    if (size > 64 * 1024) throw new HttpError(413, 'payload_too_large');
++    chunks.push(chunk);
++  }
++  try {
++    return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
++  } catch {
++    throw new HttpError(400, 'invalid_json');
++  }
++}
++
++const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
++
++function cleanEmail(value) {
++  const email = typeof value === 'string' ? value.trim() : '';
++  if (!EMAIL_RE.test(email) || email.length > 254) throw new HttpError(400, 'invalid_email', 'Enter a valid email address.');
++  return email;
++}
++
++function cleanName(value, field = 'name') {
++  const name = typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
++  if (!name || name.length > 64) throw new HttpError(400, `invalid_${field}`, 'Enter a name between 1 and 64 characters.');
++  return name;
++}
++
++function cleanPassword(value) {
++  if (typeof value !== 'string' || value.length < 8 || value.length > 256) {
++    throw new HttpError(400, 'invalid_password', 'Passwords must be at least 8 characters.');
++  }
++  return value;
++}
++
++function requireUser(session) {
++  const user = session.userId && db.findUserById(session.userId);
++  if (!user) throw new HttpError(401, 'signed_out', 'Please sign in.');
++  return user;
++}
++
++function requireRecentAuth(session) {
++  const user = requireUser(session);
++  if (!session.authAt || Date.now() - session.authAt > REAUTH_WINDOW_MS) {
++    throw new HttpError(401, 'reauth_required', 'Please confirm it’s you to continue.');
++  }
++  return user;
++}
++
++function takeChallenge(session, key) {
++  const pending = session[key];
++  delete session[key]; // Challenges are single-use.
++  if (!pending || pending.expires < Date.now()) {
++    throw new HttpError(400, 'challenge_expired', 'This request expired. Please try again.');
++  }
++  return pending;
++}
++
++function publicUser(user) {
++  return {
++    email: user.email,
++    displayName: user.displayName,
++    createdAt: user.createdAt,
++    passkeyCount: db.findCredentialsByUserId(user.id).length,
++  };
++}
++
++function publicCredential(cred) {
++  const { id, name, aaguid, providerIcon, registeredAt, lastUsedAt, credentialDeviceType, credentialBackedUp, transports } = cred;
++  return { id, name, aaguid, providerIcon, registeredAt, lastUsedAt, credentialDeviceType, credentialBackedUp, transports };
++}
++
++function toWebAuthnCredential(cred) {
++  return {
++    id: cred.id,
++    publicKey: Buffer.from(cred.credentialPublicKey, 'base64url'),
++    counter: cred.counter,
++    transports: cred.transports,
++  };
++}
++
++/** Verify an assertion against a stored credential and update its usage metadata. */
++async function verifyAssertion(response, cred, pending) {
++  let verification;
++  try {
++    verification = await verifyAuthenticationResponse({
++      response,
++      expectedChallenge: pending.challenge,
++      expectedOrigin: ORIGIN,
++      expectedRPID: RP_ID,
++      credential: toWebAuthnCredential(cred),
++      // 'preferred' must not reject authenticators that skip UV; 'required' is enforced strictly.
++      requireUserVerification: pending.uv === 'required',
++    });
++  } catch (err) {
++    throw new HttpError(400, 'verification_failed', err.message);
++  }
++  if (!verification.verified) throw new HttpError(400, 'verification_failed', 'Passkey could not be verified.');
++  const info = verification.authenticationInfo;
++  db.saveCredential({
++    ...cred,
++    counter: info.newCounter,
++    credentialBackedUp: info.credentialBackedUp,
++    credentialDeviceType: info.credentialDeviceType,
++    lastUsedAt: Date.now(),
++  });
++}
++
++// ---------------------------------------------------------------------------
++// API routes
++// ---------------------------------------------------------------------------
++
++/** @type {Record<string, (ctx: { req: any, res: any, session: Session, params: string[] }) => Promise<[number, any]>>} */
++const routes = {
++  'GET /api/session': async ({ session }) => {
++    const user = session.userId && db.findUserById(session.userId);
++    return [200, { user: user ? publicUser(user) : null }];
++  },
++
++  // --- Customer registration & password sign-in ---------------------------
++
++  'POST /api/account': async ({ req, res }) => {
++    const body = await readJson(req);
++    const email = cleanEmail(body.email);
++    const displayName = cleanName(body.displayName, 'display_name');
++    const password = cleanPassword(body.password);
++    if (db.findUserByEmail(email)) {
++      throw new HttpError(409, 'email_taken', 'An account with this email already exists. Try signing in.');
++    }
++    const user = db.createUser({
++      id: randomUUID(),
++      passkeyUserId: randomBytes(32).toString('base64url'),
++      email,
++      displayName,
++      passwordHash: await hashPassword(password),
++      createdAt: Date.now(),
++    });
++    signIn(req, res, user.id);
++    return [201, { user: publicUser(user) }];
++  },
++
++  'POST /api/signin/password': async ({ req, res }) => {
++    const body = await readJson(req);
++    const email = typeof body.email === 'string' ? body.email.trim() : '';
++    const password = typeof body.password === 'string' ? body.password : '';
++    const limiterKey = `${req.socket.remoteAddress}|${email.toLowerCase()}`;
++    if (isRateLimited(limiterKey)) {
++      throw new HttpError(429, 'rate_limited', 'Too many attempts. Please wait a few minutes and try again.');
++    }
++    const user = email && db.findUserByEmail(email);
++    const ok = await verifyPassword(password, user?.passwordHash);
++    if (!user || !ok) {
++      recordFailure(limiterKey);
++      throw new HttpError(401, 'invalid_credentials', 'That email and password don’t match our records.');
++    }
++    failures.delete(limiterKey);
++    signIn(req, res, user.id);
++    return [200, { user: publicUser(user) }];
++  },
++
++  'POST /api/logout': async ({ req, res }) => {
++    signOut(req, res);
++    return [200, { ok: true }];
++  },
++
++  // --- Passkey sign-in (discoverable credentials) -------------------------
++
++  'POST /api/signin/passkey/options': async ({ session }) => {
++    const options = await generateAuthenticationOptions({
++      rpID: RP_ID,
++      allowCredentials: [], // Discoverable: the passkey provider lists available accounts.
++      userVerification: 'preferred',
++    });
++    // Persist expected UV server-side so the client can't downgrade it.
++    session.signin = { challenge: options.challenge, uv: 'preferred', expires: Date.now() + CHALLENGE_TTL_MS };
++    return [200, { ...options, rpId: RP_ID }];
++  },
++
++  'POST /api/signin/passkey/verify': async ({ req, res, session }) => {
++    const response = await readJson(req);
++    const pending = takeChallenge(session, 'signin');
++    const cred = typeof response.id === 'string' && db.findCredentialById(response.id);
++    if (!cred) throw new HttpError(404, 'credential_not_found', 'This passkey is no longer registered with The Daily Grind.');
++    const user = db.findUserById(cred.passkeyUserId);
++    if (!user) throw new HttpError(404, 'credential_not_found', 'This passkey is no longer registered with The Daily Grind.');
++    const userHandle = response.response?.userHandle;
++    if (userHandle && userHandle !== user.passkeyUserId) {
++      throw new HttpError(400, 'verification_failed', 'Passkey does not belong to this account.');
++    }
++    await verifyAssertion(response, cred, pending);
++    signIn(req, res, user.id);
++    return [200, { user: publicUser(user) }];
++  },
++
++  // --- Passkey registration (signed-in customers) -------------------------
++
++  'POST /api/passkeys/register/options': async ({ req, session }) => {
++    const body = await readJson(req);
++    const user = requireRecentAuth(session);
++    const conditional = body.conditional === true;
++    // Promotions (post-signup prompt / post-password conditional create) target the platform
++    // authenticator; the management panel also allows security keys.
++    const platformOnly = conditional || body.promotion === true;
++    const existing = db.findCredentialsByUserId(user.id);
++    const options = await generateRegistrationOptions({
++      rpName: RP_NAME,
++      rpID: RP_ID,
++      userName: user.email,
++      userDisplayName: user.displayName,
++      userID: Buffer.from(user.passkeyUserId, 'base64url'),
++      attestationType: 'none',
++      excludeCredentials: existing.map((c) => ({ id: c.id, transports: c.transports })),
++      authenticatorSelection: {
++        residentKey: 'required',
++        requireResidentKey: true,
++        userVerification: 'preferred',
++        ...(platformOnly && { authenticatorAttachment: 'platform' }),
++      },
++      supportedAlgorithmIDs: [-7, -257],
++    });
++    session.registration = { challenge: options.challenge, conditional, expires: Date.now() + CHALLENGE_TTL_MS };
++    return [200, options];
++  },
++
++  'POST /api/passkeys/register/verify': async ({ req, session }) => {
++    const response = await readJson(req);
++    const user = requireUser(session);
++    const pending = takeChallenge(session, 'registration');
++    let verification;
++    try {
++      verification = await verifyRegistrationResponse({
++        response,
++        expectedChallenge: pending.challenge,
++        expectedOrigin: ORIGIN,
++        expectedRPID: RP_ID,
++        // Conditional create may legitimately omit user presence; explicit creation must not.
++        requireUserPresence: !pending.conditional,
++        // Options asked for 'preferred', so don't reject authenticators without UV.
++        requireUserVerification: false,
++      });
++    } catch (err) {
++      throw new HttpError(400, 'verification_failed', err.message);
++    }
++    if (!verification.verified) throw new HttpError(400, 'verification_failed', 'Passkey could not be verified.');
++    const info = verification.registrationInfo;
++    if (db.findCredentialById(info.credential.id)) {
++      throw new HttpError(409, 'credential_exists', 'This passkey is already registered.');
++    }
++    const { name, providerIcon } = describeAuthenticator(info.aaguid, req.headers['user-agent']);
++    const cred = db.saveCredential({
++      id: info.credential.id,
++      passkeyUserId: user.id,
++      credentialPublicKey: Buffer.from(info.credential.publicKey).toString('base64url'),
++      credentialType: 'public-key',
++      credentialDeviceType: info.credentialDeviceType,
++      credentialBackedUp: info.credentialBackedUp,
++      aaguid: info.aaguid,
++      providerIcon,
++      name,
++      transports: info.credential.transports || response.response?.transports || [],
++      registeredAt: Date.now(),
++      counter: info.credential.counter,
++    });
++    return [201, { credential: publicCredential(cred) }];
++  },
++
++  // --- Passkey management --------------------------------------------------
++
++  'GET /api/passkeys': async ({ session }) => {
++    const user = requireUser(session);
++    const credentials = db
++      .findCredentialsByUserId(user.id)
++      .sort((a, b) => b.registeredAt - a.registeredAt)
++      .map(publicCredential);
++    return [200, { rpId: RP_ID, userId: user.passkeyUserId, credentials }];
++  },
++
++  'PUT /api/passkeys/:id': async ({ req, session, params }) => {
++    const body = await readJson(req);
++    const user = requireUser(session);
++    const cred = db.findCredentialById(params[0]);
++    if (!cred || cred.passkeyUserId !== user.id) throw new HttpError(404, 'credential_not_found', 'Passkey not found.');
++    cred.name = cleanName(body.name);
++    db.saveCredential(cred);
++    return [200, { credential: publicCredential(cred) }];
++  },
++
++  'DELETE /api/passkeys/:id': async ({ session, params }) => {
++    const user = requireRecentAuth(session);
++    const cred = db.findCredentialById(params[0]);
++    if (!cred || cred.passkeyUserId !== user.id) throw new HttpError(404, 'credential_not_found', 'Passkey not found.');
++    db.deleteCredential(cred.id);
++    return [200, { ok: true }];
++  },
++
++  // --- Profile -------------------------------------------------------------
++
++  'PUT /api/user': async ({ req, session }) => {
++    const body = await readJson(req);
++    const user = requireRecentAuth(session);
++    const email = cleanEmail(body.email);
++    const displayName = cleanName(body.displayName, 'display_name');
++    const clash = db.findUserByEmail(email);
++    if (clash && clash.id !== user.id) throw new HttpError(409, 'email_taken', 'That email is already used by another account.');
++    const updated = db.updateUser(user.id, { email, displayName });
++    return [200, { user: publicUser(updated), rpId: RP_ID, userId: updated.passkeyUserId }];
++  },
++
++  // --- Reauthentication ----------------------------------------------------
++
++  'POST /api/reauth/options': async ({ session }) => {
++    const user = requireUser(session);
++    const passkeys = db.findCredentialsByUserId(user.id);
++    if (passkeys.length === 0) throw new HttpError(409, 'no_passkeys', 'No passkeys registered.');
++    const options = await generateAuthenticationOptions({
++      rpID: RP_ID,
++      // Restrict the prompt to this customer's own passkeys (never discoverable here).
++      allowCredentials: passkeys.map((c) => ({ id: c.id, transports: c.transports })),
++      userVerification: 'required',
++    });
++    session.reauth = { challenge: options.challenge, uv: 'required', expires: Date.now() + CHALLENGE_TTL_MS };
++    return [200, { ...options, rpId: RP_ID }];
++  },
++
++  'POST /api/reauth/verify': async ({ req, session }) => {
++    const response = await readJson(req);
++    const user = requireUser(session);
++    const pending = takeChallenge(session, 'reauth');
++    const cred = typeof response.id === 'string' && db.findCredentialById(response.id);
++    if (!cred) throw new HttpError(404, 'credential_not_found', 'This passkey is no longer registered.');
++    if (cred.passkeyUserId !== user.id) {
++      throw new HttpError(403, 'wrong_account', 'That passkey belongs to a different account.');
++    }
++    await verifyAssertion(response, cred, pending);
++    session.authAt = Date.now();
++    return [200, { ok: true }];
++  },
++
++  'POST /api/reauth/password': async ({ req, session }) => {
++    const body = await readJson(req);
++    const user = requireUser(session);
++    const limiterKey = `${req.socket.remoteAddress}|${user.email.toLowerCase()}`;
++    if (isRateLimited(limiterKey)) throw new HttpError(429, 'rate_limited', 'Too many attempts. Please wait a few minutes.');
++    if (!(await verifyPassword(typeof body.password === 'string' ? body.password : '', user.passwordHash))) {
++      recordFailure(limiterKey);
++      throw new HttpError(401, 'invalid_credentials', 'Incorrect password.');
++    }
++    failures.delete(limiterKey);
++    session.authAt = Date.now();
++    return [200, { ok: true }];
++  },
++};
++
++function matchRoute(method, pathname) {
++  for (const key of Object.keys(routes)) {
++    const [m, pattern] = key.split(' ');
++    if (m !== method) continue;
++    const re = new RegExp(`^${pattern.replace(/:[a-z]+/g, '([A-Za-z0-9_-]+)')}$`);
++    const match = pathname.match(re);
++    if (match) return { handler: routes[key], params: match.slice(1) };
++  }
++  return null;
++}
++
++// ---------------------------------------------------------------------------
++// Static files
++// ---------------------------------------------------------------------------
++
++const PAGES = { '/': 'index.html', '/account': 'account.html' };
++const MIME = {
++  '.html': 'text/html; charset=utf-8',
++  '.css': 'text/css; charset=utf-8',
++  '.js': 'text/javascript; charset=utf-8',
++  '.svg': 'image/svg+xml',
++  '.png': 'image/png',
++  '.ico': 'image/x-icon',
++  '.json': 'application/json; charset=utf-8',
++};
++
++async function serveStatic(req, res, pathname) {
++  const rel = PAGES[pathname] || pathname.slice(1);
++  const file = resolve(PUBLIC_DIR, rel);
++  if (!file.startsWith(PUBLIC_DIR + sep) || !MIME[extname(file)]) return false;
++  try {
++    const body = await readFile(file);
++    res.writeHead(200, {
++      'Content-Type': MIME[extname(file)],
++      'Cache-Control': extname(file) === '.html' ? 'no-cache' : 'public, max-age=300',
++    });
++    res.end(req.method === 'HEAD' ? undefined : body);
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Server
++// ---------------------------------------------------------------------------
++
++const server = createServer(async (req, res) => {
++  res.setHeader('X-Content-Type-Options', 'nosniff');
++  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
++  res.setHeader(
++    'Content-Security-Policy',
++    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
++      "img-src 'self' data: https://images.unsplash.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
++  );
++
++  const { pathname } = new URL(req.url, ORIGIN);
++
++  try {
++    if (pathname.startsWith('/api/')) {
++      const route = matchRoute(req.method, pathname);
++      if (!route) throw new HttpError(404, 'not_found');
++      // CSRF defence: state-changing API calls must come from our own origin.
++      if (req.method !== 'GET' && req.headers.origin !== ORIGIN) {
++        throw new HttpError(403, 'bad_origin', 'Cross-origin request rejected.');
++      }
++      const session = getSession(req, res);
++      const [status, body] = await route.handler({ req, res, session, params: route.params });
++      return sendJson(res, status, body);
++    }
++
++    if (pathname === '/logout' && req.method === 'GET') {
++      getSession(req, res);
++      signOut(req, res);
++      res.writeHead(303, { Location: '/' });
++      return res.end();
++    }
++
++    if ((req.method === 'GET' || req.method === 'HEAD') && (await serveStatic(req, res, pathname))) return;
++
++    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
++    res.end('Not found');
++  } catch (err) {
++    if (err instanceof HttpError) return sendJson(res, err.status, { error: err.code, message: err.message });
++    console.error(err);
++    sendJson(res, 500, { error: 'server_error', message: 'Something went wrong. Please try again.' });
++  }
++});
++
++server.listen(PORT, () => {
++  console.log(`The Daily Grind running at ${ORIGIN} (RP ID: ${RP_ID})`);
++});

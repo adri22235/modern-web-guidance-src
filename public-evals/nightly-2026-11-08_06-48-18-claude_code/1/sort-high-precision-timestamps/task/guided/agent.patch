@@ -1,0 +1,218 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -151,8 +151,79 @@
+       color: var(--text);
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++    /* Order Event Timeline */
++    .timeline-tools {
++      text-align: center;
++    }
++
++    .timeline-tools p {
++      max-width: 650px;
++      margin: 10px auto 0;
++    }
++
++    button.btn {
++      border: 0;
++      font: inherit;
++      cursor: pointer;
++    }
++
++    button.btn:disabled {
++      opacity: 0.6;
++      cursor: progress;
++    }
++
++    #event-status {
++      margin-top: 15px;
++      font-size: 0.9rem;
++    }
++
++    .table-wrap {
++      overflow-x: auto;
++      margin-top: 20px;
++    }
++
++    #event-table {
++      width: 100%;
++      border-collapse: collapse;
++      background: white;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++      border-radius: 8px;
++      font-size: 0.9rem;
++    }
++
++    #event-table caption {
++      caption-side: top;
++      text-align: left;
++      font-weight: bold;
++      padding: 0 0 8px;
++      color: var(--primary);
++    }
++
++    #event-table th,
++    #event-table td {
++      padding: 8px 12px;
++      text-align: left;
++      border-bottom: 1px solid var(--secondary);
++      white-space: nowrap;
++    }
++
++    #event-table th {
++      background: var(--primary);
++      color: white;
++    }
++
++    #event-table td.ts,
++    #event-table td.gap {
++      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
++      font-variant-numeric: tabular-nums;
++    }
++
++    #event-table tr.tie td.gap {
++      color: #bf360c;
++      font-weight: bold;
++    }
+   </style>
+ </head>
+ 
+ <body>
+@@ -194,8 +265,33 @@
+           <a href="/menu/cold-brew" class="btn">View Details</a>
+         </div>
+       </div>
+     </section>
++
++    <section class="timeline-tools" aria-labelledby="timeline-heading">
++      <h2 id="timeline-heading">Order Event Timeline</h2>
++      <p>Our ordering, payment, barista and delivery services each record events with nanosecond UTC
++        timestamps. Load the latest batch to see them merged into true chronological order, along with
++        the time between each step.</p>
++      <button type="button" id="load-events" class="btn">Load &amp; Sort Order Events</button>
++      <p id="event-status" role="status" aria-live="polite"></p>
++      <div class="table-wrap">
++        <table id="event-table" hidden>
++          <caption>Events sorted chronologically (UTC, nanosecond precision)</caption>
++          <thead>
++            <tr>
++              <th scope="col">#</th>
++              <th scope="col">Timestamp (UTC)</th>
++              <th scope="col">Service</th>
++              <th scope="col">Order</th>
++              <th scope="col">Event</th>
++              <th scope="col">Interval since previous</th>
++            </tr>
++          </thead>
++          <tbody></tbody>
++        </table>
++      </div>
++    </section>
+   </main>
+ 
+   <footer>
+     <div class="footer-links">
+@@ -206,7 +302,100 @@
+     </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script type="module">
++    // Load the Temporal polyfill only where the native API is missing (e.g. Safari).
++    if (typeof Temporal === 'undefined') {
++      const module = await import('https://esm.sh/temporal-polyfill@0.3.0');
++      globalThis.Temporal = module.Temporal;
++    }
++
++    // Simulated batch collected from distributed backend services. Arrival order is
++    // scrambled, and several events share the same millisecond — Date would collide them.
++    async function fetchOrderEvents() {
++      return [
++        { service: 'barista-queue', orderId: 'A-1042', type: 'drink.started', ts: '2026-11-08T14:03:12.418772031Z' },
++        { service: 'payments', orderId: 'A-1042', type: 'payment.authorized', ts: '2026-11-08T14:03:09.205114870Z' },
++        { service: 'order-api', orderId: 'A-1043', type: 'order.placed', ts: '2026-11-08T14:03:09.205114002Z' },
++        { service: 'order-api', orderId: 'A-1042', type: 'order.placed', ts: '2026-11-08T14:03:07.981003512Z' },
++        { service: 'inventory', orderId: 'A-1042', type: 'stock.reserved', ts: '2026-11-08T14:03:09.205114870Z' },
++        { service: 'barista-queue', orderId: 'A-1042', type: 'drink.completed', ts: '2026-11-08T14:05:44.090000001Z' },
++        { service: 'payments', orderId: 'A-1043', type: 'payment.authorized', ts: '2026-11-08T14:03:10.002917466Z' },
++        { service: 'notifications', orderId: 'A-1042', type: 'customer.notified', ts: '2026-11-08T14:05:44.090412988Z' },
++        { service: 'barista-queue', orderId: 'A-1043', type: 'drink.started', ts: '2026-11-08T14:05:44.090000417Z' },
++        { service: 'order-api', orderId: 'A-1042', type: 'order.validated', ts: '2026-11-08T14:03:07.981361904Z' },
++        { service: 'barista-queue', orderId: 'A-1043', type: 'drink.completed', ts: '2026-11-08T14:08:01.773250600Z' },
++        { service: 'pickup', orderId: 'A-1042', type: 'order.picked_up', ts: '2026-11-08T14:07:30.500000000Z' },
++      ];
++    }
++
++    const button = document.getElementById('load-events');
++    const status = document.getElementById('event-status');
++    const table = document.getElementById('event-table');
++    const tbody = table.querySelector('tbody');
++
++    const hasDurationFormat = typeof Intl.DurationFormat === 'function';
++    function formatGap(duration) {
++      // toLocaleString() delegates to Intl.DurationFormat; fall back to ISO 8601 if absent.
++      return hasDurationFormat
++        ? duration.toLocaleString(undefined, { style: 'narrow' })
++        : duration.toString();
++    }
++
++    function cell(text, className) {
++      const td = document.createElement('td');
++      td.textContent = text;
++      if (className) td.className = className;
++      return td;
++    }
++
++    button.addEventListener('click', async () => {
++      button.disabled = true;
++      status.textContent = 'Loading order events…';
++      try {
++        const raw = await fetchOrderEvents();
++
++        // Parse with Temporal.Instant (never new Date()) to keep all nanosecond digits.
++        const sorted = raw
++          .map(evt => ({ ...evt, instant: Temporal.Instant.from(evt.ts) }))
++          .toSorted((a, b) => Temporal.Instant.compare(a.instant, b.instant));
++
++        const rows = sorted.map((evt, i) => {
++          const tr = document.createElement('tr');
++          let gapText = '—';
++          if (i > 0) {
++            const prev = sorted[i - 1].instant;
++            if (evt.instant.equals(prev)) {
++              gapText = 'Simultaneous (0 ns)';
++              tr.className = 'tie';
++            } else {
++              // Balance up to hours so long gaps read naturally; nanoseconds are retained.
++              gapText = formatGap(evt.instant.since(prev, { largestUnit: 'hours' }));
++            }
++          }
++          tr.append(
++            cell(String(i + 1)),
++            cell(evt.instant.toString(), 'ts'),
++            cell(evt.service),
++            cell(evt.orderId),
++            cell(evt.type),
++            cell(gapText, 'gap'),
++          );
++          return tr;
++        });
++        tbody.replaceChildren(...rows);
++        table.hidden = false;
++
++        const span = sorted.at(-1).instant.since(sorted[0].instant, { largestUnit: 'hours' });
++        status.textContent = `Sorted ${sorted.length} events from ${new Set(raw.map(e => e.service)).size} services; total span ${formatGap(span)}.`;
++      } catch (err) {
++        console.error(err);
++        status.textContent = 'Sorry, the order events could not be loaded.';
++      } finally {
++        button.disabled = false;
++      }
++    });
++  </script>
+ </body>
+ 
+ </html>

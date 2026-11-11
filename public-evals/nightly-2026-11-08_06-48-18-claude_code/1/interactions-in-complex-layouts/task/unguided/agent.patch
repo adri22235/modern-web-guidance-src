@@ -1,0 +1,457 @@
+diff --git a/board.js b/board.js
+new file mode 100644
+--- a/board.js
++++ b/board.js
+@@ -0,0 +1,452 @@
++/*
++ * Barista order board — pointer-driven drag & drop.
++ *
++ * Performance strategy:
++ *  - One set of delegated listeners on the board (no per-card listeners),
++ *    so adding thousands of orders costs nothing extra.
++ *  - Pointer handlers only record coordinates; all DOM work happens in a
++ *    single requestAnimationFrame callback per frame, reads first, then writes
++ *    (no layout thrashing).
++ *  - The dragged card is moved into a fixed overlay and positioned with
++ *    translate3d only (compositor work, no layout).
++ *  - Column rects and card midpoints are measured once per column entered and
++ *    cached; the drop index is found by binary search (pure math per frame).
++ *  - The placeholder is only moved when the target index actually changes,
++ *    and columns use CSS containment, so any resulting layout stays inside
++ *    one column instead of reflowing the page.
++ *  - Off-screen cards use content-visibility:auto, so huge queues stay cheap.
++ */
++(() => {
++  'use strict';
++
++  const board = document.getElementById('board');
++  if (!board) return;
++
++  const STATUSES = ['queued', 'brewing', 'ready'];
++  const LABELS = { queued: 'Queued', brewing: 'Brewing', ready: 'Ready' };
++  const DRAG_THRESHOLD = 4; // px before a press becomes a drag
++  const CARD_GAP = 10; // must match .order-card margin-bottom
++  const AUTOSCROLL_EDGE = 48; // px
++  const AUTOSCROLL_MAX = 18; // px per frame
++
++  const columns = STATUSES.map((status) => {
++    const el = board.querySelector(`.board-column[data-status="${status}"]`);
++    return {
++      status,
++      el,
++      list: el.querySelector('.board-list'),
++      countEl: el.querySelector('.board-count'),
++      count: 0,
++    };
++  });
++  const columnByStatus = Object.fromEntries(columns.map((c) => [c.status, c]));
++  const live = document.getElementById('board-live');
++
++  const dragLayer = document.createElement('div');
++  dragLayer.className = 'drag-layer';
++  dragLayer.setAttribute('aria-hidden', 'true');
++  document.body.appendChild(dragLayer);
++
++  // ---------------------------------------------------------------- counts
++  let countsDirty = false;
++  function refreshCounts() {
++    if (countsDirty) return;
++    countsDirty = true;
++    requestAnimationFrame(() => {
++      countsDirty = false;
++      for (const c of columns) c.countEl.textContent = c.count;
++    });
++  }
++  for (const c of columns) c.count = c.list.querySelectorAll('.order-card').length;
++  refreshCounts();
++
++  function announce(msg) {
++    live.textContent = msg;
++  }
++
++  function setStatus(card, from, to) {
++    if (from === to) return;
++    card.dataset.status = to.status;
++    from.count--;
++    to.count++;
++    refreshCounts();
++  }
++
++  function cardName(card) {
++    const h = card.querySelector('h3');
++    return h ? h.textContent : 'Order';
++  }
++
++  // -------------------------------------------------------------- creation
++  let nextOrderNo = 1004;
++  function createCard(drink, status, meta) {
++    const card = document.createElement('article');
++    card.className = 'card order-card';
++    card.setAttribute('role', 'listitem');
++    card.tabIndex = 0;
++    card.dataset.status = status;
++
++    const top = document.createElement('div');
++    top.className = 'order-top';
++    const no = document.createElement('span');
++    no.className = 'order-no';
++    no.textContent = `#${nextOrderNo++}`;
++    const grip = document.createElement('span');
++    grip.className = 'grip';
++    grip.setAttribute('aria-hidden', 'true');
++    grip.textContent = '⠿';
++    top.append(no, grip);
++
++    const h = document.createElement('h3');
++    h.textContent = drink;
++    const p = document.createElement('p');
++    p.className = 'order-meta';
++    p.textContent = meta;
++
++    card.append(top, h, p);
++    return card;
++  }
++
++  function nowLabel() {
++    return new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
++  }
++
++  const form = document.getElementById('order-form');
++  form.addEventListener('submit', (e) => {
++    e.preventDefault();
++    const drink = form.drink.value.trim();
++    if (!drink) return;
++    const col = columnByStatus[form.status.value] || columns[0];
++    col.list.appendChild(createCard(drink, col.status, `Placed ${nowLabel()}`));
++    col.count++;
++    refreshCounts();
++    form.drink.value = '';
++    announce(`${drink} added to ${LABELS[col.status]}`);
++  });
++
++  const SAMPLE_DRINKS = [
++    'Maple Oat Latte', 'Dark Roast Espresso', 'Cold Brew', 'Flat White',
++    'Cortado', 'Chai Latte', 'Caramel Macchiato', 'Matcha Latte',
++    'Americano', 'Mocha', 'Cappuccino', 'Nitro Cold Brew',
++  ];
++  const SAMPLE_META = [
++    'Tall · Whole milk', 'Grande · Oat milk', 'Venti · Almond milk',
++    'Double shot', 'Extra hot · No foam', 'Iced · Light ice',
++  ];
++  document.getElementById('bulk-orders').addEventListener('click', () => {
++    // Build off-DOM and insert in one operation.
++    const frag = document.createDocumentFragment();
++    const N = 500;
++    for (let i = 0; i < N; i++) {
++      frag.appendChild(createCard(
++        SAMPLE_DRINKS[(Math.random() * SAMPLE_DRINKS.length) | 0],
++        'queued',
++        SAMPLE_META[(Math.random() * SAMPLE_META.length) | 0],
++      ));
++    }
++    const q = columnByStatus.queued;
++    q.list.appendChild(frag);
++    q.count += N;
++    refreshCounts();
++    announce(`${N} orders added to Queued`);
++  });
++
++  document.getElementById('clear-ready').addEventListener('click', () => {
++    const r = columnByStatus.ready;
++    const n = r.count;
++    r.list.replaceChildren(); // single mutation
++    r.count = 0;
++    refreshCounts();
++    announce(`Cleared ${n} ready order${n === 1 ? '' : 's'}`);
++  });
++
++  // ------------------------------------------------------------- keyboard
++  board.addEventListener('keydown', (e) => {
++    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
++    const card = e.target.closest && e.target.closest('.order-card');
++    if (!card || drag) return;
++    const from = columnByStatus[card.dataset.status];
++    const idx = STATUSES.indexOf(from.status) + (e.key === 'ArrowRight' ? 1 : -1);
++    if (idx < 0 || idx >= STATUSES.length) return;
++    e.preventDefault();
++    const to = columns[idx];
++    to.list.appendChild(card);
++    setStatus(card, from, to);
++    card.focus({ preventScroll: true });
++    card.scrollIntoView({ block: 'nearest' });
++    announce(`${cardName(card)} moved to ${LABELS[to.status]}`);
++  });
++
++  // ---------------------------------------------------------- drag & drop
++  let press = null; // pending press before threshold
++  let drag = null; // active drag state
++  let rafId = 0;
++
++  board.addEventListener('pointerdown', (e) => {
++    if (drag || e.button !== 0 || !e.isPrimary) return;
++    const card = e.target.closest('.order-card');
++    if (!card || !board.contains(card)) return;
++    // Touch scrolls lists by default; on touch only the grip starts a drag.
++    if (e.pointerType === 'touch' && !e.target.closest('.grip')) return;
++
++    press = { card, pointerId: e.pointerId, startX: e.clientX, startY: e.clientY };
++    window.addEventListener('pointermove', onPointerMove, { passive: false });
++    window.addEventListener('pointerup', onPointerUp);
++    window.addEventListener('pointercancel', onPointerCancel);
++  });
++
++  function removeWindowListeners() {
++    window.removeEventListener('pointermove', onPointerMove);
++    window.removeEventListener('pointerup', onPointerUp);
++    window.removeEventListener('pointercancel', onPointerCancel);
++  }
++
++  function onPointerMove(e) {
++    if (press && e.pointerId === press.pointerId) {
++      const dx = e.clientX - press.startX;
++      const dy = e.clientY - press.startY;
++      if (dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD) return;
++      startDrag(press, e);
++      press = null;
++    }
++    if (!drag || e.pointerId !== drag.pointerId) return;
++    e.preventDefault();
++    drag.x = e.clientX;
++    drag.y = e.clientY;
++    schedule();
++  }
++
++  function onPointerUp(e) {
++    if (press && e.pointerId === press.pointerId) {
++      press = null;
++      removeWindowListeners();
++      return;
++    }
++    if (drag && e.pointerId === drag.pointerId) finishDrag(false);
++  }
++
++  function onPointerCancel(e) {
++    if (press && e.pointerId === press.pointerId) {
++      press = null;
++      removeWindowListeners();
++      return;
++    }
++    if (drag && e.pointerId === drag.pointerId) finishDrag(true);
++  }
++
++  function onKeyDuringDrag(e) {
++    if (e.key === 'Escape' && drag) {
++      e.preventDefault();
++      finishDrag(true);
++    }
++  }
++
++  function invalidateRects() {
++    if (drag) {
++      drag.rectsDirty = true;
++      schedule();
++    }
++  }
++
++  function startDrag(p, e) {
++    const card = p.card;
++    // --- reads (layout is clean: nothing has been written yet)
++    const rect = card.getBoundingClientRect();
++    const fromCol = columnByStatus[card.dataset.status];
++
++    // --- writes
++    const placeholder = document.createElement('div');
++    placeholder.className = 'card-placeholder';
++    placeholder.style.height = `${rect.height}px`;
++    placeholder.setAttribute('aria-hidden', 'true');
++
++    const origNext = card.nextElementSibling;
++    card.before(placeholder);
++
++    card.style.width = `${rect.width}px`;
++    card.style.height = `${rect.height}px`;
++    card.style.transform = `translate3d(${rect.left}px, ${rect.top}px, 0)`;
++    card.classList.add('is-dragging');
++    dragLayer.appendChild(card);
++    document.body.classList.add('board-dragging');
++
++    drag = {
++      card,
++      pointerId: p.pointerId,
++      placeholder,
++      phSpan: rect.height + CARD_GAP,
++      fromCol,
++      origNext,
++      offsetX: p.startX - rect.left,
++      offsetY: p.startY - rect.top,
++      x: e.clientX,
++      y: e.clientY,
++      gx: rect.left,
++      gy: rect.top,
++      overCol: fromCol,
++      index: -1, // placeholder index in overCol (base coordinates)
++      rectsDirty: true,
++      listRects: null,
++      measured: null, // { col, cards, mids }
++    };
++    fromCol.el.classList.add('is-over');
++
++    window.addEventListener('keydown', onKeyDuringDrag, true);
++    window.addEventListener('scroll', invalidateRects, { capture: true, passive: true });
++    window.addEventListener('resize', invalidateRects, { passive: true });
++  }
++
++  function schedule() {
++    if (!rafId) rafId = requestAnimationFrame(frame);
++  }
++
++  // Measure card midpoints in "base" coordinates: as though the placeholder
++  // were not in the list. The placeholder therefore never feeds back into the
++  // hit test, so the index is stable and needs no re-measuring as it moves.
++  function measureColumn(col) {
++    const { placeholder, phSpan } = drag;
++    const cards = [];
++    const mids = [];
++    let afterPh = false;
++    for (let el = col.list.firstElementChild; el; el = el.nextElementSibling) {
++      if (el === placeholder) { afterPh = true; continue; }
++      cards.push(el);
++      mids.push(el.offsetTop + el.offsetHeight / 2 - (afterPh ? phSpan : 0));
++    }
++    drag.measured = { col, cards, mids };
++  }
++
++  function lowerBound(arr, v) {
++    let lo = 0;
++    let hi = arr.length;
++    while (lo < hi) {
++      const mid = (lo + hi) >>> 1;
++      if (arr[mid] < v) lo = mid + 1; else hi = mid;
++    }
++    return lo;
++  }
++
++  function frame() {
++    rafId = 0;
++    if (!drag) return;
++    const d = drag;
++
++    // ---------- READ phase
++    if (d.rectsDirty || !d.listRects) {
++      d.listRects = columns.map((c) => c.list.getBoundingClientRect());
++      d.rectsDirty = false;
++    }
++
++    // Which column is under the pointer? (horizontal hit test, pure math)
++    let target = null;
++    let targetRect = null;
++    for (let i = 0; i < columns.length; i++) {
++      const r = d.listRects[i];
++      if (d.x >= r.left && d.x <= r.right) { target = columns[i]; targetRect = r; break; }
++    }
++    // Pointer between/outside columns: keep the last column.
++    if (!target) {
++      target = d.overCol;
++      targetRect = d.listRects[columns.indexOf(target)];
++    }
++
++    if (!d.measured || d.measured.col !== target) measureColumn(target);
++    const list = target.list;
++    const scrollTop = list.scrollTop;
++    const yInList = d.y - targetRect.top + scrollTop - list.clientTop;
++    const newIndex = lowerBound(d.measured.mids, yInList);
++
++    // Auto-scroll when hovering near the top/bottom edge of a column.
++    let scrollBy = 0;
++    if (d.y >= targetRect.top && d.y <= targetRect.bottom) {
++      const fromTop = d.y - targetRect.top;
++      const fromBottom = targetRect.bottom - d.y;
++      if (fromTop < AUTOSCROLL_EDGE) {
++        scrollBy = -Math.ceil(AUTOSCROLL_MAX * (1 - fromTop / AUTOSCROLL_EDGE));
++      } else if (fromBottom < AUTOSCROLL_EDGE) {
++        scrollBy = Math.ceil(AUTOSCROLL_MAX * (1 - fromBottom / AUTOSCROLL_EDGE));
++      }
++    }
++
++    // ---------- WRITE phase
++    const gx = d.x - d.offsetX;
++    const gy = d.y - d.offsetY;
++    if (gx !== d.gx || gy !== d.gy) {
++      d.card.style.transform = `translate3d(${gx}px, ${gy}px, 0)`;
++      d.gx = gx;
++      d.gy = gy;
++    }
++
++    if (target !== d.overCol) {
++      d.overCol.el.classList.remove('is-over');
++      target.el.classList.add('is-over');
++      d.overCol = target;
++      d.index = -1;
++    }
++
++    if (newIndex !== d.index) {
++      const ref = d.measured.cards[newIndex] || null;
++      if (d.placeholder.parentNode !== list || d.placeholder.nextElementSibling !== ref) {
++        list.insertBefore(d.placeholder, ref);
++      }
++      d.index = newIndex;
++    }
++
++    if (scrollBy) {
++      list.scrollTop = scrollTop + scrollBy;
++      schedule(); // keep scrolling while the pointer rests at the edge
++    }
++  }
++
++  function finishDrag(cancelled) {
++    const d = drag;
++    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
++    if (!cancelled) frame(); // flush the final pointer position
++    drag = null;
++    removeWindowListeners();
++    window.removeEventListener('keydown', onKeyDuringDrag, true);
++    window.removeEventListener('scroll', invalidateRects, { capture: true });
++    window.removeEventListener('resize', invalidateRects);
++
++    const { card, placeholder } = d;
++    const fromX = d.gx;
++    const fromY = d.gy;
++    let toCol;
++
++    if (cancelled) {
++      toCol = d.fromCol;
++      const next = d.origNext && d.origNext.parentNode === toCol.list ? d.origNext : null;
++      toCol.list.insertBefore(card, next);
++      placeholder.remove();
++    } else {
++      toCol = d.overCol;
++      placeholder.replaceWith(card);
++    }
++
++    d.overCol.el.classList.remove('is-over');
++    card.classList.remove('is-dragging');
++    card.style.width = '';
++    card.style.height = '';
++    card.style.transform = '';
++    document.body.classList.remove('board-dragging');
++
++    setStatus(card, d.fromCol, toCol);
++    if (!cancelled) {
++      announce(`${cardName(card)} moved to ${LABELS[toCol.status]}`);
++    }
++
++    // FLIP settle animation: one contained layout read, then a
++    // compositor-only transform animation from the ghost's last position.
++    if (card.animate && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
++      const r = card.getBoundingClientRect();
++      const dx = fromX - r.left;
++      const dy = fromY - r.top;
++      if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
++        card.animate(
++          [{ transform: `translate(${dx}px, ${dy}px)` }, { transform: 'translate(0, 0)' }],
++          { duration: 160, easing: 'cubic-bezier(.2,.7,.3,1)' },
++        );
++      }
++    }
++  }
++})();

@@ -1,0 +1,563 @@
+diff --git a/index.html b/index.html
+index 66c9173..1bd1d38 100644
+--- a/index.html
++++ b/index.html
+@@ -152,6 +152,95 @@
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    /* Client-side view feedback & Performance Monitor Panel */
++    .view-panel {
++      background: white;
++      border-left: 4px solid var(--accent);
++      border-radius: 8px;
++      padding: 20px;
++      margin-bottom: 30px;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.08);
++    }
++
++    .view-panel[hidden] {
++      display: none;
++    }
++
++    .view-panel h2 {
++      color: var(--primary);
++      margin-bottom: 8px;
++    }
++
++    .perf-monitor {
++      max-width: 1100px;
++      margin: 20px auto 40px;
++      padding: 0 20px;
++    }
++
++    .perf-monitor-box {
++      background: #fff;
++      border: 1px solid var(--secondary);
++      border-radius: 8px;
++      padding: 16px 20px;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.06);
++      font-size: 0.9rem;
++    }
++
++    .perf-monitor-header {
++      display: flex;
++      justify-content: space-between;
++      align-items: center;
++      border-bottom: 1px solid var(--secondary);
++      padding-bottom: 10px;
++      margin-bottom: 12px;
++    }
++
++    .perf-monitor-header h2 {
++      font-size: 1.1rem;
++      color: var(--primary);
++    }
++
++    .perf-metrics-grid {
++      display: grid;
++      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
++      gap: 12px;
++      margin-bottom: 12px;
++    }
++
++    .perf-stat {
++      background: var(--light);
++      border: 1px solid #eee;
++      border-radius: 6px;
++      padding: 10px 12px;
++    }
++
++    .perf-stat-label {
++      font-size: 0.78rem;
++      text-transform: uppercase;
++      letter-spacing: 0.5px;
++      color: #6d4c41;
++    }
++
++    .perf-stat-value {
++      font-size: 1.15rem;
++      font-weight: bold;
++      color: var(--primary);
++      margin-top: 2px;
++    }
++
++    .perf-log {
++      list-style: none;
++      max-height: 180px;
++      overflow-y: auto;
++      font-family: monospace;
++      font-size: 0.82rem;
++    }
++
++    .perf-log li {
++      padding: 6px 8px;
++      border-bottom: 1px solid #f0ebe8;
++    }
+   </style>
+ </head>
+ 
+@@ -175,6 +264,11 @@
+   </header>
+ 
+   <main class="container">
++    <section id="active-view-panel" class="view-panel" hidden aria-live="polite">
++      <h2 id="active-view-title"></h2>
++      <p id="active-view-description"></p>
++    </section>
++
+     <section>
+       <h2 style="text-align: center;">Seasonal Favorites</h2>
+       <div class="grid">
+@@ -197,6 +291,34 @@
+     </section>
+   </main>
+ 
++  <aside class="perf-monitor" aria-label="Client-Side Performance Monitor">
++    <div class="perf-monitor-box">
++      <div class="perf-monitor-header">
++        <h2>Interaction &amp; Navigation Paint Telemetry</h2>
++        <span id="perf-support-badge">Initializing observers...</span>
++      </div>
++      <div class="perf-metrics-grid">
++        <div class="perf-stat">
++          <div class="perf-stat-label">Navigation Bar Paint</div>
++          <div class="perf-stat-value" id="metric-nav">—</div>
++        </div>
++        <div class="perf-stat">
++          <div class="perf-stat-label">"Order Now" Paint</div>
++          <div class="perf-stat-value" id="metric-order-now">—</div>
++        </div>
++        <div class="perf-stat">
++          <div class="perf-stat-label">"Seasonal Favorites" Paint</div>
++          <div class="perf-stat-value" id="metric-seasonal-card">—</div>
++        </div>
++        <div class="perf-stat">
++          <div class="perf-stat-label">View Switch FCP / LCP</div>
++          <div class="perf-stat-value" id="metric-soft-nav">—</div>
++        </div>
++      </div>
++      <ul class="perf-log" id="perf-log-list"></ul>
++    </div>
++  </aside>
++
+   <footer>
+     <div class="footer-links">
+       <a href="/about">Our Story</a> |
+@@ -207,6 +329,415 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script type="module">
++    const interactionTargetsById = new Map();
++    let lastClickedCategory = null;
++
++    const metricsStore = {
++      interactionPaints: [],
++      softNavigations: [],
++      hardLcp: null,
++      cls: 0,
++      events: [],
++    };
++    window.__dailyGrindPerfMetrics = metricsStore;
++
++    function classifyInteractionElement(element) {
++      if (!(element instanceof Element)) return null;
++      if (element.closest('nav')) {
++        const link = element.closest('a, .logo');
++        return {
++          category: 'navigation-bar',
++          label: `Navigation Bar (${link ? link.textContent.trim() : 'nav'})`,
++        };
++      }
++      if (element.closest('.hero .btn')) {
++        return {
++          category: 'order-now',
++          label: '"Order Now" Button',
++        };
++      }
++      const card = element.closest('.card');
++      if (card) {
++        const title = card.querySelector('h3')?.textContent?.trim() || 'Card';
++        return {
++          category: 'seasonal-favorites',
++          label: `Seasonal Favorites (${title})`,
++        };
++      }
++      return null;
++    }
++
++    function appendPerfLog(message, detail) {
++      const logList = document.getElementById('perf-log-list');
++      if (logList) {
++        const item = document.createElement('li');
++        item.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
++        logList.prepend(item);
++      }
++      console.info(`[DailyGrind Perf] ${message}`, detail ?? '');
++    }
++
++    function updateCategoryStat(category, durationMs) {
++      const formatted = `${durationMs.toFixed(1)} ms`;
++      if (category === 'navigation-bar') {
++        const el = document.getElementById('metric-nav');
++        if (el) el.textContent = formatted;
++      } else if (category === 'order-now') {
++        const el = document.getElementById('metric-order-now');
++        if (el) el.textContent = formatted;
++      } else if (category === 'seasonal-favorites') {
++        const el = document.getElementById('metric-seasonal-card');
++        if (el) el.textContent = formatted;
++      }
++    }
++
++    /**
++     * Observes contentful paints caused by user interactions and invokes a callback
++     * whenever an interaction produces a larger contentful paint.
++     *
++     * @param {(entry: PerformanceEntry) => void} onInteractionPaint
++     */
++    export function observeInteractionPaints(onInteractionPaint) {
++      // Feature-detect support before calling observe() so unsupported browsers
++      // do not throw or log console warnings.
++      if (
++        typeof PerformanceObserver === 'undefined' ||
++        !PerformanceObserver.supportedEntryTypes?.includes('interaction-contentful-paint')
++      ) {
++        return null;
++      }
++
++      const observer = new PerformanceObserver((list) => {
++        for (const entry of list.getEntries()) {
++          // entry.duration is already calculated as (entry.presentationTime - entry.startTime),
++          // giving the total time from the user interaction to this contentful paint.
++          onInteractionPaint(entry);
++        }
++      });
++
++      // MANDATORY: Pass buffered: true to capture interaction paints that occurred
++      // before this observer was registered.
++      observer.observe({ type: 'interaction-contentful-paint', buffered: true });
++      return observer;
++    }
++
++    /**
++     * Tracks FCP and LCP for each client-side soft navigation and reports finalized
++     * route metrics when the user navigates to a new route or hides the page.
++     *
++     * @param {(report: {
++     *   url: string,
++     *   navigationId: number,
++     *   interactionId: number,
++     *   fcpDuration: number,
++     *   lcpDuration: number | null,
++     *   lcpElement: Element | null,
++     *   lcpSize: number | null
++     * }) => void} onSoftNavReport
++     */
++    export function trackSoftNavigationLCP(onSoftNavReport) {
++      const supported =
++        typeof PerformanceObserver !== 'undefined' &&
++        PerformanceObserver.supportedEntryTypes?.includes('soft-navigation') &&
++        PerformanceObserver.supportedEntryTypes?.includes('interaction-contentful-paint');
++
++      if (!supported) {
++        return null;
++      }
++
++      let activeSoftNav = null;
++      let activeLcpEntry = null;
++
++      function finalizeCurrentSoftNav() {
++        if (!activeSoftNav) return;
++
++        onSoftNavReport({
++          // activeSoftNav.name holds the destination URL of the soft navigation.
++          url: activeSoftNav.name,
++          navigationId: activeSoftNav.navigationId,
++          interactionId: activeSoftNav.interactionId,
++          // activeSoftNav.duration is (activeSoftNav.presentationTime - activeSoftNav.startTime),
++          // which represents First Contentful Paint (FCP) relative to interaction start.
++          fcpDuration: activeSoftNav.duration,
++          // activeLcpEntry.duration is (activeLcpEntry.presentationTime - activeSoftNav.startTime),
++          // representing the soft navigation's LCP duration relative to interaction start.
++          lcpDuration: activeLcpEntry ? activeLcpEntry.duration : null,
++          lcpElement: activeLcpEntry?.largestContentfulPaint?.element ?? null,
++          lcpSize: activeLcpEntry?.largestContentfulPaint?.size ?? null,
++        });
++
++        activeSoftNav = null;
++        activeLcpEntry = null;
++      }
++
++      const softNavObserver = new PerformanceObserver((list) => {
++        for (const softNavEntry of list.getEntries()) {
++          // Finalize the previous route's metrics before resetting state for the new route.
++          finalizeCurrentSoftNav();
++
++          activeSoftNav = softNavEntry;
++          // MANDATORY: Seed the LCP candidate with getLargestInteractionContentfulPaint()
++          // to capture any attributed contentful paints that occurred before the URL updated.
++          activeLcpEntry = softNavEntry.getLargestInteractionContentfulPaint();
++
++          const softNavEl = document.getElementById('metric-soft-nav');
++          if (softNavEl) {
++            const fcp = activeSoftNav.duration.toFixed(1);
++            const lcp = activeLcpEntry ? activeLcpEntry.duration.toFixed(1) : fcp;
++            softNavEl.textContent = `${fcp} / ${lcp} ms`;
++          }
++        }
++      });
++
++      const icpObserver = new PerformanceObserver((list) => {
++        for (const icpEntry of list.getEntries()) {
++          // MANDATORY: Match by interactionId (not navigationId) so only paints caused
++          // by the soft navigation's initiating interaction update the route's LCP.
++          if (activeSoftNav && icpEntry.interactionId === activeSoftNav.interactionId) {
++            activeLcpEntry = icpEntry;
++            const softNavEl = document.getElementById('metric-soft-nav');
++            if (softNavEl) {
++              const fcp = activeSoftNav.duration.toFixed(1);
++              const lcp = activeLcpEntry.duration.toFixed(1);
++              softNavEl.textContent = `${fcp} / ${lcp} ms`;
++            }
++          }
++        }
++      });
++
++      softNavObserver.observe({ type: 'soft-navigation', buffered: true });
++      icpObserver.observe({ type: 'interaction-contentful-paint', buffered: true });
++
++      // Finalize the active route's LCP when the page is backgrounded or unloaded.
++      document.addEventListener('visibilitychange', () => {
++        if (document.visibilityState === 'hidden') {
++          finalizeCurrentSoftNav();
++        }
++      });
++
++      return { softNavObserver, icpObserver, finalizeCurrentSoftNav };
++    }
++
++    /**
++     * Keep standard hard-navigation observers ('largest-contentful-paint', 'event',
++     * and 'layout-shift') active across all browsers as fallback and baseline telemetry.
++     */
++    function observeStandardPerformanceEntries() {
++      if (typeof PerformanceObserver === 'undefined') return;
++
++      const supportedTypes = PerformanceObserver.supportedEntryTypes ?? [];
++
++      if (supportedTypes.includes('largest-contentful-paint')) {
++        const lcpObserver = new PerformanceObserver((list) => {
++          for (const entry of list.getEntries()) {
++            metricsStore.hardLcp = entry.startTime;
++          }
++        });
++        lcpObserver.observe({ type: 'largest-contentful-paint', buffered: true });
++      }
++
++      if (supportedTypes.includes('layout-shift')) {
++        const clsObserver = new PerformanceObserver((list) => {
++          for (const entry of list.getEntries()) {
++            if (!entry.hadRecentInput) {
++              metricsStore.cls += entry.value;
++            }
++          }
++        });
++        clsObserver.observe({ type: 'layout-shift', buffered: true });
++      }
++
++      if (supportedTypes.includes('event')) {
++        const eventObserver = new PerformanceObserver((list) => {
++          for (const entry of list.getEntries()) {
++            if (!entry.interactionId) continue;
++
++            const classified = classifyInteractionElement(entry.target);
++            if (classified) {
++              interactionTargetsById.set(entry.interactionId, classified);
++              metricsStore.events.push({
++                interactionId: entry.interactionId,
++                name: entry.name,
++                duration: entry.duration,
++                category: classified.category,
++                label: classified.label,
++              });
++
++              // In browsers without interaction-contentful-paint support, provide graceful
++              // fallback telemetry using PerformanceEventTiming next-paint duration.
++              if (!supportedTypes.includes('interaction-contentful-paint')) {
++                updateCategoryStat(classified.category, entry.duration);
++                appendPerfLog(
++                  `[Event Paint Fallback] ${classified.label}: ${entry.duration.toFixed(1)} ms (interactionId=${entry.interactionId})`,
++                  entry
++                );
++              }
++            }
++          }
++        });
++        eventObserver.observe({ type: 'event', buffered: true, durationThreshold: 16 });
++      }
++    }
++
++    // Initialize interaction contentful paint and soft navigation observers
++    const icpObs = observeInteractionPaints((entry) => {
++      const targetInfo =
++        interactionTargetsById.get(entry.interactionId) ||
++        lastClickedCategory || {
++          category: 'interaction',
++          label: 'Page Interaction',
++        };
++
++      const paintDuration = entry.duration ?? entry.presentationTime - entry.startTime;
++      const lcpDetails = entry.largestContentfulPaint;
++
++      const record = {
++        interactionId: entry.interactionId,
++        category: targetInfo.category,
++        label: targetInfo.label,
++        startTime: entry.startTime,
++        paintTime: entry.paintTime,
++        presentationTime: entry.presentationTime,
++        duration: paintDuration,
++        element: lcpDetails?.element ?? null,
++        size: lcpDetails?.size ?? null,
++      };
++
++      metricsStore.interactionPaints.push(record);
++      updateCategoryStat(targetInfo.category, paintDuration);
++      appendPerfLog(
++        `[Interaction Paint] ${targetInfo.label}: ${paintDuration.toFixed(1)} ms (interactionId=${entry.interactionId}, size=${lcpDetails?.size ?? 0})`,
++        record
++      );
++    });
++
++    const softNavTracker = trackSoftNavigationLCP((report) => {
++      metricsStore.softNavigations.push(report);
++      const softNavEl = document.getElementById('metric-soft-nav');
++      if (softNavEl) {
++        const fcp = report.fcpDuration.toFixed(1);
++        const lcp = report.lcpDuration !== null ? report.lcpDuration.toFixed(1) : 'n/a';
++        softNavEl.textContent = `${fcp} / ${lcp} ms`;
++      }
++      appendPerfLog(
++        `[Soft Navigation Finalized] ${report.url} — FCP: ${report.fcpDuration.toFixed(1)} ms, LCP: ${
++          report.lcpDuration !== null ? `${report.lcpDuration.toFixed(1)} ms` : 'n/a'
++        } (interactionId=${report.interactionId})`,
++        report
++      );
++    });
++
++    observeStandardPerformanceEntries();
++
++    const badge = document.getElementById('perf-support-badge');
++    if (badge) {
++      badge.textContent =
++        icpObs && softNavTracker
++          ? 'ICP & Soft-Nav Observers Active'
++          : 'Standard PerformanceObserver Active (Graceful Fallback)';
++    }
++
++    // Client-side view switch handler for Navigation Bar, "Order Now", and "Seasonal Favorites" cards
++    const routeViews = {
++      '/menu': {
++        title: 'Full Artisanal Menu',
++        description:
++          'Explore single-origin pour-overs, signature espresso drinks, organic teas, and freshly baked pastries roasted daily.',
++      },
++      '/locations': {
++        title: 'Our Coffeehouse Locations',
++        description:
++          'Visit our flagship roastery downtown, the neighborhood cafe on Oak Street, or our riverside espresso bar.',
++      },
++      '/rewards': {
++        title: 'Daily Grind Rewards',
++        description:
++          'Earn 2 beans for every dollar spent. Redeem for complimentary drinks, seasonal tasting flights, and whole-bean bags.',
++      },
++      '/account': {
++        title: 'My Account & Subscriptions',
++        description:
++          'Manage your recurring coffee bean deliveries, saved favorite drinks, and payment preferences.',
++      },
++      '/logout': {
++        title: 'Signed Out',
++        description:
++          'You have signed out of your Daily Grind Rewards session. See you tomorrow morning!',
++      },
++      '/order-online': {
++        title: 'Order Online for Express Pickup',
++        description:
++          'Select your local Daily Grind bar, customize your roast and milk options, and skip the morning line.',
++      },
++      '/menu/seasonal': {
++        title: 'Maple Oat Latte — Seasonal Spotlight',
++        description:
++          'Crafted with double-shot house espresso, velvety steamed oat milk, Grade-A Vermont maple syrup, and a dusting of cinnamon.',
++      },
++      '/menu/espresso': {
++        title: 'Dark Roast Espresso — Roaster Notes',
++        description:
++          '100% Arabica beans from Colombia and Sumatra roasted to a rich dark profile with notes of dark chocolate and toasted walnut.',
++      },
++      '/menu/cold-brew': {
++        title: '18-Hour Signature Cold Brew',
++        description:
++          'Coarse-ground Ethiopian beans steeped in cold filtered water for 18 hours for a naturally sweet, low-acid finish.',
++      },
++    };
++
++    function renderClientSideView(path, fallbackTitle, fallbackDescription) {
++      const panel = document.getElementById('active-view-panel');
++      const titleEl = document.getElementById('active-view-title');
++      const descEl = document.getElementById('active-view-description');
++      if (!panel || !titleEl || !descEl) return;
++
++      const viewData = routeViews[path] || {
++        title: fallbackTitle,
++        description: fallbackDescription,
++      };
++
++      panel.hidden = false;
++      titleEl.textContent = viewData.title;
++      descEl.textContent = viewData.description;
++
++      if (path && window.location.pathname !== path) {
++        history.pushState({ path }, viewData.title, path);
++      }
++    }
++
++    document.addEventListener('click', (event) => {
++      const target = event.target instanceof Element ? event.target : null;
++      if (!target) return;
++
++      const classified = classifyInteractionElement(target);
++      if (!classified) return;
++
++      lastClickedCategory = classified;
++
++      const link = target.closest('a');
++      const card = target.closest('.card');
++
++      if (link) {
++        event.preventDefault();
++        const url = new URL(link.href, window.location.origin);
++        renderClientSideView(
++          url.pathname,
++          link.textContent.trim(),
++          `Loaded ${link.textContent.trim()} view.`
++        );
++      } else if (card) {
++        const cardLink = card.querySelector('a');
++        const path = cardLink
++          ? new URL(cardLink.href, window.location.origin).pathname
++          : '/menu/seasonal';
++        const title = card.querySelector('h3')?.textContent?.trim() || 'Seasonal Favorite';
++        const desc = card.querySelector('p')?.textContent?.trim() || '';
++        renderClientSideView(path, title, desc);
++      }
++    });
++  </script>
+ </body>
+ 
+ </html>

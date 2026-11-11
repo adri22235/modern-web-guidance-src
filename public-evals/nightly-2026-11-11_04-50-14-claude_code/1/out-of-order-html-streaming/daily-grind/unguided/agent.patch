@@ -1,0 +1,466 @@
+diff --git a/index.html b/index.html
+index 66c9173..da0b899 100644
+--- a/index.html
++++ b/index.html
+@@ -152,7 +152,365 @@
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    /* Seasonal Favorites: placeholders, reviews, promo */
++    .grid[aria-busy="true"] .card {
++      cursor: progress;
++    }
++
++    .card--placeholder {
++      pointer-events: none;
++    }
++
++    .card--placeholder .skeleton {
++      background: linear-gradient(90deg, #eee 25%, #f5f5f5 37%, #eee 63%);
++      background-size: 400% 100%;
++      animation: shimmer 1.4s ease infinite;
++      border-radius: 4px;
++      margin: 0 auto 10px;
++    }
++
++    .skeleton--title { height: 1.4rem; width: 60%; }
++    .skeleton--line { height: 0.9rem; width: 85%; }
++    .skeleton--btn { height: 2.4rem; width: 45%; margin-top: 20px !important; }
++
++    @keyframes shimmer {
++      0% { background-position: 100% 50%; }
++      100% { background-position: 0 50%; }
++    }
++
++    @media (prefers-reduced-motion: reduce) {
++      .card--placeholder .skeleton { animation: none; }
++    }
++
++    .seasonal-extras {
++      display: grid;
++      grid-template-columns: 2fr 1fr;
++      gap: 20px;
++      margin-top: 30px;
++    }
++
++    @media (max-width: 760px) {
++      .seasonal-extras { grid-template-columns: 1fr; }
++    }
++
++    .reviews h3,
++    .promo h3 {
++      color: var(--primary);
++      margin-bottom: 10px;
++    }
++
++    .review {
++      background: white;
++      border-radius: 8px;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++      padding: 15px 20px;
++      margin-bottom: 12px;
++    }
++
++    .review__meta {
++      font-size: 0.85rem;
++      color: #6d4c41;
++      margin-bottom: 6px;
++    }
++
++    .review__rating {
++      color: var(--accent);
++      letter-spacing: 2px;
++    }
++
++    .promo {
++      background: var(--secondary);
++      border-radius: 8px;
++      padding: 20px;
++      min-height: 150px;
++    }
++
++    .sr-only {
++      position: absolute;
++      width: 1px;
++      height: 1px;
++      overflow: hidden;
++      clip: rect(0 0 0 0);
++      white-space: nowrap;
++    }
+   </style>
++
++  <script>
++    (() => {
++      'use strict';
++
++      // ---- Configuration (same-origin endpoints; adjust to match the backend) ----
++      const ENDPOINTS = {
++        cards: '/api/menu/seasonal-favorites',      // returns an HTML fragment of .card elements
++        menuEvents: '/api/menu/events',             // SSE stream; emits "menu-updated"
++        reviews: '/api/reviews?collection=seasonal', // JSON: [{ author, rating, body }]
++        promo: '/cms/promos/seasonal-favorites',    // first-party CMS HTML (may include a widget <script>)
++      };
++      // Only these origins may supply external promo widget scripts.
++      const PROMO_SCRIPT_ORIGINS = [location.origin, 'https://cms.dailygrind.coffee'];
++      const POLL_INTERVAL_MS = 120000;
++
++      // ---- Sanitizer configs ----
++      // Server-rendered card markup: structural/presentational elements only.
++      const CARD_POLICY = {
++        div: ['class'], h3: ['class'], p: ['class'], span: ['class'],
++        strong: [], em: [], br: [],
++        a: ['href', 'class', 'title'],
++        img: ['src', 'alt', 'width', 'height', 'loading', 'class'],
++      };
++      // Customer-submitted review bodies: minimal inline formatting, no links/images/attributes.
++      const REVIEW_POLICY = { p: [], br: [], strong: [], em: [], b: [], i: [], ul: [], ol: [], li: [] };
++
++      const toSanitizerConfig = (policy) => ({
++        elements: Object.entries(policy).map(([name, attributes]) => ({ name, attributes })),
++        attributes: [],
++        comments: false,
++        dataAttributes: false,
++      });
++
++      const hasNativeSetHTML = typeof Element.prototype.setHTML === 'function';
++      const DROP_WITH_CONTENT = new Set(['script', 'style', 'template', 'iframe', 'object', 'embed',
++        'noscript', 'svg', 'math', 'form', 'input', 'button', 'textarea', 'select', 'link', 'meta', 'base']);
++
++      function isSafeUrl(value) {
++        try {
++          const url = new URL(value, document.baseURI);
++          return url.protocol === 'https:' || url.protocol === 'http:';
++        } catch {
++          return false;
++        }
++      }
++
++      // Fallback allowlist sanitizer: parses inertly (DOMParser never runs scripts) and
++      // rebuilds only allowed elements/attributes into a fresh fragment.
++      function sanitizeToFragment(html, policy) {
++        const doc = new DOMParser().parseFromString(`<body>${html}`, 'text/html');
++        const out = document.createDocumentFragment();
++        const copy = (src, dest) => {
++          for (const node of src.childNodes) {
++            if (node.nodeType === Node.TEXT_NODE) {
++              dest.append(node.data);
++            } else if (node.nodeType === Node.ELEMENT_NODE) {
++              const tag = node.localName;
++              if (DROP_WITH_CONTENT.has(tag)) continue;
++              if (!Object.hasOwn(policy, tag)) { copy(node, dest); continue; } // unwrap
++              const el = document.createElement(tag);
++              for (const attr of policy[tag]) {
++                const value = node.getAttribute(attr);
++                if (value === null) continue;
++                if ((attr === 'href' || attr === 'src') && !isSafeUrl(value)) continue;
++                el.setAttribute(attr, value);
++              }
++              if (tag === 'a' && el.hasAttribute('href') &&
++                  new URL(el.href).origin !== location.origin) {
++                el.rel = 'noopener noreferrer';
++              }
++              copy(node, el);
++              dest.append(el);
++            }
++          }
++        };
++        copy(doc.body, out);
++        return out;
++      }
++
++      // Safe HTML insertion: native Sanitizer API (Element.setHTML) when available,
++      // otherwise the allowlist fallback above. Never uses innerHTML.
++      function safeSetHTML(target, html, policy) {
++        if (hasNativeSetHTML) {
++          target.setHTML(html, { sanitizer: toSanitizerConfig(policy) });
++        } else {
++          target.replaceChildren(sanitizeToFragment(html, policy));
++        }
++      }
++
++      // ---- Streamed placeholders: <template for="id"> later in the document ----
++      // Browsers with native declarative partial updates consume these themselves;
++      // this fallback only touches templates that are still in the DOM once fully parsed.
++      function applyStreamedTemplate(template) {
++        const target = document.getElementById(template.getAttribute('for'));
++        if (!target) return;
++        target.replaceChildren(document.importNode(template.content, true));
++        template.remove();
++        target.removeAttribute('aria-busy');
++      }
++
++      function flushStreamedTemplates(finalPass) {
++        for (const t of document.querySelectorAll('template[for]')) {
++          // A template is fully parsed once the parser has moved past it.
++          if (finalPass || t.nextSibling) applyStreamedTemplate(t);
++        }
++      }
++
++      const streamObserver = new MutationObserver(() => flushStreamedTemplates(false));
++      streamObserver.observe(document.documentElement, { childList: true, subtree: true });
++
++      // ---- Live card refresh when the menu changes ----
++      let refreshController = null;
++
++      async function refreshCards() {
++        const grid = document.getElementById('seasonal-cards');
++        const status = document.getElementById('seasonal-status');
++        refreshController?.abort();
++        const controller = (refreshController = new AbortController());
++        grid.setAttribute('aria-busy', 'true');
++        try {
++          const res = await fetch(ENDPOINTS.cards, {
++            headers: { Accept: 'text/html' },
++            credentials: 'same-origin',
++            cache: 'no-store',
++            signal: controller.signal,
++          });
++          if (!res.ok) throw new Error(`HTTP ${res.status}`);
++          const html = await res.text();
++          if (controller.signal.aborted) return;
++          const update = () => safeSetHTML(grid, html, CARD_POLICY);
++          // View Transitions give a smooth in-place swap where supported.
++          if (document.startViewTransition && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
++            await document.startViewTransition(update).updateCallbackDone;
++          } else {
++            update();
++          }
++          status.textContent = 'Seasonal favorites updated.';
++        } catch (err) {
++          if (err.name !== 'AbortError') console.warn('[seasonal] refresh failed:', err);
++        } finally {
++          if (refreshController === controller) {
++            grid.removeAttribute('aria-busy');
++            refreshController = null;
++          }
++        }
++      }
++
++      function watchMenuChanges() {
++        let pollTimer = null;
++        const startPolling = () => {
++          if (pollTimer) return;
++          pollTimer = setInterval(() => {
++            if (document.visibilityState === 'visible') refreshCards();
++          }, POLL_INTERVAL_MS);
++        };
++
++        if ('EventSource' in window) {
++          const source = new EventSource(ENDPOINTS.menuEvents, { withCredentials: false });
++          source.addEventListener('menu-updated', refreshCards);
++          source.addEventListener('error', () => {
++            if (source.readyState === EventSource.CLOSED) startPolling();
++          });
++        } else {
++          startPolling();
++        }
++      }
++
++      // ---- Customer reviews (untrusted) ----
++      async function loadReviews() {
++        const container = document.getElementById('seasonal-reviews');
++        try {
++          const res = await fetch(ENDPOINTS.reviews, {
++            headers: { Accept: 'application/json' },
++            credentials: 'same-origin',
++          });
++          if (!res.ok) throw new Error(`HTTP ${res.status}`);
++          const reviews = await res.json();
++          const list = document.createDocumentFragment();
++          for (const review of Array.isArray(reviews) ? reviews.slice(0, 6) : []) {
++            const article = document.createElement('article');
++            article.className = 'review';
++
++            const meta = document.createElement('p');
++            meta.className = 'review__meta';
++            const rating = Math.max(0, Math.min(5, Math.round(Number(review.rating) || 0)));
++            const stars = document.createElement('span');
++            stars.className = 'review__rating';
++            stars.setAttribute('aria-label', `${rating} out of 5 stars`);
++            stars.textContent = '★'.repeat(rating) + '☆'.repeat(5 - rating);
++            meta.append(stars, ` — ${String(review.author ?? 'Anonymous').slice(0, 80)}`);
++
++            const body = document.createElement('div');
++            body.className = 'review__body';
++            safeSetHTML(body, String(review.body ?? ''), REVIEW_POLICY);
++
++            article.append(meta, body);
++            list.append(article);
++          }
++          if (list.childNodes.length) {
++            container.replaceChildren(list);
++          } else {
++            container.textContent = 'No reviews yet — be the first!';
++          }
++        } catch (err) {
++          console.warn('[seasonal] reviews failed:', err);
++          container.textContent = 'Reviews are unavailable right now.';
++        } finally {
++          container.removeAttribute('aria-busy');
++        }
++      }
++
++      // ---- First-party CMS promo (trusted, with embedded widget script) ----
++      // Scripts inserted via parsing APIs never execute, so after inserting the
++      // markup we re-create each <script> (only inline or from allowlisted origins),
++      // in document order, waiting for external scripts so dependencies resolve.
++      async function loadPromo() {
++        const container = document.getElementById('seasonal-promo');
++        try {
++          const res = await fetch(ENDPOINTS.promo, {
++            headers: { Accept: 'text/html' },
++            credentials: 'same-origin',
++          });
++          if (!res.ok) throw new Error(`HTTP ${res.status}`);
++          // Guard against redirects to another origin and non-HTML responses.
++          if (new URL(res.url).origin !== location.origin) throw new Error('Unexpected promo origin');
++          if (!(res.headers.get('Content-Type') || '').includes('text/html')) {
++            throw new Error('Unexpected promo content type');
++          }
++
++          const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
++          const fragment = document.importNode(doc.body, true);
++          const inertScripts = [...fragment.querySelectorAll('script')];
++          container.replaceChildren(...fragment.childNodes);
++
++          for (const inert of inertScripts) {
++            const src = inert.getAttribute('src');
++            if (src !== null) {
++              let url;
++              try { url = new URL(src, document.baseURI); } catch { url = null; }
++              if (!url || !PROMO_SCRIPT_ORIGINS.includes(url.origin)) {
++                console.warn('[seasonal] blocked promo script from', src);
++                inert.remove();
++                continue;
++              }
++            }
++            const live = document.createElement('script');
++            for (const { name, value } of inert.attributes) live.setAttribute(name, value);
++            live.textContent = inert.textContent;
++            // Preserve execution order for external scripts unless marked async.
++            const loaded = src !== null && !inert.hasAttribute('async')
++              ? new Promise((resolve) => { live.onload = live.onerror = resolve; })
++              : null;
++            inert.replaceWith(live);
++            if (loaded) await loaded;
++          }
++        } catch (err) {
++          console.warn('[seasonal] promo failed:', err);
++          container.replaceChildren();
++        } finally {
++          container.removeAttribute('aria-busy');
++        }
++      }
++
++      document.addEventListener('DOMContentLoaded', () => {
++        flushStreamedTemplates(true);
++        streamObserver.disconnect();
++        const grid = document.getElementById('seasonal-cards');
++        if (!grid.querySelector('.card--placeholder')) grid.removeAttribute('aria-busy');
++
++        watchMenuChanges();
++        loadReviews();
++        loadPromo();
++      });
++    })();
++  </script>
+ </head>
+ 
+ <body>
+@@ -175,25 +533,50 @@
+   </header>
+ 
+   <main class="container">
+-    <section>
+-      <h2 style="text-align: center;">Seasonal Favorites</h2>
+-      <div class="grid">
+-        <div class="card">
+-          <h3>Maple Oat Latte</h3>
+-          <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
+-          <a href="/menu/seasonal" class="btn">View Details</a>
++    <section id="seasonal-favorites" aria-labelledby="seasonal-heading">
++      <h2 id="seasonal-heading" style="text-align: center;">Seasonal Favorites</h2>
++      <p id="seasonal-status" class="sr-only" role="status" aria-live="polite"></p>
++
++      <!--
++        Placeholder cards. The real cards are streamed later in this same
++        document as <template for="seasonal-cards"> (see the end of <body>),
++        and are replaced in place whenever the menu changes.
++      -->
++      <div id="seasonal-cards" class="grid" aria-busy="true">
++        <div class="card card--placeholder" aria-hidden="true">
++          <div class="skeleton skeleton--title"></div>
++          <div class="skeleton skeleton--line"></div>
++          <div class="skeleton skeleton--line"></div>
++          <div class="skeleton skeleton--btn"></div>
+         </div>
+-        <div class="card">
+-          <h3>Dark Roast Espresso</h3>
+-          <p>Bold, smokey, and perfect for a morning boost.</p>
+-          <a href="/menu/espresso" class="btn">View Details</a>
++        <div class="card card--placeholder" aria-hidden="true">
++          <div class="skeleton skeleton--title"></div>
++          <div class="skeleton skeleton--line"></div>
++          <div class="skeleton skeleton--line"></div>
++          <div class="skeleton skeleton--btn"></div>
+         </div>
+-        <div class="card">
+-          <h3>Cold Brew</h3>
+-          <p>Steeped for 18 hours for maximum smoothness.</p>
+-          <a href="/menu/cold-brew" class="btn">View Details</a>
++        <div class="card card--placeholder" aria-hidden="true">
++          <div class="skeleton skeleton--title"></div>
++          <div class="skeleton skeleton--line"></div>
++          <div class="skeleton skeleton--line"></div>
++          <div class="skeleton skeleton--btn"></div>
+         </div>
+       </div>
++
++      <div class="seasonal-extras">
++        <!-- Customer-submitted (untrusted) content: always sanitized before insertion. -->
++        <div class="reviews">
++          <h3>What Our Regulars Say</h3>
++          <div id="seasonal-reviews" aria-busy="true">
++            <p>Loading reviews&hellip;</p>
++          </div>
++        </div>
++
++        <!-- First-party CMS promo (trusted): may include its own widget <script>. -->
++        <aside class="promo" aria-label="Promotion">
++          <div id="seasonal-promo" aria-busy="true"></div>
++        </aside>
++      </div>
+     </section>
+   </main>
+ 
+@@ -207,6 +590,29 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <!--
++    Streamed-in real cards (the server flushes this chunk once the menu data is
++    ready). Browsers with native declarative partial updates apply it directly;
++    others are handled by the small fallback in the script below.
++  -->
++  <template for="seasonal-cards">
++    <div class="card">
++      <h3>Maple Oat Latte</h3>
++      <p>Creamy oat milk with a hint of Vermont maple syrup.</p>
++      <a href="/menu/seasonal" class="btn">View Details</a>
++    </div>
++    <div class="card">
++      <h3>Dark Roast Espresso</h3>
++      <p>Bold, smokey, and perfect for a morning boost.</p>
++      <a href="/menu/espresso" class="btn">View Details</a>
++    </div>
++    <div class="card">
++      <h3>Cold Brew</h3>
++      <p>Steeped for 18 hours for maximum smoothness.</p>
++      <a href="/menu/cold-brew" class="btn">View Details</a>
++    </div>
++  </template>
++
+ </body>
+ 
+ </html>

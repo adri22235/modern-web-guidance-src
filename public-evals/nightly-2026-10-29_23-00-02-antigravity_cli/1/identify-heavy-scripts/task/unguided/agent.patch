@@ -1,0 +1,198 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -4,8 +4,194 @@
+ <head>
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <title>The Daily Grind | Artisanal Coffee</title>
++  <script>
++    (function initSlowScriptMonitor() {
++      const THRESHOLDS = {
++        scriptExecutionMs: 50,
++        loafBlockingMs: 50,
++        resourceLoadMs: 200,
++      };
++
++      const slowScriptsLog = {
++        longAnimationFrameScripts: [],
++        longTasks: [],
++        slowNetworkScripts: [],
++      };
++
++      function reportSlowScript(category, details) {
++        console.warn(`[Slow Script Detected - ${category}]`, details);
++      }
++
++      // 1. Long Animation Frames API (LoAF) - attributes main-thread work directly to specific scripts
++      if (
++        typeof PerformanceObserver !== 'undefined' &&
++        PerformanceObserver.supportedEntryTypes &&
++        PerformanceObserver.supportedEntryTypes.includes('long-animation-frame')
++      ) {
++        const loafObserver = new PerformanceObserver((list) => {
++          for (const entry of list.getEntries()) {
++            if (!entry.scripts || entry.scripts.length === 0) continue;
++
++            for (const script of entry.scripts) {
++              if (script.duration >= THRESHOLDS.scriptExecutionMs || entry.blockingDuration >= THRESHOLDS.loafBlockingMs) {
++                const record = {
++                  sourceURL: script.sourceURL || '(inline or anonymous)',
++                  functionName: script.sourceFunctionName || '(anonymous)',
++                  charPosition: script.sourceCharPosition,
++                  invoker: script.invoker,
++                  invokerType: script.invokerType,
++                  scriptDurationMs: Math.round(script.duration * 100) / 100,
++                  forcedStyleAndLayoutMs: Math.round((script.forcedStyleAndLayoutDuration || 0) * 100) / 100,
++                  pauseDurationMs: Math.round((script.pauseDuration || 0) * 100) / 100,
++                  frameDurationMs: Math.round(entry.duration * 100) / 100,
++                  frameBlockingDurationMs: Math.round((entry.blockingDuration || 0) * 100) / 100,
++                  startTimeMs: Math.round(script.startTime * 100) / 100,
++                };
++                slowScriptsLog.longAnimationFrameScripts.push(record);
++                reportSlowScript('Execution (LoAF)', record);
++              }
++            }
++          }
++        });
++
++        try {
++          loafObserver.observe({ type: 'long-animation-frame', buffered: true });
++        } catch (err) {
++          console.error('Failed to observe long-animation-frame:', err);
++        }
++      } else if (
++        // 2. Fallback: Long Tasks API for browsers without LoAF support
++        typeof PerformanceObserver !== 'undefined' &&
++        PerformanceObserver.supportedEntryTypes &&
++        PerformanceObserver.supportedEntryTypes.includes('longtask')
++      ) {
++        const longTaskObserver = new PerformanceObserver((list) => {
++          for (const entry of list.getEntries()) {
++            const attribution = (entry.attribution || []).map((attr) => ({
++              name: attr.name,
++              containerType: attr.containerType,
++              containerSrc: attr.containerSrc,
++              containerId: attr.containerId,
++              containerName: attr.containerName,
++            }));
++
++            const record = {
++              durationMs: Math.round(entry.duration * 100) / 100,
++              startTimeMs: Math.round(entry.startTime * 100) / 100,
++              name: entry.name,
++              attribution,
++            };
++            slowScriptsLog.longTasks.push(record);
++            reportSlowScript('Long Task', record);
++          }
++        });
++
++        try {
++          longTaskObserver.observe({ type: 'longtask', buffered: true });
++        } catch (err) {
++          console.error('Failed to observe longtask:', err);
++        }
++      }
++
++      // 3. Resource Timing API - identifies slow-loading or render-blocking script files over the network
++      if (
++        typeof PerformanceObserver !== 'undefined' &&
++        PerformanceObserver.supportedEntryTypes &&
++        PerformanceObserver.supportedEntryTypes.includes('resource')
++      ) {
++        const resourceObserver = new PerformanceObserver((list) => {
++          for (const entry of list.getEntries()) {
++            const isScript =
++              entry.initiatorType === 'script' ||
++              /\.m?js(\?|$)/i.test(entry.name);
++
++            if (!isScript) continue;
++
++            const isRenderBlocking = entry.renderBlockingStatus === 'blocking';
++            if (entry.duration >= THRESHOLDS.resourceLoadMs || isRenderBlocking) {
++              const record = {
++                url: entry.name,
++                durationMs: Math.round(entry.duration * 100) / 100,
++                ttfbMs: Math.round((entry.responseStart - entry.requestStart) * 100) / 100,
++                downloadMs: Math.round((entry.responseEnd - entry.responseStart) * 100) / 100,
++                transferSizeBytes: entry.transferSize,
++                decodedBodySizeBytes: entry.decodedBodySize,
++                renderBlockingStatus: entry.renderBlockingStatus || 'unknown',
++                startTimeMs: Math.round(entry.startTime * 100) / 100,
++              };
++              slowScriptsLog.slowNetworkScripts.push(record);
++              reportSlowScript('Network/Resource', record);
++            }
++          }
++        });
++
++        try {
++          resourceObserver.observe({ type: 'resource', buffered: true });
++        } catch (err) {
++          console.error('Failed to observe resource timing:', err);
++        }
++      }
++
++      // Expose helper on window for on-demand inspection and summary reporting
++      window.scriptPerformanceMonitor = {
++        thresholds: THRESHOLDS,
++        logs: slowScriptsLog,
++        getSummary() {
++          const byScript = new Map();
++
++          for (const item of slowScriptsLog.longAnimationFrameScripts) {
++            const key = item.sourceURL;
++            const current = byScript.get(key) || {
++              script: key,
++              count: 0,
++              totalExecutionMs: 0,
++              maxExecutionMs: 0,
++              totalBlockingMs: 0,
++              functions: new Set(),
++            };
++            current.count += 1;
++            current.totalExecutionMs = Math.round((current.totalExecutionMs + item.scriptDurationMs) * 100) / 100;
++            current.maxExecutionMs = Math.max(current.maxExecutionMs, item.scriptDurationMs);
++            current.totalBlockingMs = Math.round((current.totalBlockingMs + item.frameBlockingDurationMs) * 100) / 100;
++            current.functions.add(item.functionName);
++            byScript.set(key, current);
++          }
++
++          return Array.from(byScript.values())
++            .map((entry) => ({
++              ...entry,
++              functions: Array.from(entry.functions).join(', '),
++            }))
++            .sort((a, b) => b.totalExecutionMs - a.totalExecutionMs);
++        },
++        printReport() {
++          console.group('Slow Scripts Performance Report');
++          const executionSummary = this.getSummary();
++          if (executionSummary.length > 0) {
++            console.log('Main-Thread Blocking Scripts (LoAF):');
++            console.table(executionSummary);
++          } else {
++            console.log('No slow script executions (LoAF) recorded.');
++          }
++
++          if (slowScriptsLog.longTasks.length > 0) {
++            console.log('Long Tasks:');
++            console.table(slowScriptsLog.longTasks);
++          }
++
++          if (slowScriptsLog.slowNetworkScripts.length > 0) {
++            console.log('Slow or Render-Blocking Network Scripts:');
++            console.table(slowScriptsLog.slowNetworkScripts);
++          } else {
++            console.log('No slow network scripts recorded.');
++          }
++          console.groupEnd();
++        },
++      };
++    })();
++  </script>
+   <style>
+     :root {
+       --primary: #4e342e;
+       --secondary: #d7ccc8;

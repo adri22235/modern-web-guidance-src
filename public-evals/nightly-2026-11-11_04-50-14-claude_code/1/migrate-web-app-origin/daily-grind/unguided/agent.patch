@@ -1,0 +1,605 @@
+diff --git a/app.js b/app.js
+new file mode 100644
+index 0000000..2f2b50e
+--- /dev/null
++++ b/app.js
+@@ -0,0 +1,214 @@
++/* The Daily Grind: user preferences and the origin-migration handoff.
++ *
++ * localStorage belongs to one origin, so the browser cannot carry it from the
++ * legacy origin to the new one on its own. When the page runs on the legacy
++ * origin, it packs the user's saved configuration into the URL *fragment*
++ * (fragments are never sent to servers) and redirects to the same path on the
++ * new origin. The new origin checks the payload, merges it in, and removes the
++ * fragment from the address bar.
++ *
++ * Installed-app identity and OS integration (launcher icon, taskbar pin and
++ * jump-list shortcuts) carry over through the manifest pair:
++ * legacy/manifest.webmanifest declares `migrate_to` and manifest.webmanifest
++ * declares `migrate_from`. Both list the same `shortcuts`.
++ */
++(function () {
++  'use strict';
++
++  var CFG = window.DG_MIGRATION;
++  var STORAGE_KEY = 'dg:prefs';
++  var SCHEMA_VERSION = 1;
++
++  // Allowed preference keys and their validators. Anything else is dropped on import.
++  var PREF_SCHEMA = {
++    favoriteDrink: oneOf(['', 'maple-oat-latte', 'dark-roast-espresso', 'cold-brew']),
++    milk: oneOf(['whole', 'oat', 'almond', 'soy', 'none']),
++    size: oneOf(['small', 'medium', 'large']),
++    homeLocation: oneOf(['', 'downtown', 'riverside', 'uptown']),
++    theme: oneOf(['light', 'dark']),
++    notifications: function (v) { return typeof v === 'boolean'; }
++  };
++  var DEFAULT_PREFS = {
++    favoriteDrink: '', milk: 'whole', size: 'medium',
++    homeLocation: '', theme: 'light', notifications: false
++  };
++
++  function oneOf(list) { return function (v) { return list.indexOf(v) !== -1; }; }
++
++  // ---------- storage ----------
++  function sanitize(raw) {
++    var out = {};
++    if (!raw || typeof raw !== 'object') return out;
++    Object.keys(PREF_SCHEMA).forEach(function (k) {
++      if (Object.prototype.hasOwnProperty.call(raw, k) && PREF_SCHEMA[k](raw[k])) out[k] = raw[k];
++    });
++    return out;
++  }
++
++  function readStore() {
++    try {
++      var data = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
++      if (data && data.v === SCHEMA_VERSION) {
++        return { v: SCHEMA_VERSION, updatedAt: Number(data.updatedAt) || 0, prefs: sanitize(data.prefs) };
++      }
++    } catch (e) { /* corrupted or unavailable storage */ }
++    return { v: SCHEMA_VERSION, updatedAt: 0, prefs: {} };
++  }
++
++  function writeStore(store) {
++    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(store)); } catch (e) { /* quota / private mode */ }
++  }
++
++  function getPrefs() {
++    var p = readStore().prefs, out = {};
++    Object.keys(DEFAULT_PREFS).forEach(function (k) { out[k] = k in p ? p[k] : DEFAULT_PREFS[k]; });
++    return out;
++  }
++
++  function savePrefs(prefs) {
++    writeStore({ v: SCHEMA_VERSION, updatedAt: Date.now(), prefs: sanitize(prefs) });
++  }
++
++  // ---------- base64url JSON ----------
++  function encode(obj) {
++    var bytes = new TextEncoder().encode(JSON.stringify(obj)), bin = '';
++    bytes.forEach(function (b) { bin += String.fromCharCode(b); });
++    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
++  }
++  function decode(str) {
++    var b64 = str.replace(/-/g, '+').replace(/_/g, '/');
++    while (b64.length % 4) b64 += '=';
++    var bin = atob(b64), bytes = new Uint8Array(bin.length);
++    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
++    return JSON.parse(new TextDecoder().decode(bytes));
++  }
++
++  // ---------- origin detection ----------
++  var origin = location.origin;
++  var isLegacy = origin === CFG.LEGACY_ORIGIN;
++  var isStandalone = (window.matchMedia && matchMedia('(display-mode: standalone)').matches) ||
++    window.navigator.standalone === true;
++
++  // Each origin gets the manifest that matches its role in the migration.
++  (function linkManifest() {
++    var link = document.createElement('link');
++    link.rel = 'manifest';
++    link.href = isLegacy ? CFG.LEGACY_MANIFEST : CFG.CURRENT_MANIFEST;
++    document.head.appendChild(link);
++  })();
++
++  // ---------- legacy origin: export and redirect ----------
++  function buildHandoffUrl() {
++    var target = new URL(location.pathname + location.search, CFG.CURRENT_ORIGIN);
++    var store = readStore();
++    if (store.updatedAt) {
++      target.hash = CFG.HASH_KEY + '=' + encode({
++        v: SCHEMA_VERSION, from: origin, updatedAt: store.updatedAt, prefs: store.prefs
++      });
++    }
++    return target.href;
++  }
++
++  function handoff() { location.replace(buildHandoffUrl()); }
++
++  if (isLegacy) {
++    if (!isStandalone) {
++      // Regular browser tab: nothing to wait for, go straight to the new origin.
++      handoff();
++      return;
++    }
++    // Installed app: keep the page up briefly so the browser can read the
++    // legacy manifest (`migrate_to`) and start migrating the installed app.
++    document.addEventListener('DOMContentLoaded', function () {
++      showBanner(
++        'The Daily Grind has moved to ' + CFG.CURRENT_ORIGIN.replace(/^https?:\/\//, '') +
++        '. Your preferences and shortcuts are coming with you.',
++        'Continue now', handoff
++      );
++      setTimeout(handoff, CFG.STANDALONE_HANDOFF_DELAY_MS);
++    });
++    return;
++  }
++
++  // ---------- new origin: import ----------
++  function importFromHash() {
++    var hash = location.hash.replace(/^#/, '');
++    if (!hash) return false;
++    var params = new URLSearchParams(hash);
++    var payload = params.get(CFG.HASH_KEY);
++    if (payload === null) return false;
++
++    // Always remove the payload from the URL, whether or not it's valid.
++    params.delete(CFG.HASH_KEY);
++    var rest = params.toString();
++    history.replaceState(history.state, '', location.pathname + location.search + (rest ? '#' + rest : ''));
++
++    var data;
++    try { data = decode(payload); } catch (e) { return false; }
++    if (!data || data.v !== SCHEMA_VERSION || data.from !== CFG.LEGACY_ORIGIN) return false;
++
++    var incoming = sanitize(data.prefs);
++    var incomingAt = Number(data.updatedAt) || 0;
++    var local = readStore();
++    // If this origin already has newer settings, keep them. Otherwise, fill missing keys.
++    var merged = incomingAt > local.updatedAt
++      ? Object.assign({}, local.prefs, incoming)
++      : Object.assign({}, incoming, local.prefs);
++    writeStore({ v: SCHEMA_VERSION, updatedAt: Math.max(incomingAt, local.updatedAt) || Date.now(), prefs: merged });
++    return true;
++  }
++
++  var imported = importFromHash();
++
++  // ---------- UI ----------
++  function applyTheme(prefs) {
++    document.documentElement.setAttribute('data-theme', prefs.theme);
++  }
++  applyTheme(getPrefs());
++
++  function showBanner(text, actionLabel, onAction) {
++    var el = document.createElement('div');
++    el.className = 'dg-banner';
++    el.setAttribute('role', 'status');
++    var span = document.createElement('span');
++    span.textContent = text;
++    el.appendChild(span);
++    var btn = document.createElement('button');
++    btn.type = 'button';
++    btn.textContent = actionLabel || 'Dismiss';
++    btn.addEventListener('click', function () { (onAction || function () { el.remove(); })(); });
++    el.appendChild(btn);
++    document.body.appendChild(el);
++  }
++
++  document.addEventListener('DOMContentLoaded', function () {
++    var form = document.getElementById('prefs-form');
++    if (form) {
++      var prefs = getPrefs();
++      Object.keys(prefs).forEach(function (k) {
++        var field = form.elements[k];
++        if (!field) return;
++        if (field.type === 'checkbox') field.checked = prefs[k]; else field.value = prefs[k];
++      });
++      form.addEventListener('submit', function (e) {
++        e.preventDefault();
++        var next = {};
++        Object.keys(DEFAULT_PREFS).forEach(function (k) {
++          var field = form.elements[k];
++          if (field) next[k] = field.type === 'checkbox' ? field.checked : field.value;
++        });
++        savePrefs(next);
++        applyTheme(getPrefs());
++        var status = document.getElementById('prefs-status');
++        if (status) status.textContent = 'Preferences saved.';
++      });
++    }
++    if (imported) showBanner('Welcome to our new home! Your saved preferences were transferred.');
++  });
++
++  if ('serviceWorker' in navigator) {
++    window.addEventListener('load', function () {
++      navigator.serviceWorker.register('/sw.js').catch(function () { /* offline support is optional */ });
++    });
++  }
++})();
+diff --git a/icons/icon-192.png b/icons/icon-192.png
+new file mode 100644
+index 0000000..d27516e
+Binary files /dev/null and b/icons/icon-192.png differ
+diff --git a/icons/icon-512.png b/icons/icon-512.png
+new file mode 100644
+index 0000000..343ecb3
+Binary files /dev/null and b/icons/icon-512.png differ
+diff --git a/icons/icon.svg b/icons/icon.svg
+new file mode 100644
+index 0000000..e3a5f08
+--- /dev/null
++++ b/icons/icon.svg
+@@ -0,0 +1,8 @@
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
++  <rect width="512" height="512" fill="#4e342e"/>
++  <g fill="none" stroke="#ffab40" stroke-width="26" stroke-linecap="round">
++    <path d="M150 220h180v90a90 90 0 0 1-90 90h0a90 90 0 0 1-90-90z" fill="#d7ccc8" stroke="#d7ccc8"/>
++    <path d="M330 240h20a40 40 0 0 1 0 80h-24"/>
++    <path d="M200 110c-20 30 20 50 0 80M260 110c-20 30 20 50 0 80"/>
++  </g>
++</svg>
+diff --git a/icons/maskable-512.png b/icons/maskable-512.png
+new file mode 100644
+index 0000000..53fade4
+Binary files /dev/null and b/icons/maskable-512.png differ
+diff --git a/icons/shortcut-96.png b/icons/shortcut-96.png
+new file mode 100644
+index 0000000..095f907
+Binary files /dev/null and b/icons/shortcut-96.png differ
+diff --git a/index.html b/index.html
+index 66c9173..a332d82 100644
+--- a/index.html
++++ b/index.html
+@@ -5,6 +5,13 @@
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <title>The Daily Grind | Artisanal Coffee</title>
++  <meta name="theme-color" content="#4e342e">
++  <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
++  <link rel="apple-touch-icon" href="/icons/icon-192.png">
++  <!-- The manifest <link> is added by app.js: the legacy origin gets one with
++       migrate_to, the current origin gets one with migrate_from. -->
++  <script src="/migration-config.js"></script>
++  <script src="/app.js"></script>
+   <style>
+     :root {
+       --primary: #4e342e;
+@@ -135,6 +142,96 @@
+       background: #3e2723;
+     }
+ 
++    /* Preferences */
++    .prefs {
++      background: white;
++      padding: 24px;
++      border-radius: 8px;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++      margin-top: 40px;
++    }
++
++    .prefs form {
++      display: grid;
++      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
++      gap: 16px;
++      margin-top: 16px;
++    }
++
++    .prefs label {
++      display: flex;
++      flex-direction: column;
++      font-size: 0.9rem;
++      gap: 4px;
++    }
++
++    .prefs label.check {
++      flex-direction: row;
++      align-items: center;
++      gap: 8px;
++    }
++
++    .prefs select {
++      padding: 6px;
++      border-radius: 4px;
++      border: 1px solid var(--secondary);
++    }
++
++    .prefs button {
++      border: 0;
++      cursor: pointer;
++      font: inherit;
++      align-self: end;
++    }
++
++    #prefs-status {
++      margin-top: 10px;
++      font-size: 0.85rem;
++    }
++
++    .dg-banner {
++      position: fixed;
++      left: 50%;
++      bottom: 20px;
++      transform: translateX(-50%);
++      background: var(--primary);
++      color: white;
++      padding: 12px 16px;
++      border-radius: 8px;
++      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
++      display: flex;
++      gap: 12px;
++      align-items: center;
++      max-width: 90vw;
++      z-index: 2000;
++    }
++
++    .dg-banner button {
++      background: var(--accent);
++      color: var(--text);
++      border: 0;
++      border-radius: 4px;
++      padding: 6px 12px;
++      cursor: pointer;
++      font: inherit;
++      white-space: nowrap;
++    }
++
++    [data-theme="dark"] {
++      --text: #efebe9;
++      --light: #1b1412;
++      --secondary: #3e2723;
++    }
++
++    [data-theme="dark"] .card,
++    [data-theme="dark"] .prefs {
++      background: #2a1f1c;
++    }
++
++    [data-theme="dark"] .card h3 {
++      color: var(--accent);
++    }
++
+     footer {
+       background: var(--secondary);
+       text-align: center;
+@@ -195,6 +292,53 @@
+         </div>
+       </div>
+     </section>
++
++    <section class="prefs" id="preferences">
++      <h2>My Preferences</h2>
++      <form id="prefs-form">
++        <label>Favorite drink
++          <select name="favoriteDrink">
++            <option value="">No favorite</option>
++            <option value="maple-oat-latte">Maple Oat Latte</option>
++            <option value="dark-roast-espresso">Dark Roast Espresso</option>
++            <option value="cold-brew">Cold Brew</option>
++          </select>
++        </label>
++        <label>Milk
++          <select name="milk">
++            <option value="whole">Whole</option>
++            <option value="oat">Oat</option>
++            <option value="almond">Almond</option>
++            <option value="soy">Soy</option>
++            <option value="none">None</option>
++          </select>
++        </label>
++        <label>Size
++          <select name="size">
++            <option value="small">Small</option>
++            <option value="medium">Medium</option>
++            <option value="large">Large</option>
++          </select>
++        </label>
++        <label>Home location
++          <select name="homeLocation">
++            <option value="">Not set</option>
++            <option value="downtown">Downtown</option>
++            <option value="riverside">Riverside</option>
++            <option value="uptown">Uptown</option>
++          </select>
++        </label>
++        <label>Theme
++          <select name="theme">
++            <option value="light">Light</option>
++            <option value="dark">Dark</option>
++          </select>
++        </label>
++        <label class="check"><input type="checkbox" name="notifications"> Order-ready notifications</label>
++        <button type="submit" class="btn">Save Preferences</button>
++      </form>
++      <p id="prefs-status" role="status"></p>
++    </section>
+   </main>
+ 
+   <footer>
+diff --git a/legacy/.well-known/web-app-origin-association b/legacy/.well-known/web-app-origin-association
+new file mode 100644
+index 0000000..e3bab9c
+--- /dev/null
++++ b/legacy/.well-known/web-app-origin-association
+@@ -0,0 +1,5 @@
++{
++  "https://app.dailygrind.coffee/": {
++    "scope": "/"
++  }
++}
+diff --git a/legacy/manifest.webmanifest b/legacy/manifest.webmanifest
+new file mode 100644
+index 0000000..23fe9ca
+--- /dev/null
++++ b/legacy/manifest.webmanifest
+@@ -0,0 +1,85 @@
++{
++  "id": "/",
++  "name": "The Daily Grind",
++  "short_name": "Daily Grind",
++  "description": "Order artisanal coffee, find locations and track rewards.",
++  "start_url": "/?source=pwa",
++  "scope": "/",
++  "display": "standalone",
++  "background_color": "#fafafa",
++  "theme_color": "#4e342e",
++  "icons": [
++    {
++      "src": "/icons/icon-192.png",
++      "sizes": "192x192",
++      "type": "image/png"
++    },
++    {
++      "src": "/icons/icon-512.png",
++      "sizes": "512x512",
++      "type": "image/png"
++    },
++    {
++      "src": "/icons/maskable-512.png",
++      "sizes": "512x512",
++      "type": "image/png",
++      "purpose": "maskable"
++    },
++    {
++      "src": "/icons/icon.svg",
++      "sizes": "any",
++      "type": "image/svg+xml"
++    }
++  ],
++  "shortcuts": [
++    {
++      "name": "Order Now",
++      "short_name": "Order",
++      "url": "/order-online?source=shortcut",
++      "icons": [
++        {
++          "src": "/icons/shortcut-96.png",
++          "sizes": "96x96",
++          "type": "image/png"
++        }
++      ]
++    },
++    {
++      "name": "Menu",
++      "url": "/menu?source=shortcut",
++      "icons": [
++        {
++          "src": "/icons/shortcut-96.png",
++          "sizes": "96x96",
++          "type": "image/png"
++        }
++      ]
++    },
++    {
++      "name": "Rewards",
++      "url": "/rewards?source=shortcut",
++      "icons": [
++        {
++          "src": "/icons/shortcut-96.png",
++          "sizes": "96x96",
++          "type": "image/png"
++        }
++      ]
++    },
++    {
++      "name": "Locations",
++      "url": "/locations?source=shortcut",
++      "icons": [
++        {
++          "src": "/icons/shortcut-96.png",
++          "sizes": "96x96",
++          "type": "image/png"
++        }
++      ]
++    }
++  ],
++  "migrate_to": {
++    "id": "https://app.dailygrind.coffee/",
++    "install_url": "https://app.dailygrind.coffee/?source=migration"
++  }
++}
+diff --git a/manifest.webmanifest b/manifest.webmanifest
+new file mode 100644
+index 0000000..b4e2bca
+--- /dev/null
++++ b/manifest.webmanifest
+@@ -0,0 +1,26 @@
++{
++  "id": "/",
++  "name": "The Daily Grind",
++  "short_name": "Daily Grind",
++  "description": "Order artisanal coffee, find locations and track rewards.",
++  "start_url": "/?source=pwa",
++  "scope": "/",
++  "display": "standalone",
++  "background_color": "#fafafa",
++  "theme_color": "#4e342e",
++  "icons": [
++    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
++    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
++    { "src": "/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
++    { "src": "/icons/icon.svg", "sizes": "any", "type": "image/svg+xml" }
++  ],
++  "shortcuts": [
++    { "name": "Order Now", "short_name": "Order", "url": "/order-online?source=shortcut", "icons": [{ "src": "/icons/shortcut-96.png", "sizes": "96x96", "type": "image/png" }] },
++    { "name": "Menu", "url": "/menu?source=shortcut", "icons": [{ "src": "/icons/shortcut-96.png", "sizes": "96x96", "type": "image/png" }] },
++    { "name": "Rewards", "url": "/rewards?source=shortcut", "icons": [{ "src": "/icons/shortcut-96.png", "sizes": "96x96", "type": "image/png" }] },
++    { "name": "Locations", "url": "/locations?source=shortcut", "icons": [{ "src": "/icons/shortcut-96.png", "sizes": "96x96", "type": "image/png" }] }
++  ],
++  "migrate_from": [
++    { "id": "https://www.dailygrind.coffee/", "behavior": "force" }
++  ]
++}
+diff --git a/migration-config.js b/migration-config.js
+new file mode 100644
+index 0000000..f652407
+--- /dev/null
++++ b/migration-config.js
+@@ -0,0 +1,16 @@
++// Origin migration settings for The Daily Grind web app.
++// The app used to be installed from LEGACY_ORIGIN and now lives on CURRENT_ORIGIN.
++// Both origins serve this same build. app.js checks which one it's on and
++// picks the right manifest and behaviour.
++window.DG_MIGRATION = Object.freeze({
++  LEGACY_ORIGIN: 'https://www.dailygrind.coffee',
++  CURRENT_ORIGIN: 'https://app.dailygrind.coffee',
++  // Manifest used when the page is served from LEGACY_ORIGIN (contains `migrate_to`).
++  LEGACY_MANIFEST: '/legacy/manifest.webmanifest',
++  // Manifest used everywhere else (contains `migrate_from`).
++  CURRENT_MANIFEST: '/manifest.webmanifest',
++  // How long an installed (standalone) legacy app stays open before it hands off.
++  // This gives the browser time to fetch the legacy manifest and see `migrate_to`.
++  STANDALONE_HANDOFF_DELAY_MS: 5000,
++  HASH_KEY: 'dg-migrate'
++});
+diff --git a/sw.js b/sw.js
+new file mode 100644
+index 0000000..0f1c48e
+--- /dev/null
++++ b/sw.js
+@@ -0,0 +1,24 @@
++// Small offline service worker: network-first for pages, cache-first for static assets.
++const CACHE = 'dg-v1';
++const ASSETS = ['/', '/app.js', '/migration-config.js', '/manifest.webmanifest',
++  '/icons/icon-192.png', '/icons/icon-512.png', '/icons/maskable-512.png', '/icons/icon.svg'];
++
++self.addEventListener('install', (e) => {
++  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(ASSETS)).then(() => self.skipWaiting()));
++});
++
++self.addEventListener('activate', (e) => {
++  e.waitUntil(caches.keys()
++    .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
++    .then(() => self.clients.claim()));
++});
++
++self.addEventListener('fetch', (e) => {
++  const req = e.request;
++  if (req.method !== 'GET' || new URL(req.url).origin !== self.location.origin) return;
++  if (req.mode === 'navigate') {
++    e.respondWith(fetch(req).catch(() => caches.match('/')));
++    return;
++  }
++  e.respondWith(caches.match(req).then((hit) => hit || fetch(req)));
++});

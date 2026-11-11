@@ -1,0 +1,158 @@
+diff --git a/README.md b/README.md
+index 4479b53..7ac4b72 100644
+--- a/README.md
++++ b/README.md
+@@ -15,3 +15,16 @@ The application will now be running on `http://localhost:11224`.
+ - **[React](https://react.dev/)**: Used for UI components.
+ - **[Tailwind CSS](https://tailwindcss.com/)**: For styling the application.
+ - **[Astro DB](https://docs.astro.build/en/guides/database/)**: Powers the comments feature, using a libSQL-compatible database.
++
++## View preservation
++
++The client router retains the active page and up to four recently visited page
++views in a persistent main container. Returning to a cached path and query string
++reuses its DOM nodes and component state. Inactive views are hidden and inert;
++the least recently used view is removed when the cache fills. Hash navigation
++continues to use Astro's normal scroll behavior.
++
++Navigation still fetches the destination so its head, title, and styles stay up to
++date. Replace navigations refresh the destination view. A full reload resets the
++cache. Sign-in and sign-up use `cacheView={false}` to clear cached content and
++discard their forms when leaving. Other pages can opt out with the same Layout prop.
+diff --git a/src/layouts/Layout.astro b/src/layouts/Layout.astro
+index dcf9696..4f00001 100644
+--- a/src/layouts/Layout.astro
++++ b/src/layouts/Layout.astro
+@@ -8,9 +8,10 @@ import { ClientRouter } from "astro:transitions";
+ 
+ export interface Props {
+   title: string;
++  cacheView?: boolean;
+ }
+ 
+-const { title } = Astro.props;
++const { title, cacheView = true } = Astro.props;
+ const baseUrl = import.meta.env.BASE_URL;
+ ---
+ 
+@@ -35,6 +36,9 @@ const baseUrl = import.meta.env.BASE_URL;
+     <link rel="icon" href=`${baseUrl}/favicon.svg` />
+ 
+     <ClientRouter />
++    <script>
++      import "../scripts/view-cache";
++    </script>
+   </head>
+   <body class="bg-gray-100">
+     <div class="mx-auto">
+@@ -45,8 +49,13 @@ const baseUrl = import.meta.env.BASE_URL;
+         <div>
+           <Header />
+         </div>
+-        <main class="bg-white relative">
+-          <slot />
++        <main class="bg-white relative" data-view-cache transition:persist="page-views">
++          <div
++            data-page-view={`${Astro.url.pathname}${Astro.url.search}`}
++            data-cache-view={String(cacheView)}
++          >
++            <slot />
++          </div>
+         </main>
+       </div>
+     </div>
+diff --git a/src/pages/signin.astro b/src/pages/signin.astro
+index 6844450..e06ec64 100644
+--- a/src/pages/signin.astro
++++ b/src/pages/signin.astro
+@@ -3,7 +3,7 @@ import Layout from '../layouts/Layout.astro';
+ import SignInForm from '../components/SignInForm';
+ ---
+ 
+-<Layout title="Sign In | The DevTools Times">
++<Layout title="Sign In | The DevTools Times" cacheView={false}>
+   <div class="py-12 px-4 sm:px-6 lg:px-8">
+     <SignInForm client:load />
+   </div>
+diff --git a/src/pages/signup.astro b/src/pages/signup.astro
+index dc93e5d..b2f5b71 100644
+--- a/src/pages/signup.astro
++++ b/src/pages/signup.astro
+@@ -3,7 +3,7 @@ import Layout from '../layouts/Layout.astro';
+ import SignUpForm from '../components/SignUpForm';
+ ---
+ 
+-<Layout title="Sign Up | The DevTools Times">
++<Layout title="Sign Up | The DevTools Times" cacheView={false}>
+   <div class="py-12 px-4 sm:px-6 lg:px-8">
+     <SignUpForm client:load />
+   </div>
+diff --git a/src/scripts/view-cache.ts b/src/scripts/view-cache.ts
+new file mode 100644
+index 0000000..fb4f41c
+--- /dev/null
++++ b/src/scripts/view-cache.ts
+@@ -0,0 +1,63 @@
++import { swapFunctions } from "astro:transitions/client";
++import type { TransitionBeforeSwapEvent } from "astro:transitions/client";
++
++// Keep the active view and up to four recently visited views. Keeping inactive
++// views connected also keeps their Astro islands mounted until eviction.
++const MAX_VIEWS = 5;
++const ROOT = "main[data-view-cache]";
++
++document.addEventListener("astro:before-swap", (event) => {
++  const transition = event as TransitionBeforeSwapEvent;
++  const currentRoot = document.querySelector<HTMLElement>(ROOT);
++  const nextRoot = transition.newDocument.querySelector<HTMLElement>(ROOT);
++  const incoming = nextRoot?.querySelector<HTMLElement>("[data-page-view]");
++
++  // Leave navigation to pages without this layout to Astro's normal swap.
++  if (!currentRoot || !nextRoot || !incoming) return;
++
++  transition.swap = () => {
++    const newDocument = transition.newDocument;
++
++    // Do this before transferring the incoming view out of the parsed document,
++    // so Astro can still deduplicate its scripts against previously run scripts.
++    swapFunctions.deselectScripts(newDocument);
++
++    const views = Array.from(currentRoot.children) as HTMLElement[];
++    const cacheable = incoming.dataset.cacheView === "true";
++    const restored = cacheable && transition.navigationType !== "replace"
++      ? views.find((view) => view.dataset.pageView === incoming.dataset.pageView)
++      : undefined;
++
++    for (const view of views) {
++      // Clear cached content at authentication boundaries. A replace navigation
++      // also replaces the destination's cached view with the fresh response.
++      if (
++        !cacheable ||
++        view.dataset.cacheView !== "true" ||
++        (view !== restored && view.dataset.pageView === incoming.dataset.pageView)
++      ) {
++        view.remove();
++      } else {
++        view.hidden = true;
++        view.inert = true;
++      }
++    }
++
++    const active = restored || incoming;
++    active.hidden = false;
++    active.inert = false;
++    // DOM order doubles as the LRU list: the active view is always last.
++    currentRoot.append(active);
++    while (currentRoot.childElementCount > MAX_VIEWS) {
++      currentRoot.firstElementChild?.remove();
++    }
++
++    // Retain Astro's head/title updates, focus handling, media initialization,
++    // and persistent-element transfer while reusing the main view container.
++    swapFunctions.swapRootAttributes(newDocument);
++    swapFunctions.swapHeadElements(newDocument);
++    const restoreFocus = swapFunctions.saveFocus();
++    swapFunctions.swapBodyElement(newDocument.body, document.body);
++    restoreFocus();
++  };
++});

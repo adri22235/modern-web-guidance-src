@@ -1,0 +1,769 @@
+diff --git a/app.js b/app.js
+new file mode 100644
+index 0000000..ab7333c
+--- /dev/null
++++ b/app.js
+@@ -0,0 +1,194 @@
++// Client-side helper that catches blocked outbound requests gracefully without unhandled rejections.
++export async function fetchWithPolicyHandling(url, { statusElement, ...fetchOptions } = {}) {
++  try {
++    const response = await fetch(url, fetchOptions);
++    const contentType = response.headers.get('content-type') || '';
++    const data = contentType.includes('application/json')
++      ? await response.json()
++      : await response.text();
++
++    if (!response.ok) {
++      const serverMessage =
++        typeof data === 'object' && data !== null && data.error
++          ? data.error
++          : `HTTP ${response.status}`;
++      throw new Error(serverMessage);
++    }
++
++    if (statusElement) {
++      const successMessage =
++        typeof data === 'object' && data !== null && data.message
++          ? data.message
++          : 'Thank you for subscribing to The Daily Grind newsletter!';
++      statusElement.textContent = successMessage;
++      statusElement.dataset.status = 'success';
++      statusElement.className = 'status-msg status-success';
++    }
++    return { ok: true, body: data, error: null };
++  } catch (error) {
++    const message = error instanceof Error ? error.message : String(error);
++    if (statusElement) {
++      statusElement.textContent = `We couldn't complete your request (${message}). For your security, connections outside The Daily Grind are blocked.`;
++      statusElement.dataset.status = 'error';
++      statusElement.className = 'status-msg status-error';
++    }
++    return { ok: false, body: null, error };
++  }
++}
++
++// Fallback for browsers without native CSS :user-invalid support
++const UserInvalidFallback = (() => {
++  const dirtyState = new WeakMap();
++
++  const updateState = (input) => {
++    const isValid = input.checkValidity();
++    input.classList.toggle('user-invalid-fallback', !isValid);
++    input.classList.toggle('user-valid-fallback', isValid);
++
++    if (!isValid) {
++      input.setAttribute('aria-invalid', 'true');
++    } else {
++      input.removeAttribute('aria-invalid');
++    }
++  };
++
++  const handleEvent = (event) => {
++    const input = event.target;
++
++    if (event.type === 'reset') {
++      const controls = input.elements || [];
++      for (const control of controls) {
++        dirtyState.delete(control);
++        control.classList.remove('user-invalid-fallback', 'user-valid-fallback');
++        control.removeAttribute('aria-invalid');
++      }
++      return;
++    }
++
++    if (!input || typeof input.checkValidity !== 'function') return;
++
++    if (event.type === 'input' || event.type === 'change') {
++      const state = dirtyState.get(input) || { hasInteracted: false, hasBlurred: false };
++      state.hasInteracted = true;
++      dirtyState.set(input, state);
++      if (state.hasBlurred) {
++        updateState(input);
++      }
++    } else if (event.type === 'blur') {
++      const state = dirtyState.get(input) || { hasInteracted: false, hasBlurred: false };
++      state.hasBlurred = true;
++      dirtyState.set(input, state);
++      if (state.hasInteracted) {
++        updateState(input);
++      }
++    }
++  };
++
++  const init = (root = document) => {
++    if (typeof CSS !== 'undefined' && CSS.supports('selector(:user-invalid)')) return;
++
++    root.addEventListener('blur', handleEvent, true);
++    root.addEventListener('input', handleEvent);
++    root.addEventListener('change', handleEvent);
++    root.addEventListener('reset', handleEvent, true);
++  };
++
++  return { init };
++})();
++
++// Sync aria-invalid with native :user-invalid state
++const syncAria = (el) => {
++  if (!el || typeof el.matches !== 'function' || typeof el.setAttribute !== 'function') return;
++  if (typeof CSS !== 'undefined' && CSS.supports('selector(:user-invalid)')) {
++    el.setAttribute('aria-invalid', el.matches(':user-invalid') ? 'true' : 'false');
++  }
++};
++
++function initNewsletterForm() {
++  const form = document.getElementById('newsletter-form');
++  const emailInput = document.getElementById('newsletter-email');
++  const submitButton = document.getElementById('newsletter-submit');
++  const statusElement = document.getElementById('newsletter-status');
++
++  if (!form || !emailInput || !statusElement) return;
++
++  UserInvalidFallback.init(form);
++
++  document.addEventListener(
++    'blur',
++    (e) => {
++      if (e.target === emailInput) syncAria(emailInput);
++    },
++    true,
++  );
++
++  emailInput.addEventListener('input', () => {
++    emailInput.setCustomValidity('');
++    if (emailInput.hasAttribute('aria-invalid')) {
++      syncAria(emailInput);
++    }
++  });
++
++  form.addEventListener('submit', async (event) => {
++    event.preventDefault();
++
++    if (!form.checkValidity()) {
++      emailInput.classList.add('user-invalid-fallback');
++      emailInput.setAttribute('aria-invalid', 'true');
++      emailInput.focus();
++      return;
++    }
++
++    const email = emailInput.value.trim();
++    const endpoint = form.dataset.endpoint || form.getAttribute('action') || '/api/newsletter';
++
++    if (submitButton) submitButton.disabled = true;
++    statusElement.textContent = 'Subscribing...';
++    statusElement.dataset.status = 'loading';
++    statusElement.className = 'status-msg status-loading';
++
++    const result = await fetchWithPolicyHandling(endpoint, {
++      method: 'POST',
++      headers: {
++        'Content-Type': 'application/json',
++        Accept: 'application/json',
++      },
++      body: JSON.stringify({ email }),
++      statusElement,
++    });
++
++    if (submitButton) submitButton.disabled = false;
++
++    if (result.ok) {
++      form.reset();
++      emailInput.removeAttribute('aria-invalid');
++    }
++  });
++
++  // Also surface a clear message to the customer if an injected script triggers a blocked outbound request
++  document.addEventListener('securitypolicyviolation', (event) => {
++    const blocked = event.blockedURI || 'an external server';
++    statusElement.textContent = `We couldn't complete that request: connection to ${blocked} was blocked by our security policy.`;
++    statusElement.dataset.status = 'error';
++    statusElement.className = 'status-msg status-error';
++  });
++
++  window.addEventListener('unhandledrejection', (event) => {
++    if (event.reason instanceof TypeError) {
++      event.preventDefault();
++      statusElement.textContent =
++        "We couldn't complete that request: the connection could not go through or was blocked by our security policy.";
++      statusElement.dataset.status = 'error';
++      statusElement.className = 'status-msg status-error';
++    }
++  });
++}
++
++if (typeof window !== 'undefined') {
++  window.fetchWithPolicyHandling = fetchWithPolicyHandling;
++  if (document.readyState === 'loading') {
++    document.addEventListener('DOMContentLoaded', initNewsletterForm);
++  } else {
++    initNewsletterForm();
++  }
++}
+diff --git a/index.html b/index.html
+index 66c9173..f364aa2 100644
+--- a/index.html
++++ b/index.html
+@@ -4,6 +4,10 @@
+ <head>
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
++  <meta
++    http-equiv="Content-Security-Policy"
++    content="default-src 'self'; connect-src 'self' https://images.unsplash.com; img-src 'self' https://images.unsplash.com data: blob:; style-src 'self' 'sha256-RGbcZWXw/Y2F5eCQzbyNvAi17W6BDhHd7KskGy1YSE8='; script-src 'self'; form-action 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'"
++  >
+   <title>The Daily Grind | Artisanal Coffee</title>
+   <style>
+     :root {
+@@ -12,6 +16,10 @@
+       --accent: #ffab40;
+       --text: #3e2723;
+       --light: #fafafa;
++      --error: #d93025;
++      --error-bg: #fce8e6;
++      --success: #188038;
++      --success-bg: #e6f4ea;
+     }
+ 
+     * {
+@@ -100,6 +108,10 @@
+       padding: 0 20px;
+     }
+ 
++    .section-title {
++      text-align: center;
++    }
++
+     .grid {
+       display: grid;
+       grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+@@ -129,12 +141,134 @@
+       border-radius: 5px;
+       margin-top: 15px;
+       transition: background 0.3s;
++      border: none;
++      font-size: 1rem;
++      min-height: 48px;
++      cursor: pointer;
+     }
+ 
+     .btn:hover {
+       background: #3e2723;
+     }
+ 
++    .btn:disabled {
++      opacity: 0.7;
++      cursor: not-allowed;
++    }
++
++    /* Newsletter Section */
++    .newsletter-section {
++      background: white;
++      padding: 32px 24px;
++      border-radius: 8px;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++      margin-top: 40px;
++      max-width: 600px;
++      margin-inline: auto;
++    }
++
++    .newsletter-section h2 {
++      color: var(--primary);
++      margin-block-end: 0.5rem;
++    }
++
++    .newsletter-section p {
++      margin-block-end: 1.5rem;
++    }
++
++    .field {
++      margin-block-end: 1.25rem;
++      text-align: left;
++    }
++
++    .field label {
++      display: inline-block;
++      font-weight: 600;
++      padding: 10px 0;
++      margin: -10px 0 0.25rem 0;
++    }
++
++    .hint {
++      display: block;
++      color: #5f6368;
++      font-size: 0.85rem;
++      margin-block-end: 0.35rem;
++    }
++
++    .field input[type="email"] {
++      width: 100%;
++      font-size: 1rem;
++      padding: 0.75rem;
++      min-height: 48px;
++      border: 2px solid #8d6e63;
++      border-radius: 5px;
++      color: var(--text);
++      background-color: #fff;
++    }
++
++    .field input:focus-visible,
++    .btn:focus-visible {
++      outline: 3px solid #0b57d0;
++      outline-offset: 2px;
++    }
++
++    .error-msg {
++      display: none;
++      color: var(--error);
++      font-size: 0.875rem;
++      margin-block-start: 0.35rem;
++    }
++
++    .field input:user-invalid,
++    .field input.user-invalid-fallback {
++      border-color: var(--error);
++      background-color: var(--error-bg);
++    }
++
++    .field input:user-invalid + .error-msg,
++    .field input.user-invalid-fallback + .error-msg {
++      display: block;
++    }
++
++    .field input:user-valid,
++    .field input.user-valid-fallback {
++      border-color: var(--success);
++    }
++
++    .status-msg {
++      margin-block-start: 1rem;
++      font-size: 0.95rem;
++      border-radius: 5px;
++    }
++
++    .status-msg:not(:empty) {
++      padding: 0.75rem 1rem;
++    }
++
++    .status-loading {
++      background-color: var(--secondary);
++      color: var(--text);
++    }
++
++    .status-success {
++      background-color: var(--success-bg);
++      color: var(--success);
++      border: 1px solid var(--success);
++    }
++
++    .status-error {
++      background-color: var(--error-bg);
++      color: var(--error);
++      border: 1px solid var(--error);
++    }
++
++    @media (pointer: coarse) {
++      .field input[type="email"],
++      .btn {
++        min-height: 52px;
++      }
++    }
++
+     footer {
+       background: var(--secondary);
+       text-align: center;
+@@ -176,7 +310,7 @@
+ 
+   <main class="container">
+     <section>
+-      <h2 style="text-align: center;">Seasonal Favorites</h2>
++      <h2 class="section-title">Seasonal Favorites</h2>
+       <div class="grid">
+         <div class="card">
+           <h3>Maple Oat Latte</h3>
+@@ -195,6 +329,34 @@
+         </div>
+       </div>
+     </section>
++
++    <section class="newsletter-section" aria-labelledby="newsletter-heading">
++      <h2 id="newsletter-heading">Subscribe to Our Newsletter</h2>
++      <p>Sign up for roasting updates, brewing guides, and seasonal offers from The Daily Grind.</p>
++      <form id="newsletter-form" action="/api/newsletter" method="POST">
++        <div class="field">
++          <label for="newsletter-email">Email Address (required)</label>
++          <span id="email-hint" class="hint">Format: you@example.com</span>
++          <input
++            type="email"
++            id="newsletter-email"
++            name="email"
++            required
++            autocomplete="email"
++            autocorrect="off"
++            autocapitalize="off"
++            spellcheck="false"
++            aria-describedby="email-hint newsletter-status"
++            aria-errormessage="email-error"
++          >
++          <div id="email-error" class="error-msg">
++            <span aria-hidden="true">❌</span> Please enter a valid email address.
++          </div>
++        </div>
++        <button type="submit" id="newsletter-submit" class="btn">Subscribe to Newsletter</button>
++        <div id="newsletter-status" class="status-msg" role="status" aria-live="polite"></div>
++      </form>
++    </section>
+   </main>
+ 
+   <footer>
+@@ -207,6 +369,7 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script type="module" src="/app.js"></script>
+ </body>
+ 
+ </html>
+diff --git a/package.json b/package.json
+index 2bd4d77..e49b21f 100644
+--- a/package.json
++++ b/package.json
+@@ -1,8 +1,9 @@
+ {
+   "name": "daily-grind",
+   "version": "1.0.0",
++  "type": "module",
+   "scripts": {
+-    "start": "pnpm dlx statikk --port ${PORT:-11222}"
++    "start": "node server.js"
+   },
+   "pnpm": {
+     "onlyBuiltDependencies": []
+diff --git a/server.js b/server.js
+new file mode 100644
+index 0000000..aabf4ce
+--- /dev/null
++++ b/server.js
+@@ -0,0 +1,324 @@
++import http from 'node:http';
++import fs from 'node:fs/promises';
++import crypto from 'node:crypto';
++import path from 'node:path';
++import { fileURLToPath, pathToFileURL } from 'node:url';
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const PORT = Number(process.env.PORT) || 11222;
++
++const ALLOWLIST_DESTS = new Set(['document', 'iframe', 'worker', 'sharedworker', 'serviceworker']);
++const ALLOWED_EXTERNAL_PATTERNS = ['https://images.unsplash.com'];
++const subscribers = new Set();
++
++// Normalize a config URL or URLPattern string for Connection-Allowlist:
++// - Rewrites ws:// and wss:// to http:// and https:// (WebSocket matching rule).
++// - Strips a bare trailing slash on origin-only URLs (e.g. from new URL(...).href)
++//   so all subpaths on the origin are permitted instead of only "/".
++export function normalizeAllowlistPattern(rawPattern) {
++  const trimmed = String(rawPattern).trim().replace(/^ws(s?):\/\//i, 'http$1://');
++  if (!/^https?:\/\//i.test(trimmed)) {
++    throw new Error(`Pattern must include an http:// or https:// scheme: ${rawPattern}`);
++  }
++  if (/[\s,]/.test(trimmed)) {
++    throw new Error(`Pattern must be a single URLPattern without spaces or commas: ${rawPattern}`);
++  }
++  if (/[()]/.test(trimmed)) {
++    throw new Error(`Custom regex groups are rejected by Connection-Allowlist: ${rawPattern}`);
++  }
++  return trimmed.replace(/^(https?:\/\/[^/?#]+)\/$/i, '$1');
++}
++
++// Build an RFC 9651 Inner List value for Connection-Allowlist or Connection-Allowlist-Report-Only.
++export function buildConnectionAllowlistHeader({
++  allowSelf = true,
++  patterns = ALLOWED_EXTERNAL_PATTERNS,
++  reportTo,
++  redirects = 'block',
++  webrtc = 'block',
++} = {}) {
++  const items = allowSelf ? ['response-origin'] : [];
++  for (const pattern of patterns) {
++    const raw = String(pattern).trim();
++    if (raw === 'response-origin') {
++      if (!items.includes('response-origin')) items.push('response-origin');
++      continue;
++    }
++    const normalized = normalizeAllowlistPattern(raw);
++    items.push(`"${normalized.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`);
++  }
++  let header = `(${items.join(' ')})`;
++  if (redirects === 'allow') header += '; redirects=allow';
++  if (webrtc === 'allow') header += '; webrtc=allow';
++  if (reportTo) {
++    const endpointToken = String(reportTo).trim().replace(/^"+|"+$/g, '');
++    header += `; report-to=${endpointToken}`;
++  }
++  return header;
++}
++
++// Server or middleware helper applying Connection-Allowlist and Reporting-Endpoints
++// on document and worker responses.
++export function setConnectionAllowlistHeaders(res, options = {}) {
++  const {
++    secFetchDest = 'document',
++    patterns = ALLOWED_EXTERNAL_PATTERNS,
++    reportOnlyPatterns,
++    reportEndpointName = 'conn-reports',
++    reportEndpointUrl = `http://localhost:${PORT}/api/security-reports`,
++    redirects = 'block',
++    webrtc = 'block',
++    reportOnly = false,
++    styleHashes = [],
++  } = options;
++
++  const setHeader = (name, value) =>
++    typeof res.setHeader === 'function' ? res.setHeader(name, value) : res.headers.set(name, value);
++
++  if (typeof res.appendHeader === 'function') {
++    res.appendHeader('Vary', 'Sec-Fetch-Dest');
++  } else if (typeof res.headers?.append === 'function') {
++    res.headers.append('Vary', 'Sec-Fetch-Dest');
++  } else {
++    setHeader('Vary', 'Sec-Fetch-Dest');
++  }
++
++  if (secFetchDest && !ALLOWLIST_DESTS.has(String(secFetchDest).toLowerCase())) return;
++
++  setHeader('Reporting-Endpoints', `${reportEndpointName}="${reportEndpointUrl}"`);
++  setHeader(
++    reportOnly ? 'Connection-Allowlist-Report-Only' : 'Connection-Allowlist',
++    buildConnectionAllowlistHeader({ allowSelf: true, patterns, reportTo: reportEndpointName, redirects, webrtc }),
++  );
++
++  if (!reportOnly && Array.isArray(reportOnlyPatterns)) {
++    setHeader(
++      'Connection-Allowlist-Report-Only',
++      buildConnectionAllowlistHeader({
++        allowSelf: true,
++        patterns: reportOnlyPatterns,
++        reportTo: reportEndpointName,
++        redirects,
++        webrtc,
++      }),
++    );
++  }
++
++  const styleSrcTokens = ["'self'", ...styleHashes.map((h) => `'${h}'`)].join(' ');
++  const csp = [
++    "default-src 'self'",
++    "connect-src 'self' https://images.unsplash.com",
++    "img-src 'self' https://images.unsplash.com data: blob:",
++    `style-src ${styleSrcTokens}`,
++    "script-src 'self'",
++    "form-action 'self'",
++    "worker-src 'self'",
++    "object-src 'none'",
++    "base-uri 'self'",
++    "frame-ancestors 'self'",
++    `report-to ${reportEndpointName}`,
++  ].join('; ');
++  setHeader('Content-Security-Policy', csp);
++}
++
++function setCompanionSecurityHeaders(res) {
++  res.setHeader('X-Content-Type-Options', 'nosniff');
++  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
++  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
++  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
++  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
++  res.setHeader('Permissions-Policy', 'camera=(), geolocation=(), microphone=(), focus-without-user-activation=()');
++}
++
++function extractInlineStyleHashes(html) {
++  const hashes = [];
++  const styleRegex = /<style>([\s\S]*?)<\/style>/gi;
++  let match;
++  while ((match = styleRegex.exec(html)) !== null) {
++    const digest = crypto.createHash('sha256').update(match[1]).digest('base64');
++    hashes.push(`sha256-${digest}`);
++  }
++  return hashes;
++}
++
++function readRequestBody(req, maxBytes = 64 * 1024) {
++  return new Promise((resolve, reject) => {
++    const chunks = [];
++    let total = 0;
++    req.on('data', (chunk) => {
++      total += chunk.length;
++      if (total > maxBytes) {
++        reject(new Error('Payload too large'));
++        req.destroy();
++        return;
++      }
++      chunks.push(chunk);
++    });
++    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
++    req.on('error', reject);
++  });
++}
++
++function parseEmailFromBody(rawBody, contentType = '') {
++  if (!rawBody) return '';
++  if (contentType.includes('application/json')) {
++    const parsed = JSON.parse(rawBody);
++    return typeof parsed?.email === 'string' ? parsed.email.trim() : '';
++  }
++  if (contentType.includes('application/x-www-form-urlencoded')) {
++    const params = new URLSearchParams(rawBody);
++    return (params.get('email') || '').trim();
++  }
++  try {
++    const parsed = JSON.parse(rawBody);
++    if (typeof parsed?.email === 'string') return parsed.email.trim();
++  } catch {
++    const params = new URLSearchParams(rawBody);
++    if (params.has('email')) return (params.get('email') || '').trim();
++  }
++  return '';
++}
++
++function isValidEmail(email) {
++  return typeof email === 'string' && email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
++}
++
++export function createAppServer() {
++  return http.createServer(async (req, res) => {
++    setCompanionSecurityHeaders(res);
++
++    const host = req.headers.host || `localhost:${PORT}`;
++    const protocol = req.headers['x-forwarded-proto'] || 'http';
++    const reportEndpointUrl = `${protocol}://${host}/api/security-reports`;
++    const url = new URL(req.url || '/', `${protocol}://${host}`);
++    const pathname = url.pathname;
++
++    // Fetch Metadata resource isolation check for non-navigational cross-site requests
++    const secFetchSite = req.headers['sec-fetch-site'];
++    const secFetchMode = req.headers['sec-fetch-mode'];
++    const secFetchDest = req.headers['sec-fetch-dest'];
++
++    if (
++      secFetchSite &&
++      !['same-origin', 'same-site', 'none'].includes(secFetchSite) &&
++      !(
++        secFetchSite === 'cross-site' &&
++        secFetchMode === 'navigate' &&
++        req.method === 'GET' &&
++        !['object', 'embed'].includes(secFetchDest)
++      )
++    ) {
++      res.setHeader('Vary', 'Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-Site');
++      res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
++      res.end(JSON.stringify({ ok: false, error: 'Cross-site requests are forbidden.' }));
++      return;
++    }
++
++    // Violation reporting endpoint for Connection-Allowlist and CSP
++    if (pathname === '/api/security-reports' && req.method === 'POST') {
++      try {
++        await readRequestBody(req);
++      } catch {
++        // Ignore malformed report bodies
++      }
++      res.writeHead(204);
++      res.end();
++      return;
++    }
++
++    // Newsletter subscription endpoint
++    if (
++      ['/api/newsletter', '/newsletter', '/api/subscribe', '/subscribe'].includes(pathname) &&
++      (req.method === 'POST' || req.method === 'GET')
++    ) {
++      res.setHeader('Vary', 'Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-Site');
++
++      if (req.method === 'GET') {
++        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
++        res.end(JSON.stringify({ ok: true, count: subscribers.size }));
++        return;
++      }
++
++      try {
++        const rawBody = await readRequestBody(req);
++        const email = parseEmailFromBody(rawBody, req.headers['content-type'] || '');
++
++        if (!isValidEmail(email)) {
++          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
++          res.end(JSON.stringify({ ok: false, error: 'Please provide a valid email address.' }));
++          return;
++        }
++
++        subscribers.add(email.toLowerCase());
++        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
++        res.end(
++          JSON.stringify({
++            ok: true,
++            message: 'Thank you for subscribing to The Daily Grind newsletter!',
++            email,
++          }),
++        );
++      } catch {
++        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
++        res.end(JSON.stringify({ ok: false, error: 'Invalid request payload.' }));
++      }
++      return;
++    }
++
++    // Logout route
++    if (pathname === '/logout') {
++      res.setHeader('Clear-Site-Data', '"cookies", "storage", "cache"');
++      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
++      res.end('Logged out.');
++      return;
++    }
++
++    // Static assets (e.g., /app.js)
++    if (pathname === '/app.js' && (req.method === 'GET' || req.method === 'HEAD')) {
++      try {
++        const jsContent = await fs.readFile(path.join(__dirname, 'app.js'), 'utf8');
++        setConnectionAllowlistHeaders(res, {
++          secFetchDest: secFetchDest || 'script',
++          patterns: ALLOWED_EXTERNAL_PATTERNS,
++          reportEndpointUrl,
++        });
++        res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8' });
++        res.end(req.method === 'HEAD' ? undefined : jsContent);
++      } catch {
++        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
++        res.end('Not Found');
++      }
++      return;
++    }
++
++    // Homepage document route
++    if ((pathname === '/' || pathname === '/index.html') && (req.method === 'GET' || req.method === 'HEAD')) {
++      try {
++        const html = await fs.readFile(path.join(__dirname, 'index.html'), 'utf8');
++        const styleHashes = extractInlineStyleHashes(html);
++        setConnectionAllowlistHeaders(res, {
++          secFetchDest: secFetchDest || 'document',
++          patterns: ALLOWED_EXTERNAL_PATTERNS,
++          reportEndpointUrl,
++          styleHashes,
++        });
++        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
++        res.end(req.method === 'HEAD' ? undefined : html);
++      } catch {
++        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
++        res.end('Internal Server Error');
++      }
++      return;
++    }
++
++    res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
++    res.end(JSON.stringify({ ok: false, error: 'Not Found' }));
++  });
++}
++
++if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
++  const server = createAppServer();
++  server.listen(PORT, () => {
++    console.log(`The Daily Grind server listening on http://localhost:${PORT}`);
++  });
++}

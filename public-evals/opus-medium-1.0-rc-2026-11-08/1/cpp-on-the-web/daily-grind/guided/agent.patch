@@ -1,0 +1,837 @@
+diff --git a/index.html b/index.html
+index 66c9173..ab85d46 100644
+--- a/index.html
++++ b/index.html
+@@ -135,6 +135,83 @@
+       background: #3e2723;
+     }
+ 
++    /* Path tracer */
++    .render {
++      margin-top: 60px;
++      text-align: center;
++    }
++
++    .render > p {
++      max-width: 60ch;
++      margin: 10px auto 20px;
++    }
++
++    .render-frame {
++      display: grid;
++      gap: 15px;
++      max-width: 640px;
++      margin: 0 auto;
++      background: white;
++      padding: 20px;
++      border-radius: 8px;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++    }
++
++    .render canvas {
++      width: 100%;
++      height: auto;
++      aspect-ratio: 4 / 3;
++      background: #111;
++      border-radius: 4px;
++    }
++
++    .render progress {
++      width: 100%;
++      accent-color: var(--accent);
++    }
++
++    .render-controls {
++      display: flex;
++      flex-wrap: wrap;
++      justify-content: space-between;
++      align-items: center;
++      gap: 10px;
++      font-size: 0.9rem;
++    }
++
++    .render button.btn {
++      margin-top: 0;
++      border: 0;
++      font: inherit;
++      cursor: pointer;
++    }
++
++    .render button.btn:disabled {
++      opacity: 0.6;
++      cursor: progress;
++    }
++
++    .swatches {
++      display: flex;
++      flex-wrap: wrap;
++      justify-content: center;
++      gap: 6px 14px;
++      list-style: none;
++      font-size: 0.8rem;
++    }
++
++    .swatches li::before {
++      content: "";
++      display: inline-block;
++      width: 0.9em;
++      height: 0.9em;
++      margin-right: 5px;
++      vertical-align: -0.1em;
++      border-radius: 50%;
++      border: 1px solid rgba(0, 0, 0, 0.2);
++      background: var(--swatch);
++    }
++
+     footer {
+       background: var(--secondary);
+       text-align: center;
+@@ -195,6 +272,24 @@
+         </div>
+       </div>
+     </section>
++
++    <section class="render" aria-labelledby="render-title">
++      <h2 id="render-title">Rendered in Your Browser</h2>
++      <p>
++        Kevin Beason's <a href="http://www.kevinbeason.com/smallpt/">smallpt</a> path tracer, a
++        global-illumination renderer in 99 lines of C++, compiled to WebAssembly and running on your device.
++      </p>
++      <div class="render-frame">
++        <canvas id="render-canvas" width="320" height="240" role="img"
++          aria-label="Path-traced Cornell box with a mirror sphere and a glass sphere"></canvas>
++        <progress id="render-progress" max="1" value="0" aria-label="Render progress"></progress>
++        <div class="render-controls">
++          <span id="render-status" aria-live="polite">Loading WebAssembly…</span>
++          <button id="render-button" class="btn" type="button" disabled>Randomize colors &amp; render</button>
++        </div>
++        <ul id="render-swatches" class="swatches" aria-label="Sphere colors"></ul>
++      </div>
++    </section>
+   </main>
+ 
+   <footer>
+@@ -207,6 +302,99 @@
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script type="module">
++    const WIDTH = 320, HEIGHT = 240;
++    const SAMPLES = 25; // per 2x2 subpixel, i.e. 100 samples per pixel
++    const BAND = 8;     // scanlines per worker job
++
++    // Scene sphere indices in wasm/smallpt.cpp (the black front wall and the light keep their colors).
++    const SPHERES = [
++      { index: 0, name: 'Left wall', color: [0.75, 0.25, 0.25] },
++      { index: 1, name: 'Right wall', color: [0.25, 0.25, 0.75] },
++      { index: 2, name: 'Back wall', color: [0.75, 0.75, 0.75] },
++      { index: 4, name: 'Floor', color: [0.75, 0.75, 0.75] },
++      { index: 5, name: 'Ceiling', color: [0.75, 0.75, 0.75] },
++      { index: 6, name: 'Mirror ball', color: [0.999, 0.999, 0.999], shiny: true },
++      { index: 7, name: 'Glass ball', color: [0.999, 0.999, 0.999], shiny: true },
++    ];
++
++    const canvas = document.getElementById('render-canvas');
++    const ctx = canvas.getContext('2d');
++    const progress = document.getElementById('render-progress');
++    const status = document.getElementById('render-status');
++    const button = document.getElementById('render-button');
++    const swatches = document.getElementById('render-swatches');
++
++    const workers = Array.from(
++      { length: Math.min(navigator.hardwareConcurrency || 4, 8) },
++      () => new Worker(new URL('./smallpt-worker.js', import.meta.url), { type: 'module' }),
++    );
++
++    let renderId = 0;
++
++    function render(colors) {
++      const id = ++renderId;
++      // Scanline 0 is the bottom of the image; queue from the top down.
++      const jobs = [];
++      for (let y1 = HEIGHT; y1 > 0; y1 -= BAND) jobs.push([Math.max(0, y1 - BAND), y1]);
++      const total = jobs.length;
++      let done = 0;
++      progress.value = 0;
++
++      return new Promise((resolve, reject) => {
++        const next = (worker) => {
++          const job = jobs.shift();
++          if (job) worker.postMessage({ id, w: WIDTH, h: HEIGHT, samps: SAMPLES, y0: job[0], y1: job[1], colors });
++        };
++        for (const worker of workers) {
++          worker.onmessage = ({ data }) => {
++            if (data.id !== id) return;
++            if (data.error) return reject(new Error(data.error));
++            ctx.putImageData(new ImageData(data.pixels, WIDTH, data.rows), 0, data.top);
++            progress.value = ++done / total;
++            if (done === total) resolve();
++            else next(worker);
++          };
++          worker.onerror = (event) => reject(new Error(event.message || 'Worker failed to load'));
++          next(worker);
++        }
++      });
++    }
++
++    function showSwatches(spheres) {
++      swatches.replaceChildren(...spheres.map(({ name, color }) => {
++        const li = document.createElement('li');
++        li.textContent = name;
++        li.style.setProperty('--swatch', `rgb(${color.map((c) => Math.round(c ** (1 / 2.2) * 255)).join(' ')})`);
++        return li;
++      }));
++    }
++
++    async function run(spheres) {
++      button.disabled = true;
++      showSwatches(spheres);
++      status.textContent = `Rendering ${WIDTH}×${HEIGHT} at ${SAMPLES * 4} samples/pixel on ${workers.length} threads…`;
++      const start = performance.now();
++      try {
++        await render(spheres.map(({ index, color }) => [index, ...color]));
++        status.textContent = `Rendered in ${((performance.now() - start) / 1000).toFixed(1)} s.`;
++      } catch (error) {
++        status.textContent = `Render failed: ${error.message}`;
++      } finally {
++        button.disabled = false;
++      }
++    }
++
++    // Diffuse surfaces get any color; mirror/glass get light tints so they stay reflective.
++    const randomColor = (shiny) =>
++      Array.from({ length: 3 }, () => (shiny ? 0.5 + Math.random() * 0.499 : 0.05 + Math.random() * 0.9));
++
++    button.addEventListener('click', () =>
++      run(SPHERES.map((sphere) => ({ ...sphere, color: randomColor(sphere.shiny) }))));
++
++    run(SPHERES);
++  </script>
++
+ </body>
+ 
+ </html>
+diff --git a/package.json b/package.json
+index 2bd4d77..cf6772b 100644
+--- a/package.json
++++ b/package.json
+@@ -2,6 +2,7 @@
+   "name": "daily-grind",
+   "version": "1.0.0",
+   "scripts": {
++    "build": "sh wasm/build.sh",
+     "start": "pnpm dlx statikk --port ${PORT:-11222}"
+   },
+   "pnpm": {
+diff --git a/smallpt-worker.js b/smallpt-worker.js
+new file mode 100644
+index 0000000..c56d9ea
+--- /dev/null
++++ b/smallpt-worker.js
+@@ -0,0 +1,31 @@
++// Runs smallpt.wasm off the main thread. Each message renders a band of
++// scanlines and posts the RGBA pixels back (transferred, not copied).
++const ready = (async () => {
++  const module = await WebAssembly.compileStreaming(fetch(new URL('./smallpt.wasm', import.meta.url)));
++  // The generated module imports sin/cos/pow from `env`; an em++ standalone
++  // build may import WASI stubs instead, which the renderer never calls.
++  const imports = {};
++  for (const { module: mod, name, kind } of WebAssembly.Module.imports(module)) {
++    if (kind !== 'function') continue;
++    (imports[mod] ??= {})[name] = typeof Math[name] === 'function' ? Math[name] : () => 0;
++  }
++  const { exports } = await WebAssembly.instantiate(module, imports);
++  exports._initialize?.();
++  return exports;
++})();
++
++self.onmessage = async ({ data: { id, w, h, samps, y0, y1, colors } }) => {
++  try {
++    const wasm = await ready;
++    wasm.reset_scene();
++    for (const [i, r, g, b] of colors ?? []) wasm.set_sphere_color(i, r, g, b);
++    wasm.render_rows(w, h, samps, y0, y1);
++    // Scanline y (0 = bottom) is written to image row h-y-1.
++    const top = h - y1;
++    const rows = y1 - y0;
++    const pixels = new Uint8ClampedArray(wasm.memory.buffer, wasm.image_ptr() + top * w * 4, rows * w * 4).slice();
++    self.postMessage({ id, top, rows, pixels }, [pixels.buffer]);
++  } catch (error) {
++    self.postMessage({ id, error: String(error) });
++  }
++};
+diff --git a/smallpt.wasm b/smallpt.wasm
+new file mode 100644
+index 0000000..be9b69a
+Binary files /dev/null and b/smallpt.wasm differ
+diff --git a/wasm/build.sh b/wasm/build.sh
+new file mode 100755
+index 0000000..7f12c4e
+--- /dev/null
++++ b/wasm/build.sh
+@@ -0,0 +1,21 @@
++#!/bin/sh
++# Builds smallpt.wasm from wasm/smallpt.cpp with Emscripten when em++ is on the
++# PATH. Otherwise falls back to wasm/gen-smallpt-wasm.mjs, a toolchain-free
++# translation of the same source that exports the same ABI (verified
++# pixel-identical against a native build of smallpt.cpp).
++set -eu
++cd "$(dirname "$0")/.."
++
++if command -v em++ >/dev/null 2>&1; then
++  em++ -c wasm/smallpt.cpp -o wasm/smallpt.o -O3 -flto -Wall -Werror
++  em++ wasm/smallpt.o -o smallpt.wasm \
++    -O3 -flto \
++    -sSTRICT \
++    -sSTANDALONE_WASM --no-entry \
++    -sSTACK_SIZE=1MB \
++    -sEXPORTED_FUNCTIONS=_render_rows,_set_sphere_color,_reset_scene,_image_ptr
++  rm wasm/smallpt.o
++else
++  echo "em++ not found; generating smallpt.wasm with wasm/gen-smallpt-wasm.mjs" >&2
++  node wasm/gen-smallpt-wasm.mjs
++fi
+diff --git a/wasm/gen-smallpt-wasm.mjs b/wasm/gen-smallpt-wasm.mjs
+new file mode 100644
+index 0000000..3022a01
+--- /dev/null
++++ b/wasm/gen-smallpt-wasm.mjs
+@@ -0,0 +1,391 @@
++// Emits smallpt.wasm without an Emscripten toolchain: a direct, line-by-line
++// translation of wasm/smallpt.cpp into WebAssembly bytecode. It exposes the
++// same exports as the em++ build (see wasm/build.sh), so either artifact works
++// with smallpt-worker.js.
++//
++// Usage: node wasm/gen-smallpt-wasm.mjs [out.wasm]
++import { writeFileSync } from 'node:fs';
++
++// ---------------------------------------------------------------------------
++// Binary encoding helpers
++const uleb = (n) => {
++  const out = [];
++  do {
++    let b = n & 0x7f;
++    n >>>= 7;
++    if (n) b |= 0x80;
++    out.push(b);
++  } while (n);
++  return out;
++};
++const sleb = (value) => {
++  let v = BigInt(value);
++  const out = [];
++  for (;;) {
++    const b = Number(v & 0x7fn);
++    v >>= 7n;
++    if ((v === 0n && !(b & 0x40)) || (v === -1n && b & 0x40)) {
++      out.push(b);
++      return out;
++    }
++    out.push(b | 0x80);
++  }
++};
++const c = (...parts) => parts.flat(Infinity);
++const name = (s) => [...uleb(s.length), ...Buffer.from(s, 'utf8')];
++const vec = (items) => [...uleb(items.length), ...items.flat(Infinity)];
++const section = (id, bytes) => [id, ...uleb(bytes.length), ...bytes];
++
++const T = { i32: 0x7f, i64: 0x7e, f64: 0x7c };
++
++// ---------------------------------------------------------------------------
++// Instructions (each helper returns a flat byte array)
++const f64 = (v) => {
++  const b = Buffer.alloc(8);
++  b.writeDoubleLE(v);
++  return [0x44, ...b];
++};
++const i32 = (v) => [0x41, ...sleb(v)];
++const i64 = (v) => [0x42, ...sleb(v)];
++const op = (...code) => (...args) => c(...args, ...code);
++
++const add = op(0xa0), sub = op(0xa1), mul = op(0xa2), div = op(0xa3);
++const sqrt = op(0x9f), abs = op(0x99), neg = op(0x9a);
++const eq = op(0x61), ne = op(0x62), lt = op(0x63), gt = op(0x64), ge = op(0x66);
++const iadd = op(0x6a), isub = op(0x6b), imul = op(0x6c), iand = op(0x71);
++const ilt = op(0x48), igt = op(0x4a), ige_u = op(0x4f), band = op(0x71);
++const ladd = op(0x7c), lmul = op(0x7e), land = op(0x83), lshl = op(0x86);
++const i64FromU32 = op(0xad), f64FromI32 = op(0xb7), f64FromU64 = op(0xba);
++const i32TruncSat = op(0xfc, 0x02);
++
++const load = (addr, offset) => c(addr, 0x2b, 0x03, uleb(offset));
++const store = (addr, offset, value) => c(addr, value, 0x39, 0x03, uleb(offset));
++const store8 = (addr, offset, value) => c(addr, value, 0x3a, 0x00, uleb(offset));
++const gget = (idx) => [0x23, ...uleb(idx)];
++const gset = (idx, value) => c(value, 0x24, uleb(idx));
++const ret = (...values) => c(...values, 0x0f);
++const if_ = (cond, then, els) => c(cond, 0x04, 0x40, then, els ? [0x05, els] : [], 0x0b);
++const ternary = (cond, a, b) => c(cond, 0x04, T.f64, a, 0x05, b, 0x0b);
++// while (cond) { body; step; }
++const loop = (cond, body, step = []) =>
++  c(0x02, 0x40, 0x03, 0x40, cond, 0x45, 0x0d, 1, body, step, 0x0c, 0, 0x0b, 0x0b);
++
++// Vector math on [x, y, z] triples of f64 expressions. Scalar operands are
++// re-evaluated per component, so only pass local reads / constants.
++const vadd = (a, b) => a.map((e, i) => add(e, b[i]));
++const vsub = (a, b) => a.map((e, i) => sub(e, b[i]));
++const vmult = (a, b) => a.map((e, i) => mul(e, b[i]));
++const vscale = (a, s) => a.map((e) => mul(e, s));
++const dot = (a, b) => add(add(mul(a[0], b[0]), mul(a[1], b[1])), mul(a[2], b[2]));
++const cross = (a, b) => [
++  sub(mul(a[1], b[2]), mul(a[2], b[1])),
++  sub(mul(a[2], b[0]), mul(a[0], b[2])),
++  sub(mul(a[0], b[1]), mul(a[1], b[0])),
++];
++const vconst = (x, y, z) => [f64(x), f64(y), f64(z)];
++const ZERO = vconst(0, 0, 0);
++
++// ---------------------------------------------------------------------------
++// Module layout
++const SPHERE_STRIDE = 88; // rad, p.xyz, e.xyz, c.xyz, refl (all f64)
++const OFF = { rad: 0, p: 8, e: 32, c: 56, refl: 80 };
++const SPHERES = 0;
++const DEFAULT_SPHERES = 1024;
++const IMAGE = 2048;
++const MAX_W = 640, MAX_H = 480;
++const PAGES = Math.ceil((IMAGE + MAX_W * MAX_H * 4) / 65536);
++
++const DIFF = 0, SPEC = 1, REFR = 2;
++const scene = [ // radius, position, emission, color, material
++  [1e5, [1e5 + 1, 40.8, 81.6], [0, 0, 0], [0.75, 0.25, 0.25], DIFF], // Left
++  [1e5, [-1e5 + 99, 40.8, 81.6], [0, 0, 0], [0.25, 0.25, 0.75], DIFF], // Rght
++  [1e5, [50, 40.8, 1e5], [0, 0, 0], [0.75, 0.75, 0.75], DIFF], // Back
++  [1e5, [50, 40.8, -1e5 + 170], [0, 0, 0], [0, 0, 0], DIFF], // Frnt
++  [1e5, [50, 1e5, 81.6], [0, 0, 0], [0.75, 0.75, 0.75], DIFF], // Botm
++  [1e5, [50, -1e5 + 81.6, 81.6], [0, 0, 0], [0.75, 0.75, 0.75], DIFF], // Top
++  [16.5, [27, 16.5, 47], [0, 0, 0], [0.999, 0.999, 0.999], SPEC], // Mirr
++  [16.5, [73, 16.5, 78], [0, 0, 0], [0.999, 0.999, 0.999], REFR], // Glas
++  [600, [50, 681.6 - 0.27, 81.6], [12, 12, 12], [0, 0, 0], DIFF], // Lite
++];
++const sceneBytes = Buffer.alloc(scene.length * SPHERE_STRIDE);
++scene.forEach(([rad, p, e, col, refl], i) => {
++  [rad, ...p, ...e, ...col, refl].forEach((v, j) => sceneBytes.writeDoubleLE(v, i * SPHERE_STRIDE + j * 8));
++});
++
++const G_SEED = 0, G_HIT = 1;
++
++// Function index space: imports first, then defined functions in this order.
++const imports = [['sin', ['f64'], ['f64']], ['cos', ['f64'], ['f64']], ['pow', ['f64', 'f64'], ['f64']]];
++const order = ['rand', 'sphere_intersect', 'intersect', 'radiance', 'render_rows', 'set_sphere_color', 'reset_scene', 'image_ptr'];
++const fnIndex = (n) => {
++  const imp = imports.findIndex(([m]) => m === n);
++  if (imp >= 0) return imp;
++  const i = order.indexOf(n);
++  if (i < 0) throw new Error(`unknown function ${n}`);
++  return imports.length + i;
++};
++const call = (fn, ...args) => c(...args, 0x10, uleb(fnIndex(fn)));
++
++const types = [];
++const typeIndex = (params, results) => {
++  const key = `${params}|${results}`;
++  let i = types.findIndex((t) => t.key === key);
++  if (i < 0) i = types.push({ key, params, results }) - 1;
++  return i;
++};
++
++const funcs = [];
++// params/locals: { name: type }; a name of 'v' with type 'vec' expands to v.x/v.y/v.z f64.
++function defineFunc(fname, params, results, locals, build, exported = true) {
++  const slots = new Map();
++  const paramTypes = [];
++  const localTypes = [];
++  const declare = (list, decls) => {
++    for (const [n, t] of Object.entries(decls)) {
++      for (const [sn, st] of t === 'vec' ? ['x', 'y', 'z'].map((k) => [`${n}.${k}`, 'f64']) : [[n, t]]) {
++        if (slots.has(sn)) throw new Error(`duplicate local ${sn} in ${fname}`);
++        slots.set(sn, paramTypes.length + localTypes.length);
++        list.push(st);
++      }
++    }
++  };
++  declare(paramTypes, params);
++  declare(localTypes, locals);
++  const slot = (n) => {
++    if (!slots.has(n)) throw new Error(`unknown local ${n} in ${fname}`);
++    return uleb(slots.get(n));
++  };
++  const g = (n) => [0x20, ...slot(n)];
++  const s = (n, value) => c(value, 0x21, slot(n));
++  const V = (n) => [g(`${n}.x`), g(`${n}.y`), g(`${n}.z`)];
++  // Evaluate all three components before assigning, so `v = f(v)` is safe.
++  const vset = (n, [x, y, z]) => c(x, y, z, 0x21, slot(`${n}.z`), 0x21, slot(`${n}.y`), 0x21, slot(`${n}.x`));
++  const vnorm = (n, v) => c(vset(n, v), vset(n, vscale(V(n), div(f64(1), sqrt(dot(V(n), V(n)))))));
++  // Store a multi-value (f64, f64, f64) call result.
++  const vcall = (n, fn, ...args) => c(call(fn, ...args), 0x21, slot(`${n}.z`), 0x21, slot(`${n}.y`), 0x21, slot(`${n}.x`));
++  const forRange = (n, from, to, body) => c(s(n, from), loop(ilt(g(n), to), body, s(n, iadd(g(n), i32(1)))));
++  const body = build({ g, s, V, vset, vnorm, vcall, forRange });
++  funcs[order.indexOf(fname)] = {
++    fname,
++    exported,
++    type: typeIndex(paramTypes, results),
++    localTypes,
++    code: c(body, 0x0b),
++  };
++}
++
++const sphereVec = (base, field) => [0, 8, 16].map((o) => load(base, OFF[field] + o));
++
++// erand48(): x = (0x5DEECE66D * x + 0xB) mod 2^48, returned as x / 2^48.
++defineFunc('rand', {}, ['f64'], {}, () => c(
++  gset(G_SEED, land(ladd(lmul(gget(G_SEED), i64(0x5deece66d)), i64(0xb)), i64(0xffffffffffff))),
++  mul(f64FromU64(gget(G_SEED)), f64(1 / 281474976710656)),
++), false);
++
++// Sphere::intersect
++defineFunc('sphere_intersect', { i: 'i32', o: 'vec', d: 'vec' }, ['f64'],
++  { base: 'i32', op: 'vec', b: 'f64', det: 'f64', t: 'f64' },
++  ({ g, s, V, vset }) => c(
++    s('base', imul(g('i'), i32(SPHERE_STRIDE))),
++    vset('op', vsub(sphereVec(g('base'), 'p'), V('o'))),
++    s('b', dot(V('op'), V('d'))),
++    s('det', add(sub(mul(g('b'), g('b')), dot(V('op'), V('op'))),
++      mul(load(g('base'), OFF.rad), load(g('base'), OFF.rad)))),
++    if_(lt(g('det'), f64(0)), ret(f64(0))),
++    s('det', sqrt(g('det'))),
++    s('t', sub(g('b'), g('det'))),
++    if_(gt(g('t'), f64(1e-4)), ret(g('t'))),
++    s('t', add(g('b'), g('det'))),
++    if_(gt(g('t'), f64(1e-4)), ret(g('t'))),
++    f64(0),
++  ), false);
++
++// intersect(): returns t (1e20 on miss) and sets the hit-id global.
++defineFunc('intersect', { o: 'vec', d: 'vec' }, ['f64'], { t: 'f64', i: 'i32', dist: 'f64' },
++  ({ g, s, V }) => c(
++    s('t', f64(1e20)),
++    s('i', i32(scene.length)),
++    loop(g('i'), c(
++      s('i', isub(g('i'), i32(1))),
++      s('dist', call('sphere_intersect', g('i'), ...V('o'), ...V('d'))),
++      if_(band(ne(g('dist'), f64(0)), lt(g('dist'), g('t'))), c(s('t', g('dist')), gset(G_HIT, g('i')))),
++    )),
++    g('t'),
++  ), false);
++
++const R0 = (0.5 * 0.5) / (2.5 * 2.5); // a=nt-nc, b=nt+nc, R0=a*a/(b*b)
++defineFunc('radiance', { o: 'vec', d: 'vec', depth: 'i32' }, ['f64', 'f64', 'f64'], {
++  t: 'f64', base: 'i32', x: 'vec', n: 'vec', nl: 'vec', f: 'vec', e: 'vec', p: 'f64', refl: 'f64',
++  r1: 'f64', r2: 'f64', r2s: 'f64', cs: 'f64', sn: 'f64', u: 'vec', v: 'vec', nd: 'vec',
++  rd: 'vec', rr: 'vec', tv: 'vec', into: 'i32', nnt: 'f64', ddn: 'f64', cos2t: 'f64', k: 'f64',
++  tdir: 'vec', cc: 'f64', Re: 'f64', Tr: 'f64', P: 'f64',
++}, ({ g, s, V, vset, vnorm, vcall }) => {
++  const result = (rad) => ret(...vadd(V('e'), vmult(V('f'), rad)));
++  return c(
++    s('t', call('intersect', ...V('o'), ...V('d'))),
++    if_(ge(g('t'), f64(1e20)), ret(...ZERO)), // if miss, return black
++    s('base', imul(gget(G_HIT), i32(SPHERE_STRIDE))),
++    vset('x', vadd(V('o'), vscale(V('d'), g('t')))),
++    vnorm('n', vsub(V('x'), sphereVec(g('base'), 'p'))),
++    vset('nl', vscale(V('n'), ternary(lt(dot(V('n'), V('d')), f64(0)), f64(1), f64(-1)))),
++    vset('f', sphereVec(g('base'), 'c')),
++    vset('e', sphereVec(g('base'), 'e')),
++    s('p', op(0xa5)(op(0xa5)(g('f.x'), g('f.y')), g('f.z'))), // max refl
++    s('depth', iadd(g('depth'), i32(1))),
++    if_(igt(g('depth'), i32(5)), // Russian roulette
++      if_(lt(call('rand'), g('p')), vset('f', vscale(V('f'), div(f64(1), g('p')))), ret(...V('e')))),
++    s('refl', load(g('base'), OFF.refl)),
++    if_(eq(g('refl'), f64(DIFF)), c( // Ideal DIFFUSE reflection
++      s('r1', mul(f64(2 * Math.PI), call('rand'))),
++      s('r2', call('rand')),
++      s('r2s', sqrt(g('r2'))),
++      if_(gt(abs(g('nl.x')), f64(0.1)),
++        vset('u', cross(vconst(0, 1, 0), V('nl'))),
++        vset('u', cross(vconst(1, 0, 0), V('nl')))),
++      vnorm('u', V('u')),
++      vset('v', cross(V('nl'), V('u'))),
++      s('cs', call('cos', g('r1'))),
++      s('sn', call('sin', g('r1'))),
++      vnorm('nd', vadd(vadd(
++        vscale(vscale(V('u'), g('cs')), g('r2s')),
++        vscale(vscale(V('v'), g('sn')), g('r2s'))),
++        vscale(V('nl'), sqrt(sub(f64(1), g('r2')))))),
++      vcall('rr', 'radiance', ...V('x'), ...V('nd'), g('depth')),
++      result(V('rr')),
++    )),
++    vset('rd', vsub(V('d'), vscale(vscale(V('n'), f64(2)), dot(V('n'), V('d'))))),
++    if_(eq(g('refl'), f64(SPEC)), c( // Ideal SPECULAR reflection
++      vcall('rr', 'radiance', ...V('x'), ...V('rd'), g('depth')),
++      result(V('rr')),
++    )),
++    // Ideal dielectric REFRACTION
++    s('into', gt(dot(V('n'), V('nl')), f64(0))),
++    s('nnt', ternary(g('into'), f64(1 / 1.5), f64(1.5 / 1))),
++    s('ddn', dot(V('d'), V('nl'))),
++    s('cos2t', sub(f64(1), mul(mul(g('nnt'), g('nnt')), sub(f64(1), mul(g('ddn'), g('ddn')))))),
++    if_(lt(g('cos2t'), f64(0)), c( // Total internal reflection
++      vcall('rr', 'radiance', ...V('x'), ...V('rd'), g('depth')),
++      result(V('rr')),
++    )),
++    s('k', mul(ternary(g('into'), f64(1), f64(-1)), add(mul(g('ddn'), g('nnt')), sqrt(g('cos2t'))))),
++    vnorm('tdir', vsub(vscale(V('d'), g('nnt')), vscale(V('n'), g('k')))),
++    s('cc', sub(f64(1), ternary(g('into'), neg(g('ddn')), dot(V('tdir'), V('n'))))),
++    s('Re', add(f64(R0), mul(mul(mul(mul(mul(f64(1 - R0), g('cc')), g('cc')), g('cc')), g('cc')), g('cc')))),
++    s('Tr', sub(f64(1), g('Re'))),
++    s('P', add(f64(0.25), mul(f64(0.5), g('Re')))),
++    if_(igt(g('depth'), i32(2)),
++      if_(lt(call('rand'), g('P')),
++        c(vcall('rr', 'radiance', ...V('x'), ...V('rd'), g('depth')),
++          s('k', div(g('Re'), g('P'))), vset('rr', vscale(V('rr'), g('k')))),
++        c(vcall('rr', 'radiance', ...V('x'), ...V('tdir'), g('depth')),
++          s('k', div(g('Tr'), sub(f64(1), g('P')))), vset('rr', vscale(V('rr'), g('k'))))),
++      c(vcall('rr', 'radiance', ...V('x'), ...V('rd'), g('depth')),
++        vset('rr', vscale(V('rr'), g('Re'))),
++        vcall('tv', 'radiance', ...V('x'), ...V('tdir'), g('depth')),
++        vset('rr', vadd(V('rr'), vscale(V('tv'), g('Tr')))))),
++    result(V('rr')),
++  );
++}, false);
++
++const clamp = (x) => ternary(lt(x, f64(0)), f64(0), ternary(gt(x, f64(1)), f64(1), x));
++const toInt = (x) => i32TruncSat(add(mul(call('pow', clamp(x), f64(1 / 2.2)), f64(255)), f64(0.5)));
++const camDir = (() => {
++  const d = [0, -0.042612, -1];
++  const inv = 1 / Math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
++  return d.map((v) => v * inv);
++})();
++
++defineFunc('render_rows', { w: 'i32', h: 'i32', samps: 'i32', y0: 'i32', y1: 'i32' }, [], {
++  x: 'i32', y: 'i32', sx: 'i32', sy: 'i32', smp: 'i32', px: 'i32', inv: 'f64',
++  r1: 'f64', r2: 'f64', dx: 'f64', dy: 'f64', a: 'f64', b: 'f64',
++  cx: 'vec', cy: 'vec', d: 'vec', o: 'vec', r: 'vec', acc: 'vec', rad: 'vec',
++}, ({ g, s, V, vset, vnorm, vcall, forRange }) => {
++  const tent = (rv) => ternary(lt(g(rv), f64(1)), sub(sqrt(g(rv)), f64(1)), sub(f64(1), sqrt(sub(f64(2), g(rv)))));
++  const subpixel = (sub_, delta, coord, size) =>
++    sub(div(add(div(add(add(f64FromI32(g(sub_)), f64(0.5)), g(delta)), f64(2)), f64FromI32(g(coord))),
++      f64FromI32(g(size))), f64(0.5));
++  return c(
++    if_(band(band(c(g('w'), i32(MAX_W), 0x4c /* i32.le_s */), c(g('h'), i32(MAX_H), 0x4c)),
++      c(g('samps'), i32(1), 0x4e /* i32.ge_s */)), [], ret()),
++    vset('cx', [div(mul(f64FromI32(g('w')), f64(0.5135)), f64FromI32(g('h'))), f64(0), f64(0)]),
++    vnorm('cy', cross(V('cx'), camDir.map(f64))),
++    vset('cy', vscale(V('cy'), f64(0.5135))),
++    s('inv', div(f64(1), f64FromI32(g('samps')))),
++    forRange('y', g('y0'), g('y1'), c(
++      gset(G_SEED, lshl(i64FromU32(iand(imul(imul(g('y'), g('y')), g('y')), i32(0xffff))), i64(32))),
++      forRange('x', i32(0), g('w'), c(
++        vset('acc', ZERO),
++        forRange('sy', i32(0), i32(2), forRange('sx', i32(0), i32(2), c(
++          vset('r', ZERO),
++          forRange('smp', i32(0), g('samps'), c(
++            s('r1', mul(f64(2), call('rand'))), s('dx', tent('r1')),
++            s('r2', mul(f64(2), call('rand'))), s('dy', tent('r2')),
++            s('a', subpixel('sx', 'dx', 'x', 'w')),
++            s('b', subpixel('sy', 'dy', 'y', 'h')),
++            vset('d', vadd(vadd(vscale(V('cx'), g('a')), vscale(V('cy'), g('b'))), camDir.map(f64))),
++            vset('o', vadd(vconst(50, 52, 295.6), vscale(V('d'), f64(140)))),
++            vnorm('d', V('d')),
++            vcall('rad', 'radiance', ...V('o'), ...V('d'), i32(0)),
++            vset('r', vadd(V('r'), vscale(V('rad'), g('inv')))),
++          )),
++          vset('acc', vadd(V('acc'), vscale(V('r').map(clamp), f64(0.25)))),
++        ))),
++        s('px', iadd(i32(IMAGE), imul(iadd(imul(isub(isub(g('h'), g('y')), i32(1)), g('w')), g('x')), i32(4)))),
++        store8(g('px'), 0, toInt(g('acc.x'))),
++        store8(g('px'), 1, toInt(g('acc.y'))),
++        store8(g('px'), 2, toInt(g('acc.z'))),
++        store8(g('px'), 3, i32(255)),
++      )),
++    )),
++  );
++});
++
++defineFunc('set_sphere_color', { i: 'i32', r: 'f64', g: 'f64', b: 'f64' }, [], { base: 'i32' },
++  ({ g, s }) => c(
++    if_(ige_u(g('i'), i32(scene.length)), ret()),
++    s('base', iadd(i32(SPHERES), imul(g('i'), i32(SPHERE_STRIDE)))),
++    store(g('base'), OFF.c, g('r')),
++    store(g('base'), OFF.c + 8, g('g')),
++    store(g('base'), OFF.c + 16, g('b')),
++  ));
++
++defineFunc('reset_scene', {}, [], { k: 'i32' }, ({ g, forRange }) =>
++  forRange('k', i32(0), i32(sceneBytes.length / 8),
++    store(imul(g('k'), i32(8)), SPHERES, load(imul(g('k'), i32(8)), DEFAULT_SPHERES))));
++
++defineFunc('image_ptr', {}, ['i32'], {}, () => i32(IMAGE));
++
++// ---------------------------------------------------------------------------
++// Assemble sections
++const importTypes = imports.map(([, p, r]) => typeIndex(p, r));
++const typeSec = vec(types.map(({ params, results }) =>
++  [0x60, vec(params.map((t) => T[t])), vec(results.map((t) => T[t]))]));
++const importSec = vec(imports.map(([n], i) => [name('env'), name(n), 0x00, uleb(importTypes[i])]));
++const funcSec = vec(funcs.map((f) => uleb(f.type)));
++const memSec = vec([[0x00, uleb(PAGES)]]);
++const globalSec = vec([
++  [T.i64, 0x01, i64(0), 0x0b], // erand48 state
++  [T.i32, 0x01, i32(0), 0x0b], // hit sphere id
++]);
++const exportSec = vec([
++  [name('memory'), 0x02, uleb(0)],
++  ...funcs.filter((f) => f.exported).map((f) => [name(f.fname), 0x00, uleb(fnIndex(f.fname))]),
++]);
++const codeSec = vec(funcs.map((f) => {
++  const body = c(vec(f.localTypes.map((t) => [1, T[t]])), f.code);
++  return [uleb(body.length), body];
++}));
++const dataSec = vec([
++  [0x00, i32(SPHERES), 0x0b, vec([...sceneBytes])],
++  [0x00, i32(DEFAULT_SPHERES), 0x0b, vec([...sceneBytes])],
++]);
++
++const bytes = Uint8Array.from(c(
++  [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
++  section(1, typeSec), section(2, importSec), section(3, funcSec), section(5, memSec),
++  section(6, globalSec), section(7, exportSec), section(10, codeSec), section(11, dataSec),
++));
++if (!WebAssembly.validate(bytes)) throw new Error('generated module failed validation');
++const out = process.argv[2] ?? new URL('../smallpt.wasm', import.meta.url);
++writeFileSync(out, bytes);
++console.log(`wrote ${bytes.length} bytes to ${out}`);
+diff --git a/wasm/smallpt.cpp b/wasm/smallpt.cpp
+new file mode 100644
+index 0000000..5b1342b
+--- /dev/null
++++ b/wasm/smallpt.cpp
+@@ -0,0 +1,141 @@
++// smallpt, a Path Tracer by Kevin Beason, 2008 (http://www.kevinbeason.com/smallpt/)
++// Adapted for WebAssembly: main() and the PPM writer are replaced by exported
++// functions that render rows into an RGBA buffer, and sphere colors are settable.
++#include <math.h>
++
++static const double PI = 3.14159265358979323846;
++static const int MAX_W = 640, MAX_H = 480;
++static unsigned char image[MAX_W * MAX_H * 4];
++
++// erand48() from POSIX, inlined so the build doesn't depend on libc extensions.
++static double rand48(unsigned short *Xi) {
++  unsigned long long x = (unsigned long long)Xi[0] | (unsigned long long)Xi[1] << 16 |
++                         (unsigned long long)Xi[2] << 32;
++  x = (x * 0x5DEECE66DULL + 0xB) & 0xFFFFFFFFFFFFULL;
++  Xi[0] = x; Xi[1] = x >> 16; Xi[2] = x >> 32;
++  return x * (1.0 / 281474976710656.0);
++}
++
++struct Vec {        // Usage: time ./smallpt 5000 && xv image.ppm
++  double x, y, z;                  // position, also color (r,g,b)
++  Vec(double x_=0, double y_=0, double z_=0){ x=x_; y=y_; z=z_; }
++  Vec operator+(const Vec &b) const { return Vec(x+b.x,y+b.y,z+b.z); }
++  Vec operator-(const Vec &b) const { return Vec(x-b.x,y-b.y,z-b.z); }
++  Vec operator*(double b) const { return Vec(x*b,y*b,z*b); }
++  Vec mult(const Vec &b) const { return Vec(x*b.x,y*b.y,z*b.z); }
++  Vec& norm(){ return *this = *this * (1/sqrt(x*x+y*y+z*z)); }
++  double dot(const Vec &b) const { return x*b.x+y*b.y+z*b.z; } // cross:
++  Vec operator%(const Vec &b) const { return Vec(y*b.z-z*b.y,z*b.x-x*b.z,x*b.y-y*b.x); }
++};
++struct Ray { Vec o, d; Ray(Vec o_, Vec d_) : o(o_), d(d_) {} };
++enum Refl_t { DIFF, SPEC, REFR };  // material types, used in radiance()
++struct Sphere {
++  double rad;       // radius
++  Vec p, e, c;      // position, emission, color
++  Refl_t refl;      // reflection type (DIFFuse, SPECular, REFRactive)
++  Sphere(double rad_, Vec p_, Vec e_, Vec c_, Refl_t refl_):
++    rad(rad_), p(p_), e(e_), c(c_), refl(refl_) {}
++  double intersect(const Ray &r) const { // returns distance, 0 if nohit
++    Vec op = p-r.o; // Solve t^2*d.d + 2*t*(o-p).d + (o-p).(o-p)-R^2 = 0
++    double t, eps=1e-4, b=op.dot(r.d), det=b*b-op.dot(op)+rad*rad;
++    if (det<0) return 0; else det=sqrt(det);
++    return (t=b-det)>eps ? t : ((t=b+det)>eps ? t : 0);
++  }
++};
++static const Sphere defaultSpheres[] = {//Scene: radius, position, emission, color, material
++  Sphere(1e5, Vec( 1e5+1,40.8,81.6), Vec(),Vec(.75,.25,.25),DIFF),//Left
++  Sphere(1e5, Vec(-1e5+99,40.8,81.6),Vec(),Vec(.25,.25,.75),DIFF),//Rght
++  Sphere(1e5, Vec(50,40.8, 1e5),     Vec(),Vec(.75,.75,.75),DIFF),//Back
++  Sphere(1e5, Vec(50,40.8,-1e5+170), Vec(),Vec(),           DIFF),//Frnt
++  Sphere(1e5, Vec(50, 1e5, 81.6),    Vec(),Vec(.75,.75,.75),DIFF),//Botm
++  Sphere(1e5, Vec(50,-1e5+81.6,81.6),Vec(),Vec(.75,.75,.75),DIFF),//Top
++  Sphere(16.5,Vec(27,16.5,47),       Vec(),Vec(1,1,1)*.999, SPEC),//Mirr
++  Sphere(16.5,Vec(73,16.5,78),       Vec(),Vec(1,1,1)*.999, REFR),//Glas
++  Sphere(600, Vec(50,681.6-.27,81.6),Vec(12,12,12),  Vec(), DIFF) //Lite
++};
++static const int numSpheres = sizeof(defaultSpheres)/sizeof(Sphere);
++static Sphere spheres[] = {
++  defaultSpheres[0], defaultSpheres[1], defaultSpheres[2], defaultSpheres[3], defaultSpheres[4],
++  defaultSpheres[5], defaultSpheres[6], defaultSpheres[7], defaultSpheres[8]
++};
++inline double clamp(double x){ return x<0 ? 0 : x>1 ? 1 : x; }
++inline int toInt(double x){ return int(pow(clamp(x),1/2.2)*255+.5); }
++inline bool intersect(const Ray &r, double &t, int &id){
++  double d, inf=t=1e20;
++  for(int i=numSpheres;i--;) if((d=spheres[i].intersect(r))&&d<t){t=d;id=i;}
++  return t<inf;
++}
++Vec radiance(const Ray &r, int depth, unsigned short *Xi){
++  double t;                               // distance to intersection
++  int id=0;                               // id of intersected object
++  if (!intersect(r, t, id)) return Vec(); // if miss, return black
++  const Sphere &obj = spheres[id];        // the hit object
++  Vec x=r.o+r.d*t, n=(x-obj.p).norm(), nl=n.dot(r.d)<0?n:n*-1, f=obj.c;
++  double p = f.x>f.y && f.x>f.z ? f.x : f.y>f.z ? f.y : f.z; // max refl
++  if (++depth>5) { if (rand48(Xi)<p) f=f*(1/p); else return obj.e; } //R.R.
++  if (obj.refl == DIFF){                  // Ideal DIFFUSE reflection
++    double r1=2*PI*rand48(Xi), r2=rand48(Xi), r2s=sqrt(r2);
++    Vec w=nl, u=((fabs(w.x)>.1?Vec(0,1):Vec(1))%w).norm(), v=w%u;
++    Vec d = (u*cos(r1)*r2s + v*sin(r1)*r2s + w*sqrt(1-r2)).norm();
++    return obj.e + f.mult(radiance(Ray(x,d),depth,Xi));
++  } else if (obj.refl == SPEC)            // Ideal SPECULAR reflection
++    return obj.e + f.mult(radiance(Ray(x,r.d-n*2*n.dot(r.d)),depth,Xi));
++  Ray reflRay(x, r.d-n*2*n.dot(r.d));     // Ideal dielectric REFRACTION
++  bool into = n.dot(nl)>0;                // Ray from outside going in?
++  double nc=1, nt=1.5, nnt=into?nc/nt:nt/nc, ddn=r.d.dot(nl), cos2t;
++  if ((cos2t=1-nnt*nnt*(1-ddn*ddn))<0)    // Total internal reflection
++    return obj.e + f.mult(radiance(reflRay,depth,Xi));
++  Vec tdir = (r.d*nnt - n*((into?1:-1)*(ddn*nnt+sqrt(cos2t)))).norm();
++  double a=nt-nc, b=nt+nc, R0=a*a/(b*b), c = 1-(into?-ddn:tdir.dot(n));
++  double Re=R0+(1-R0)*c*c*c*c*c,Tr=1-Re,P=.25+.5*Re,RP=Re/P,TP=Tr/(1-P);
++  Vec rad;
++  if (depth>2) {                          // Russian roulette
++    if (rand48(Xi)<P) rad = radiance(reflRay,depth,Xi)*RP;
++    else rad = radiance(Ray(x,tdir),depth,Xi)*TP;
++  } else {
++    rad = radiance(reflRay,depth,Xi)*Re;
++    rad = rad + radiance(Ray(x,tdir),depth,Xi)*Tr;
++  }
++  return obj.e + f.mult(rad);
++}
++
++extern "C" {
++
++unsigned char *image_ptr() { return image; }
++
++void reset_scene() { for (int i=0; i<numSpheres; i++) spheres[i] = defaultSpheres[i]; }
++
++void set_sphere_color(int i, double r, double g, double b) {
++  if (i>=0 && i<numSpheres) spheres[i].c = Vec(r,g,b);
++}
++
++// Renders image rows for scanlines y0 <= y < y1 (y=0 is the bottom, as in the
++// original) using 2x2 subpixels with `samps` samples each, writing RGBA into
++// image[] top-down at row h-y-1.
++void render_rows(int w, int h, int samps, int y0, int y1) {
++  if (w>MAX_W || h>MAX_H || samps<1) return;
++  Ray cam(Vec(50,52,295.6), Vec(0,-0.042612,-1).norm()); // cam pos, dir
++  Vec cx=Vec(w*.5135/h), cy=(cx%cam.d).norm()*.5135, r;
++  for (int y=y0; y<y1; y++){
++    unsigned short Xi[3]={0,0,(unsigned short)(y*y*y)};
++    for (int x=0; x<w; x++){
++      Vec c;
++      for (int sy=0; sy<2; sy++)          // 2x2 subpixel rows
++        for (int sx=0; sx<2; sx++, r=Vec()){ // 2x2 subpixel cols
++          for (int s=0; s<samps; s++){
++            double r1=2*rand48(Xi), dx=r1<1 ? sqrt(r1)-1: 1-sqrt(2-r1);
++            double r2=2*rand48(Xi), dy=r2<1 ? sqrt(r2)-1: 1-sqrt(2-r2);
++            Vec d = cx*( ( (sx+.5 + dx)/2 + x)/w - .5) +
++                    cy*( ( (sy+.5 + dy)/2 + y)/h - .5) + cam.d;
++            Vec o = cam.o+d*140;          // Camera rays are pushed forward to start in interior
++            r = r + radiance(Ray(o,d.norm()),0,Xi)*(1./samps);
++          }
++          c = c + Vec(clamp(r.x),clamp(r.y),clamp(r.z))*.25;
++        }
++      unsigned char *px = image + ((h-y-1)*w+x)*4;
++      px[0]=toInt(c.x); px[1]=toInt(c.y); px[2]=toInt(c.z); px[3]=255;
++    }
++  }
++}
++
++} // extern "C"

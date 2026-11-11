@@ -1,0 +1,319 @@
+diff --git a/index.html b/index.html
+--- a/index.html
++++ b/index.html
+@@ -134,8 +134,96 @@
+     .btn:hover {
+       background: #3e2723;
+     }
+ 
++    /* Flavor Simulator */
++    .sim {
++      margin-top: 60px;
++      background: white;
++      padding: 24px;
++      border-radius: 8px;
++      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
++    }
++
++    .sim-controls {
++      display: flex;
++      flex-wrap: wrap;
++      gap: 12px;
++      align-items: flex-end;
++      margin: 16px 0;
++    }
++
++    .sim-controls label {
++      display: flex;
++      flex-direction: column;
++      font-size: 0.85rem;
++      gap: 4px;
++    }
++
++    .sim-controls input {
++      padding: 8px;
++      border: 1px solid var(--secondary);
++      border-radius: 4px;
++      width: 160px;
++    }
++
++    .sim-controls .btn {
++      margin-top: 0;
++      border: 0;
++      cursor: pointer;
++      font: inherit;
++    }
++
++    .sim-controls .btn:disabled {
++      opacity: 0.5;
++      cursor: not-allowed;
++    }
++
++    .progress {
++      height: 10px;
++      background: var(--secondary);
++      border-radius: 5px;
++      overflow: hidden;
++    }
++
++    .progress > div {
++      height: 100%;
++      width: 0;
++      background: var(--accent);
++    }
++
++    .sim-status {
++      font-size: 0.85rem;
++      margin: 8px 0 16px;
++    }
++
++    .flavor-row {
++      display: grid;
++      grid-template-columns: 90px 1fr 50px;
++      gap: 10px;
++      align-items: center;
++      font-size: 0.9rem;
++      margin-bottom: 6px;
++    }
++
++    .flavor-bar {
++      height: 12px;
++      background: var(--light);
++      border-radius: 6px;
++      overflow: hidden;
++    }
++
++    .flavor-bar > div {
++      height: 100%;
++      background: var(--primary);
++    }
++
++    .sim-top {
++      margin-top: 16px;
++      padding-left: 20px;
++      font-size: 0.9rem;
++    }
++
+     footer {
+       background: var(--secondary);
+       text-align: center;
+       padding: 40px 20px;
+@@ -194,8 +282,26 @@
+           <a href="/menu/cold-brew" class="btn">View Details</a>
+         </div>
+       </div>
+     </section>
++
++    <section class="sim" aria-labelledby="sim-title">
++      <h2 id="sim-title" style="text-align: center;">Flavor Profile Simulator</h2>
++      <p style="text-align: center;">Simulate thousands of random recipe blends and see the average flavor profile. It runs in the background, so the page stays responsive.</p>
++      <form class="sim-controls" id="sim-form">
++        <label>Blends to simulate
++          <input type="number" id="sim-count" min="1" max="5000000" value="500000">
++        </label>
++        <button type="submit" class="btn" id="sim-run">Run Simulation</button>
++        <button type="button" class="btn" id="sim-cancel" disabled>Cancel</button>
++      </form>
++      <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="sim-progress">
++        <div id="sim-bar"></div>
++      </div>
++      <p class="sim-status" id="sim-status" aria-live="polite">Idle.</p>
++      <div id="sim-results"></div>
++      <ol class="sim-top" id="sim-top" hidden></ol>
++    </section>
+   </main>
+ 
+   <footer>
+     <div class="footer-links">
+@@ -206,7 +312,191 @@
+     </div>
+     <p>&copy; 2026 The Daily Grind Coffee Co. All rights reserved.</p>
+   </footer>
+ 
++  <script id="sim-worker" type="text/js-worker">
++    // Runs off the main thread so the page never blocks.
++    const ORIGINS = [
++      { name: 'Ethiopia',  w: { acidity: 8, body: 3, sweetness: 6, bitterness: 2, aroma: 9 } },
++      { name: 'Colombia',  w: { acidity: 6, body: 5, sweetness: 7, bitterness: 3, aroma: 6 } },
++      { name: 'Sumatra',   w: { acidity: 3, body: 9, sweetness: 4, bitterness: 6, aroma: 5 } },
++      { name: 'Brazil',    w: { acidity: 3, body: 6, sweetness: 8, bitterness: 4, aroma: 4 } },
++      { name: 'Kenya',     w: { acidity: 9, body: 4, sweetness: 5, bitterness: 3, aroma: 8 } }
++    ];
++    const ROASTS = [0.8, 1, 1.2]; // light, medium, dark
++    const TRAITS = ['acidity', 'body', 'sweetness', 'bitterness', 'aroma'];
++    const TOP_N = 5;
++    let cancelled = false;
++
++    self.onmessage = (e) => {
++      if (e.data.type === 'cancel') { cancelled = true; return; }
++      if (e.data.type === 'start') { cancelled = false; run(e.data.count); }
++    };
++
++    function run(total) {
++      let seed = 123456789;
++      const rand = () => { // xorshift32
++        seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5;
++        return (seed >>> 0) / 4294967296;
++      };
++      const sums = new Float64Array(TRAITS.length);
++      let top = [];
++      const CHUNK = 20000;
++      let done = 0;
++      let lastPost = 0;
++
++      while (done < total) {
++        if (cancelled) { self.postMessage({ type: 'cancelled', done }); return; }
++        const end = Math.min(done + CHUNK, total);
++        for (; done < end; done++) {
++          // Random blend: weights per origin plus a roast level.
++          const ratios = ORIGINS.map(() => rand());
++          const rs = ratios.reduce((a, b) => a + b, 0);
++          const roast = Math.floor(rand() * 3);
++          const profile = new Array(TRAITS.length).fill(0);
++          for (let i = 0; i < ORIGINS.length; i++) {
++            const r = ratios[i] / rs;
++            for (let t = 0; t < TRAITS.length; t++) profile[t] += r * ORIGINS[i].w[TRAITS[t]];
++          }
++          profile[1] *= ROASTS[roast];      // body
++          profile[3] *= ROASTS[roast];      // bitterness
++          profile[0] /= ROASTS[roast];      // acidity
++          let score = 0;
++          for (let t = 0; t < TRAITS.length; t++) {
++            profile[t] = Math.min(10, profile[t]);
++            sums[t] += profile[t];
++            // Balanced cups score higher: reward sweetness/aroma, penalize bitterness.
++            score += t === 3 ? -profile[t] : profile[t];
++          }
++          if (top.length < TOP_N || score > top[top.length - 1].score) {
++            top.push({ score, roast, ratios: ratios.map(r => r / rs) });
++            top.sort((a, b) => b.score - a.score);
++            if (top.length > TOP_N) top.pop();
++          }
++        }
++        const now = Date.now();
++        if (now - lastPost > 50) {
++          lastPost = now;
++          self.postMessage({ type: 'progress', done, total });
++        }
++      }
++
++      self.postMessage({
++        type: 'done',
++        total,
++        averages: TRAITS.map((name, i) => ({ name, value: sums[i] / total })),
++        top: top.map(b => ({
++          score: b.score,
++          roast: ['Light', 'Medium', 'Dark'][b.roast],
++          mix: ORIGINS.map((o, i) => o.name + ' ' + Math.round(b.ratios[i] * 100) + '%').join(', ')
++        }))
++      });
++    }
++  </script>
++  <script>
++    (() => {
++      const form = document.getElementById('sim-form');
++      const countEl = document.getElementById('sim-count');
++      const runBtn = document.getElementById('sim-run');
++      const cancelBtn = document.getElementById('sim-cancel');
++      const bar = document.getElementById('sim-bar');
++      const progress = document.getElementById('sim-progress');
++      const status = document.getElementById('sim-status');
++      const results = document.getElementById('sim-results');
++      const topEl = document.getElementById('sim-top');
++      let worker = null;
++      let workerUrl = null;
++
++      const fmt = (n) => n.toLocaleString();
++      const setProgress = (pct) => {
++        bar.style.width = pct + '%';
++        progress.setAttribute('aria-valuenow', Math.round(pct));
++      };
++      const finish = () => {
++        if (worker) worker.terminate();
++        worker = null;
++        runBtn.disabled = false;
++        cancelBtn.disabled = true;
++      };
++
++      function render(data) {
++        results.replaceChildren();
++        data.averages.forEach((a) => {
++          const row = document.createElement('div');
++          row.className = 'flavor-row';
++          const label = document.createElement('span');
++          label.textContent = a.name[0].toUpperCase() + a.name.slice(1);
++          const track = document.createElement('div');
++          track.className = 'flavor-bar';
++          const fill = document.createElement('div');
++          fill.style.width = (a.value * 10) + '%';
++          track.appendChild(fill);
++          const val = document.createElement('span');
++          val.textContent = a.value.toFixed(2);
++          row.append(label, track, val);
++          results.appendChild(row);
++        });
++        topEl.replaceChildren();
++        data.top.forEach((b) => {
++          const li = document.createElement('li');
++          li.textContent = b.roast + ' roast: ' + b.mix + ' (score ' + b.score.toFixed(2) + ')';
++          topEl.appendChild(li);
++        });
++        topEl.hidden = false;
++      }
++
++      form.addEventListener('submit', (e) => {
++        e.preventDefault();
++        const count = Math.min(5000000, Math.max(1, parseInt(countEl.value, 10) || 0));
++        if (!count) return;
++        countEl.value = count;
++        if (!workerUrl) {
++          const src = document.getElementById('sim-worker').textContent;
++          workerUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
++        }
++        try {
++          worker = new Worker(workerUrl);
++        } catch (err) {
++          status.textContent = 'Simulation is not supported in this browser.';
++          return;
++        }
++        runBtn.disabled = true;
++        cancelBtn.disabled = false;
++        results.replaceChildren();
++        topEl.hidden = true;
++        setProgress(0);
++        status.textContent = 'Simulating…';
++
++        worker.onmessage = (ev) => {
++          const m = ev.data;
++          if (m.type === 'progress') {
++            setProgress(m.done / m.total * 100);
++            status.textContent = 'Simulated ' + fmt(m.done) + ' of ' + fmt(m.total) + ' blends…';
++          } else if (m.type === 'done') {
++            setProgress(100);
++            status.textContent = 'Finished simulating ' + fmt(m.total) + ' blends.';
++            render(m);
++            finish();
++          } else if (m.type === 'cancelled') {
++            status.textContent = 'Cancelled after ' + fmt(m.done) + ' blends.';
++            finish();
++          }
++        };
++        worker.onerror = () => {
++          status.textContent = 'Simulation failed.';
++          finish();
++        };
++        worker.postMessage({ type: 'start', count });
++      });
++
++      cancelBtn.addEventListener('click', () => {
++        if (!worker) return;
++        // The worker loop is synchronous, so terminate it rather than message it.
++        status.textContent = 'Cancelled.';
++        finish();
++      });
++    })();
++  </script>
++
+ </body>
+ 
+ </html>

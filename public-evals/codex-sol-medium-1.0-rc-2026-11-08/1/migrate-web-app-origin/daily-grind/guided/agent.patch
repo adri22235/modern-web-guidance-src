@@ -1,0 +1,464 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..b947077
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,2 @@
++node_modules/
++dist/
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..8c82c62
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,22 @@
++# Daily Grind origin migration
++
++This repository originally contained only a static page, with no installed-app manifest, settings schema, or hosting credentials. The implementation prepares two deployment bundles; it does not change a live installation from this workspace.
++
++Edit `migration.config.json` with your actual origins before production. Defaults assume a move from `https://app.dailygrind.example` to `https://order.dailygrind.example`. Both must use HTTPS and share a registrable domain, including private suffix rules. `oldId` must exactly match the existing installed app's resolved manifest ID (or its historical start URL if it had no explicit ID). Never assign a new identity to the old installation during rollout. Adjust `newId` if needed; IDs are identities, while the installation page remains `/`.
++
++Set `settingsKeys` to the actual localStorage preference keys. The default is `daily-grind:settings`, since this starter has no existing configuration storage. Do not include authentication tokens or session secrets. Values are copied verbatim, up to 64 KiB per key. IndexedDB, cookies, permissions, and server account data need separate application-specific handling; this starter uses none of them. Browser notification and location permissions must be requested again at the destination.
++
++Run `npm ci`, `npm test`, and `npm run build`. No server is required for these commands.
++
++## Deployment order
++
++1. Deploy `dist/new/` at the new origin, including its manifest, icons, scripts, and configuration.
++2. Deploy `dist/old/` at the old origin. Its manifest signals `migrate_to`; its extensionless `/.well-known/web-app-origin-association` authorizes the exact new manifest ID. Serve that file as JSON, without authentication or redirects.
++3. Keep the old origin, manifest URL, installation page, and `/migration/bridge.html` available throughout the migration window. Do not blanket-redirect the old site. If an existing service worker caches these files, update its routing/cache policy to deliver the new files. Preserve the pre-existing manifest URL when integrating these bundles with a previously deployed app.
++4. Apply the generated `_headers` rules through the hosting platform if it does not support that file. Permit the new origin to frame the old bridge; a global `X-Frame-Options: DENY` or `SAMEORIGIN` header would prevent transfer. On the new site's CSP, allow `frame-src` for the exact old origin. Do not allow arbitrary framing of the bridge.
++
++Supported browsers discover the manifest handshake and offer an app update that preserves installation integration, including OS shortcuts. This uses `suggest` rather than forcing removal. [Chrome documents origin migration starting with Chrome 150](https://developer.chrome.com/blog/seamless-pwa-origin-migration). Other browsers may require installing the new app manually; automatic shortcut preservation cannot be guaranteed there. The old site presents a link and fallback guidance without removing the old installation.
++
++On first visit to the new origin, a hidden old-origin bridge transfers only allowlisted settings. Both sides check the exact peer origin and window, and the destination correlates replies with a random nonce. New-origin values take precedence; the old values are never deleted. A completion marker prevents replay on later launches. Blocked storage, unreachable old hosting, and quota errors leave the transfer retryable, with a visible retry button. Third-party storage restrictions or isolated storage partitions can require separate account synchronization; an iframe cannot bypass them. Consumers can listen for `daily-grind:settings-migrated` to refresh settings loaded before the transfer completed.
++
++Automated checks cover manifest authorization, same-site rejection, message boundaries, allowlisting, conflicts, and retry safety. No browser verification or development server is needed to build these artifacts.
+diff --git a/index.html b/index.html
+index 66c9173..61f203c 100644
+--- a/index.html
++++ b/index.html
+@@ -5,6 +5,9 @@
+   <meta charset="UTF-8">
+   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+   <title>The Daily Grind | Artisanal Coffee</title>
++  <link rel="manifest" href="/manifest.webmanifest">
++  <meta name="theme-color" content="#4e342e">
++  <script type="module" src="/migration/client.js"></script>
+   <style>
+     :root {
+       --primary: #4e342e;
+@@ -152,6 +155,16 @@
+       text-decoration: none;
+       font-size: 0.85rem;
+     }
++
++    .migration-notice {
++      padding: 1rem 5%;
++      background: #fff3e0;
++      color: #3e2723;
++      border-bottom: 1px solid #d7ccc8;
++    }
++
++    .migration-notice a { color: inherit; font-weight: bold; }
++    .migration-notice button { margin-left: 1rem; padding: .4rem .7rem; cursor: pointer; }
+   </style>
+ </head>
+ 
+diff --git a/migration.config.json b/migration.config.json
+new file mode 100644
+index 0000000..a3dce3a
+--- /dev/null
++++ b/migration.config.json
+@@ -0,0 +1,7 @@
++{
++  "oldOrigin": "https://app.dailygrind.example",
++  "newOrigin": "https://order.dailygrind.example",
++  "oldId": "/",
++  "newId": "/",
++  "settingsKeys": ["daily-grind:settings"]
++}
+diff --git a/migration/bridge.html b/migration/bridge.html
+new file mode 100644
+index 0000000..87e17cc
+--- /dev/null
++++ b/migration/bridge.html
+@@ -0,0 +1,7 @@
++<!doctype html>
++<html lang="en">
++<meta charset="utf-8">
++<meta name="referrer" content="no-referrer">
++<title>Transfer Daily Grind preferences</title>
++<script type="module" src="/migration/bridge.js"></script>
++</html>
+diff --git a/migration/bridge.js b/migration/bridge.js
+new file mode 100644
+index 0000000..a372793
+--- /dev/null
++++ b/migration/bridge.js
+@@ -0,0 +1,17 @@
++import { loadConfig, sameOrigin, trustedMessage, readSettings, REQUEST, RESPONSE } from './shared.js';
++
++const config = await loadConfig();
++if (sameOrigin(location.origin, config.oldOrigin) && parent !== window) {
++  window.addEventListener('message', event => {
++    if (!trustedMessage(event, parent, config.newOrigin)) return;
++    if (event.data?.type !== REQUEST || typeof event.data.nonce !== 'string' || event.data.nonce.length !== 36) return;
++    const reply = { type: RESPONSE, nonce: event.data.nonce };
++    try {
++      reply.entries = readSettings(localStorage, config.settingsKeys);
++    } catch {
++      reply.error = true;
++    }
++    parent.postMessage(reply, config.newOrigin);
++  });
++  parent.postMessage({ type: 'daily-grind:bridge-ready:v1' }, config.newOrigin);
++}
+diff --git a/migration/client.js b/migration/client.js
+new file mode 100644
+index 0000000..2bb63df
+--- /dev/null
++++ b/migration/client.js
+@@ -0,0 +1,75 @@
++import { loadConfig, sameOrigin, trustedMessage, importSettings, REQUEST, RESPONSE } from './shared.js';
++
++function notice(message) {
++  const element = document.createElement('aside');
++  element.className = 'migration-notice';
++  element.setAttribute('aria-label', 'App update');
++  element.setAttribute('role', 'status');
++  element.textContent = message;
++  document.body.prepend(element);
++  return element;
++}
++
++async function start() {
++  const config = await loadConfig();
++  if (sameOrigin(location.origin, config.oldOrigin)) {
++    const banner = notice('The Daily Grind has a new home. Open it to transfer your saved preferences. ');
++    const link = document.createElement('a');
++    link.href = config.newOrigin + '/';
++    link.textContent = 'Continue to the new app';
++    banner.append(link, document.createElement('br'),
++      'If an app update is offered, accept it to keep your shortcuts. Otherwise, install the new app from your browser menu; keep the old app until your preferences have transferred.');
++    return;
++  }
++  if (!sameOrigin(location.origin, config.newOrigin)) return;
++
++  const marker = `daily-grind:migration:v1:${config.oldOrigin}:${config.oldId}`;
++  try { if (localStorage.getItem(marker) === 'complete') return; } catch { /* Show recoverable failure below. */ }
++  const banner = notice('Transferring your Daily Grind preferences…');
++  const frame = document.createElement('iframe');
++  frame.hidden = true;
++  frame.title = 'Transfer saved preferences from the previous app';
++  frame.referrerPolicy = 'no-referrer';
++  const nonce = crypto.randomUUID();
++  let finished = false;
++  const finish = error => {
++    if (finished) return;
++    finished = true;
++    clearTimeout(timer);
++    window.removeEventListener('message', receive);
++    frame.remove();
++    if (error) {
++      banner.textContent = 'Your preferences could not be transferred. Keep the old app and allow site storage for both addresses, then retry. ';
++      const retry = document.createElement('button');
++      retry.type = 'button';
++      retry.textContent = 'Retry transfer';
++      retry.addEventListener('click', () => { banner.remove(); start().catch(console.error); }, { once: true });
++      banner.append(retry);
++    } else {
++      banner.textContent = 'Your saved preferences are ready. If your browser offers an app update, accept it to keep your shortcuts. Otherwise, install this app from your browser menu.';
++      window.dispatchEvent(new CustomEvent('daily-grind:settings-migrated'));
++    }
++  };
++  function receive(event) {
++    if (!trustedMessage(event, frame.contentWindow, config.oldOrigin)) return;
++    if (event.data?.type === 'daily-grind:bridge-ready:v1') {
++      frame.contentWindow.postMessage({ type: REQUEST, nonce }, config.oldOrigin);
++      return;
++    }
++    if (event.data?.type !== RESPONSE || event.data.nonce !== nonce) return;
++    try {
++      if (event.data.error) throw new Error('Source storage unavailable');
++      importSettings(localStorage, config.settingsKeys, event.data.entries);
++      localStorage.setItem(marker, 'complete');
++      finish(false);
++    } catch { finish(true); }
++  }
++  const timer = setTimeout(() => finish(true), 10000);
++  window.addEventListener('message', receive);
++  frame.src = config.oldOrigin + '/migration/bridge.html';
++  document.body.append(frame);
++}
++
++start().catch(error => {
++  console.error('App migration unavailable', error);
++});
+diff --git a/migration/shared.js b/migration/shared.js
+new file mode 100644
+index 0000000..cd91313
+--- /dev/null
++++ b/migration/shared.js
+@@ -0,0 +1,52 @@
++export const REQUEST = 'daily-grind:settings-request:v1';
++export const RESPONSE = 'daily-grind:settings-response:v1';
++export const MAX_VALUE_LENGTH = 64 * 1024;
++
++// Exact origin boundaries, never same-site privileges for messages.
++export function sameOrigin(candidate, trusted) {
++  try {
++    if ('Origin' in globalThis) {
++      return Origin.from(candidate).isSameOrigin(Origin.from(trusted));
++    }
++    const url = new URL(candidate);
++    return url.origin !== 'null' && url.origin === new URL(trusted).origin;
++  } catch {
++    return false;
++  }
++}
++
++export async function loadConfig() {
++  const response = await fetch('/migration.config.json', { cache: 'no-store' });
++  if (!response.ok) throw new Error('Migration configuration unavailable');
++  return response.json();
++}
++
++export function trustedMessage(event, peerWindow, trustedOrigin) {
++  return peerWindow != null && event.source === peerWindow && sameOrigin(event.origin, trustedOrigin);
++}
++
++export function readSettings(storage, keys) {
++  return keys.flatMap(key => {
++    const value = storage.getItem(key);
++    if (value === null) return [];
++    if (value.length > MAX_VALUE_LENGTH) throw new Error('Setting too large');
++    return [[key, value]];
++  });
++}
++
++export function importSettings(storage, keys, entries) {
++  if (!Array.isArray(entries) || entries.length > keys.length) throw new Error('Invalid settings');
++  const seen = new Set();
++  for (const entry of entries) {
++    if (!Array.isArray(entry) || entry.length !== 2) throw new Error('Invalid setting');
++    const [key, value] = entry;
++    if (!keys.includes(key) || seen.has(key) || typeof value !== 'string' || value.length > MAX_VALUE_LENGTH) {
++      throw new Error('Invalid setting');
++    }
++    seen.add(key);
++  }
++  // Retrying after an interrupted write is safe; newer destination values win.
++  for (const [key, value] of entries) {
++    if (storage.getItem(key) === null) storage.setItem(key, value);
++  }
++}
+diff --git a/package.json b/package.json
+index 2bd4d77..d1d3e12 100644
+--- a/package.json
++++ b/package.json
+@@ -1,10 +1,16 @@
+ {
+   "name": "daily-grind",
+   "version": "1.0.0",
++  "type": "module",
+   "scripts": {
++    "build": "node scripts/build.mjs",
++    "test": "node --test",
+     "start": "pnpm dlx statikk --port ${PORT:-11222}"
+   },
+   "pnpm": {
+     "onlyBuiltDependencies": []
++  },
++  "devDependencies": {
++    "tldts": "^7.4.19"
+   }
+ }
+diff --git a/scripts/build.mjs b/scripts/build.mjs
+new file mode 100644
+index 0000000..bf98078
+--- /dev/null
++++ b/scripts/build.mjs
+@@ -0,0 +1,81 @@
++import { readFile, writeFile, mkdir, cp, rm } from 'node:fs/promises';
++import { deflateSync } from 'node:zlib';
++import { getDomain } from 'tldts';
++
++export function validateConfig(config) {
++  const origins = [config.oldOrigin, config.newOrigin].map(value => {
++    const url = new URL(value);
++    if (url.protocol !== 'https:' || url.origin !== value) throw new Error('Use bare HTTPS origins without trailing slashes');
++    return url;
++  });
++  const domains = origins.map(url => getDomain(url.hostname, { allowPrivateDomains: true }));
++  if (!domains[0] || domains[0] !== domains[1] || origins[0].origin === origins[1].origin) {
++    throw new Error('Migration requires distinct origins on the same registrable domain');
++  }
++  for (const [id, origin] of [[config.oldId, config.oldOrigin], [config.newId, config.newOrigin]]) {
++    const url = new URL(id, origin);
++    if (typeof id !== 'string' || !id.startsWith('/') || url.origin !== origin || url.hash) throw new Error('App IDs must be same-origin absolute paths without fragments');
++  }
++  if (!Array.isArray(config.settingsKeys) || !config.settingsKeys.length || config.settingsKeys.length > 100 ||
++      config.settingsKeys.some(key => typeof key !== 'string' || !key.length || key.startsWith('daily-grind:migration:')) ||
++      new Set(config.settingsKeys).size !== config.settingsKeys.length) throw new Error('Configure a unique allowlist of settings keys');
++  return config;
++}
++
++// Small local app icon; no remote assets are needed for installation.
++function icon(size) {
++  function chunk(type, data) {
++    const payload = Buffer.concat([Buffer.from(type), data]);
++    let crc = 0xffffffff;
++    for (const byte of payload) {
++      crc ^= byte;
++      for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
++    }
++    const length = Buffer.alloc(4); length.writeUInt32BE(data.length);
++    const checksum = Buffer.alloc(4); checksum.writeUInt32BE((crc ^ 0xffffffff) >>> 0);
++    return Buffer.concat([length, payload, checksum]);
++  }
++  const pixels = Buffer.alloc(size * (1 + size * 3));
++  for (let y = 0; y < size; y++) for (let x = 0; x < size; x++) {
++    const px = x / size, py = y / size;
++    const cup = px > .25 && px < .64 && py > .35 && py < .7;
++    const handle = ((px - .65) ** 2 + (py - .49) ** 2 < .11 ** 2) &&
++      ((px - .65) ** 2 + (py - .49) ** 2 > .065 ** 2);
++    const saucer = px > .2 && px < .78 && py > .74 && py < .78;
++    pixels.set(cup || handle || saucer ? [255, 243, 224] : [78, 52, 46], y * (1 + size * 3) + 1 + x * 3);
++  }
++  const header = Buffer.alloc(13);
++  header.writeUInt32BE(size, 0); header.writeUInt32BE(size, 4); header[8] = 8; header[9] = 2;
++  return Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]), chunk('IHDR', header), chunk('IDAT', deflateSync(pixels)), chunk('IEND', Buffer.alloc(0))]);
++}
++
++export async function build() {
++  const config = validateConfig(JSON.parse(await readFile('migration.config.json', 'utf8')));
++  await rm('dist', { recursive: true, force: true });
++  const oldId = new URL(config.oldId, config.oldOrigin).href;
++  const newId = new URL(config.newId, config.newOrigin).href;
++  for (const side of ['old', 'new']) {
++    const dir = `dist/${side}`;
++    await mkdir(`${dir}/.well-known`, { recursive: true });
++    await cp('index.html', `${dir}/index.html`);
++    await cp('migration', `${dir}/migration`, { recursive: true });
++    await writeFile(`${dir}/migration.config.json`, JSON.stringify(config, null, 2));
++    const manifest = {
++      name: 'The Daily Grind', short_name: 'Daily Grind',
++      id: side === 'old' ? config.oldId : config.newId,
++      start_url: '/', scope: '/', display: 'standalone',
++      background_color: '#fafafa', theme_color: '#4e342e',
++      icons: [192, 512].map(size => ({ src: `/icon-${size}.png`, sizes: `${size}x${size}`, type: 'image/png' })),
++      ...(side === 'old' ? { migrate_to: { id: newId, install_url: config.newOrigin + '/' } } :
++        { migrate_from: [{ id: oldId, install_url: config.oldOrigin + '/', behavior: 'suggest' }] })
++    };
++    await writeFile(`${dir}/manifest.webmanifest`, JSON.stringify(manifest, null, 2));
++    for (const size of [192, 512]) await writeFile(`${dir}/icon-${size}.png`, icon(size));
++    // These headers must also be configured in the deployment platform if it does not read _headers.
++    await writeFile(`${dir}/_headers`, `/migration/bridge.html\n  Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; frame-ancestors ${config.newOrigin}\n  Cache-Control: no-store\n/migration.config.json\n  Cache-Control: no-store\n/manifest.webmanifest\n  Cache-Control: no-cache\n/.well-known/web-app-origin-association\n  Content-Type: application/json\n  Cache-Control: no-cache\n`);
++    if (side === 'old') await writeFile(`${dir}/.well-known/web-app-origin-association`, JSON.stringify({ [newId]: { allow_migration: true } }, null, 2));
++  }
++  console.log('Built dist/old and dist/new. Deploy each directory to its configured HTTPS origin.');
++}
++
++if (process.argv[1] && import.meta.url === new URL(process.argv[1], 'file:').href) await build();
+diff --git a/test/migration.test.js b/test/migration.test.js
+new file mode 100644
+index 0000000..042d305
+--- /dev/null
++++ b/test/migration.test.js
+@@ -0,0 +1,95 @@
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import { readFile } from 'node:fs/promises';
++import { build, validateConfig } from '../scripts/build.mjs';
++import { sameOrigin, trustedMessage, readSettings, importSettings, MAX_VALUE_LENGTH } from '../migration/shared.js';
++
++const config = JSON.parse(await readFile('migration.config.json', 'utf8'));
++function storage(initial = {}) {
++  const values = new Map(Object.entries(initial));
++  return { getItem: key => values.get(key) ?? null, setItem: (key, value) => values.set(key, value), values };
++}
++
++test('configuration requires HTTPS and PSL-aware same-site origins', () => {
++  assert.equal(validateConfig(config), config);
++  for (const newOrigin of ['http://order.dailygrind.example', 'https://different.example', config.oldOrigin]) {
++    assert.throws(() => validateConfig({ ...config, newOrigin }));
++  }
++  assert.throws(() => validateConfig({ ...config, oldOrigin: 'https://one.github.io', newOrigin: 'https://two.github.io' }));
++  assert.throws(() => validateConfig({ ...config, oldOrigin: 'https://one.co.uk', newOrigin: 'https://two.co.uk' }));
++  assert.throws(() => validateConfig({ ...config, oldId: '//attacker.example/' }));
++  assert.throws(() => validateConfig({ ...config, settingsKeys: ['settings', 'settings'] }));
++});
++
++test('message boundaries require exact origin and exact sending window', () => {
++  const peer = {};
++  assert.ok(sameOrigin(config.oldOrigin + ':443/', config.oldOrigin));
++  assert.ok(trustedMessage({ source: peer, origin: config.oldOrigin }, peer, config.oldOrigin));
++  for (const origin of ['null', 'invalid', 'http://app.dailygrind.example', 'https://app.dailygrind.example.attacker.com', config.newOrigin]) {
++    assert.equal(trustedMessage({ source: peer, origin }, peer, config.oldOrigin), false);
++  }
++  assert.equal(trustedMessage({ source: {}, origin: config.oldOrigin }, peer, config.oldOrigin), false);
++  assert.equal(trustedMessage({ source: null, origin: config.oldOrigin }, null, config.oldOrigin), false);
++});
++
++test('Origin API path rejects malformed input and uses structured equality', () => {
++  globalThis.Origin = { from(value) { const url = new URL(value); return { isSameOrigin: other => url.origin === other.origin, origin: url.origin }; } };
++  try {
++    assert.ok(sameOrigin(config.oldOrigin, config.oldOrigin));
++    assert.equal(sameOrigin('null', config.oldOrigin), false);
++    assert.equal(sameOrigin(config.newOrigin, config.oldOrigin), false);
++  } finally { delete globalThis.Origin; }
++});
++
++test('copy only allowlisted settings without overwriting current values or deleting source', () => {
++  const source = storage({ settings: '{"theme":"dark"}', token: 'secret', empty: '' });
++  const entries = readSettings(source, ['settings', 'empty', 'missing']);
++  assert.deepEqual(entries, [['settings', '{"theme":"dark"}'], ['empty', '']]);
++  const destination = storage({ settings: '{"theme":"light"}' });
++  importSettings(destination, ['settings', 'empty'], entries);
++  assert.equal(destination.getItem('settings'), '{"theme":"light"}');
++  assert.equal(destination.getItem('empty'), '');
++  assert.equal(destination.getItem('token'), null);
++  assert.equal(source.getItem('settings'), '{"theme":"dark"}');
++});
++
++test('malformed or oversized payloads are rejected before writing', () => {
++  const destination = storage();
++  for (const entries of [null, [['token', 'secret']], [['settings', {}]], [['settings', 'x'.repeat(MAX_VALUE_LENGTH + 1)]], [['settings', 'ok'], ['empty']], [['settings', 'a'], ['settings', 'b']]]) {
++    assert.throws(() => importSettings(destination, ['settings', 'empty'], entries));
++    assert.equal(destination.values.size, 0);
++  }
++  assert.throws(() => readSettings(storage({ settings: 'x'.repeat(MAX_VALUE_LENGTH + 1) }), ['settings']));
++});
++
++test('a failed storage write can be retried without clobbering earlier settings', () => {
++  const destination = storage();
++  const set = destination.setItem;
++  destination.setItem = (key, value) => { if (key === 'second') throw new Error('quota'); set(key, value); };
++  const entries = [['first', 'a'], ['second', 'b']];
++  assert.throws(() => importSettings(destination, ['first', 'second'], entries));
++  destination.setItem = set;
++  importSettings(destination, ['first', 'second'], entries);
++  assert.equal(destination.getItem('first'), 'a');
++  assert.equal(destination.getItem('second'), 'b');
++});
++
++test('built manifests and authorization agree on exact app identities', async () => {
++  await build();
++  const json = async path => JSON.parse(await readFile(path, 'utf8'));
++  const old = await json('dist/old/manifest.webmanifest');
++  const next = await json('dist/new/manifest.webmanifest');
++  const association = await json('dist/old/.well-known/web-app-origin-association');
++  assert.equal(old.migrate_to.id, new URL(next.id, config.newOrigin).href);
++  assert.equal(next.migrate_from[0].id, new URL(old.id, config.oldOrigin).href);
++  assert.equal(next.migrate_from[0].behavior, 'suggest');
++  assert.equal(association[old.migrate_to.id].allow_migration, true);
++  for (const side of ['old', 'new']) {
++    assert.match(await readFile(`dist/${side}/index.html`, 'utf8'), /rel="manifest"/);
++    for (const size of [192, 512]) {
++      const png = await readFile(`dist/${side}/icon-${size}.png`);
++      assert.equal(png.readUInt32BE(16), size);
++      assert.equal(png.readUInt32BE(20), size);
++    }
++  }
++});
